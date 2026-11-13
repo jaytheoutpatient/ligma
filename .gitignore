@@ -1,0 +1,18 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+*.o
+*.so
+*.a
+/core
+/core.*
+
+# Local build/testing artifacts
+dist/
+*.log
+*.tar.gz
+.DS_Store
+
+# Editor metadata
+.idea/
+.vscode/

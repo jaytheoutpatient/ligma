@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ligma
+GenericName=File Manager
+Comment=Fast, searchable file manager
+Exec=ligma
+Icon=org.ligma.FileManager
+Terminal=false
+Categories=System;FileTools;FileManager;
+Keywords=files;manager;browse;folders;
+StartupNotify=true
+StartupWMClass=ligma
