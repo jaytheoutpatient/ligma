@@ -304,8 +304,8 @@ install_deps() {
         run_priv apt-get update
         local candidate=""
         local qterm_package=""
-        for candidate in libqtermwidget6-2-dev libqtermwidget6-dev \
-            libqtermwidget6-1-dev; do
+        for candidate in libqtermwidget6-2-dev libqtermwidget-dev \
+            libqtermwidget6-dev libqtermwidget6-1-dev; do
             if apt-cache show "$candidate" >/dev/null 2>&1; then
                 qterm_package="$candidate"
                 break

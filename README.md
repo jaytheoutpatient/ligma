@@ -151,16 +151,17 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 - Linux
 - Zig **0.17.0+** (the build script downloads an official compiler into `.tools/` when needed)
 - Qt **6.8+** development files (tested with 6.12.0), including QtMultimedia and a multimedia backend
-- QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`)
+- QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`; Debian: `libqtermwidget-dev`; newer Ubuntu: `libqtermwidget6-2-dev`)
 - SQLite 3 development files with FTS5 and the trigram tokenizer (tested with 3.54.1)
 - A C/C++ toolchain (`g++`) and `pkg-config`
 
 On Debian/Ubuntu-style systems:
 
 ```bash
-sudo apt install build-essential pkg-config qt6-base-dev qt6-multimedia-dev libsqlite3-dev
-# plus the Qt 6 qtermwidget development package for your release
-# and QtMultimedia with its FFmpeg backend
+sudo apt install build-essential pkg-config qt6-base-dev qt6-multimedia-dev \
+  libsqlite3-dev libqtermwidget-dev
+# Debian names the Qt 6 widget development package libqtermwidget-dev.
+# Newer Ubuntu releases use libqtermwidget6-2-dev instead.
 ```
 
 On Arch Linux: `sudo pacman -S qt6-base qt6-multimedia qt6-multimedia-ffmpeg sqlite qtermwidget`.
