@@ -5,6 +5,7 @@
 #
 # Examples:
 #   ./build.sh                 # install missing dependencies and build
+#                              # (downloads a local Zig compiler if needed)
 #   ./build.sh --test          # build and run the unit tests
 #   ./build.sh --debug         # Debug build
 #   ./build.sh --install       # install binary and desktop integration
@@ -35,7 +36,8 @@ Options:
   --install     Install the binary and assets system-wide (needs sudo).
   --install-deps
                 Force the development-package installer to run. This is
-                automatic when a dependency is missing.
+                automatic when a dependency is missing. If Zig 0.17+ is not
+                available, an official compiler is downloaded to .tools/.
   --run         Launch the built binary after building.
   --clean       Remove .zig-cache/ and zig-out/ before building.
   -h, --help    Show this help text.
@@ -90,11 +92,147 @@ zig_version_ok() {
     [[ "$(printf '%s\n' 0.17.0 "$version" | sort -V | head -n1)" == "0.17.0" ]]
 }
 
-deps_ready() {
+system_deps_ready() {
     command -v g++ >/dev/null 2>&1 || return 1
     command -v pkg-config >/dev/null 2>&1 || return 1
-    zig_version_ok || return 1
     pkg-config --exists qtermwidget6 Qt6Multimedia sqlite3
+}
+
+ZIG_BOOTSTRAP_VERSION="0.17.0"
+
+activate_local_zig() {
+    local dir
+    for dir in "$ROOT"/.tools/zig-*-linux-*; do
+        [[ -x "$dir/zig" ]] || continue
+        export PATH="$dir:$PATH"
+        hash -r
+        if zig_version_ok; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+bootstrap_zig() {
+    if zig_version_ok; then
+        return 0
+    fi
+    activate_local_zig && return 0
+
+    local machine
+    machine="$(uname -m)"
+    local zig_arch
+    local expected_sha
+    case "$machine" in
+        x86_64|amd64)
+            zig_arch="x86_64"
+            expected_sha="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+            ;;
+        aarch64|arm64)
+            zig_arch="aarch64"
+            expected_sha="9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8"
+            ;;
+        armv7l|armv6l|arm)
+            zig_arch="arm"
+            expected_sha="53f0045cdef7ba06da70a12b2ef654e4c5283b0139bc441aa7d84f364b46de43"
+            ;;
+        riscv64)
+            zig_arch="riscv64"
+            expected_sha="18ff032ac6cecf746a84259f6463264f13160ff88bc3b80722ce06f9479b82ed"
+            ;;
+        ppc64le|powerpc64le)
+            zig_arch="powerpc64le"
+            expected_sha="731e2887e66fff41fdc34f7fd9d8afa814d86d7426f5827805f8854b2977684b"
+            ;;
+        i386|i686|x86)
+            zig_arch="x86"
+            expected_sha="55e39e175cd5b3098afc29ec47b2590134f5b874175369fb9ae7b8e836d7531a"
+            ;;
+        loongarch64)
+            zig_arch="loongarch64"
+            expected_sha="5a6000b866201c3b3820b563fcfd29641185393e7d35039e50235db418d8367c"
+            ;;
+        s390x)
+            zig_arch="s390x"
+            expected_sha="13905f11989b65566c544d191d4bc5bd5d6f858e303208cf1d2f090e5d91b512"
+            ;;
+        *)
+            printf 'error: no official Zig build is available for %s.\n' "$machine" >&2
+            printf 'Download Zig 0.17.0 or newer manually from https://ziglang.org/download/\n' >&2
+            exit 1
+            ;;
+    esac
+
+    need_command tar
+    need_command sha256sum
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        printf 'error: curl or wget is required to download Zig.\n' >&2
+        exit 1
+    fi
+
+    local zig_name="zig-${zig_arch}-linux-${ZIG_BOOTSTRAP_VERSION}"
+    local tools_dir="$ROOT/.tools"
+    local archive="$tools_dir/${zig_name}.tar.xz"
+    local destination="$tools_dir/$zig_name"
+    local url="https://ziglang.org/download/${ZIG_BOOTSTRAP_VERSION}/${zig_name}.tar.xz"
+
+    mkdir -p "$tools_dir"
+    if [[ ! -f "$archive" ]]; then
+        printf 'Zig %s was not found; downloading the official compiler...\n' "$ZIG_BOOTSTRAP_VERSION"
+        printf '  %s\n' "$url"
+        if command -v curl >/dev/null 2>&1; then
+            if ! curl -fL --retry 3 -o "$archive" "$url"; then
+                rm -f "$archive"
+                printf 'error: could not download Zig.\n' >&2
+                exit 1
+            fi
+        else
+            if ! wget -O "$archive" "$url"; then
+                rm -f "$archive"
+                printf 'error: could not download Zig.\n' >&2
+                exit 1
+            fi
+        fi
+    fi
+
+    local actual_sha
+    actual_sha="$(sha256sum "$archive" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        rm -f "$archive"
+        printf 'error: Zig archive checksum mismatch.\n' >&2
+        exit 1
+    fi
+
+    printf 'Extracting Zig %s into %s...\n' "$ZIG_BOOTSTRAP_VERSION" "$tools_dir"
+    if ! tar -xJf "$archive" -C "$tools_dir"; then
+        printf 'error: could not extract the Zig archive.\n' >&2
+        exit 1
+    fi
+    rm -f "$archive"
+
+    if [[ ! -x "$destination/zig" ]]; then
+        printf 'error: Zig executable not found after extraction.\n' >&2
+        exit 1
+    fi
+
+    export PATH="$destination:$PATH"
+    hash -r
+    if ! zig_version_ok; then
+        printf 'error: the downloaded Zig compiler failed its version check.\n' >&2
+        exit 1
+    fi
+    printf 'Using local Zig: %s (%s)\n' "$(zig version)" "$destination"
+}
+
+ensure_zig() {
+    if zig_version_ok; then
+        return 0
+    fi
+    activate_local_zig || true
+    if zig_version_ok; then
+        return 0
+    fi
+    bootstrap_zig
 }
 
 setup_sudo() {
@@ -165,27 +303,20 @@ install_deps() {
     fi
 
     hash -r
-    if ! zig_version_ok; then
-        printf '\nwarning: a Zig %s or newer compiler is required.\n' "0.17.0" >&2
-        printf 'Your distribution may not package it yet. Download a release from:\n' >&2
-        printf '  https://ziglang.org/download/\n' >&2
-        exit 1
-    fi
 }
 
-if ((DO_INSTALL_DEPS)) || ! deps_ready; then
-    if ! deps_ready; then
+activate_local_zig || true
+
+if ((DO_INSTALL_DEPS)) || ! system_deps_ready; then
+    if ! system_deps_ready; then
         printf 'Missing build dependencies; starting the package installer.\n'
     fi
     install_deps
 fi
 
+ensure_zig
+
 need_command zig
-if ! zig_version_ok; then
-    printf 'error: Zig 0.17.0 or newer is required (found %s).\n' "$(zig version 2>/dev/null || echo none)" >&2
-    printf 'Download a release from https://ziglang.org/download/\n' >&2
-    exit 1
-fi
 need_command g++
 need_command pkg-config
 need_pkg qtermwidget6

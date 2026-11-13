@@ -149,7 +149,7 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 ### Requirements
 
 - Linux
-- Zig **0.17.0**
+- Zig **0.17.0+** (the build script downloads an official compiler into `.tools/` when needed)
 - Qt **6.8+** development files (tested with 6.12.0), including QtMultimedia and a multimedia backend
 - QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`)
 - SQLite 3 development files with FTS5 and the trigram tokenizer (tested with 3.54.1)
@@ -184,10 +184,13 @@ On the first run, `./build.sh` checks for the required development packages
 and automatically starts the installer when something is missing. It detects
 `pacman`, `apt`, or `dnf`, shows the package list, and asks before changing the
 system. It installs the Qt 6, QtMultimedia, QTermWidget, SQLite, C/C++, and
-pkg-config development packages. On Arch the distro `zig` package is installed
-and then version-checked; on distributions with an older Zig package the
-script stops and points to <https://ziglang.org/download/> for Zig 0.17.0 or
-newer. `--install-deps` remains available to force the dependency installer.
+pkg-config development packages.
+
+If Zig 0.17.0 or newer is not available, the script downloads the official
+Zig 0.17.0 compiler from <https://ziglang.org>, verifies its SHA-256 checksum,
+and extracts it into the ignored `.tools/` directory. No compiler binary is
+committed to the repository. `--install-deps` remains available to force the
+package installer.
 
 The raw Zig commands remain available:
 
