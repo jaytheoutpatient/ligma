@@ -4,11 +4,16 @@ A Linux file manager that combines the best of Nautilus, Nemo, and Dolphin — b
 
 Ligma is licensed under **GPL-3.0-or-later** (see [`LICENSE`](LICENSE)).
 
-## Build Script
-```
-cd ~/Ligma
+## Quick start
+
+```bash
+git clone https://github.com/jaytheoutpatient/ligma.git
+cd ligma
 ./build.sh
 ```
+
+The build script installs missing development packages, then builds Ligma.
+
 ## Why
 
 Nautilus is polished, Nemo keeps the classic power features, and Dolphin has the best power-user workflow. Ligma aims to combine them with three hard differentiators:
@@ -164,15 +169,25 @@ The build fetches the pinned `libqt6zig` dependency automatically. The first bui
 
 ### Commands
 
-The repository includes a build script that checks the required development
-packages, builds a ReleaseSafe binary, and stages the desktop entry and icons:
+The repository includes a build script that checks and installs the required
+development packages, builds a ReleaseSafe binary, and stages the desktop
+entry and icons:
 
 ```bash
-./build.sh          # ReleaseSafe build
+./build.sh          # install missing packages, then ReleaseSafe build
 ./build.sh --test   # build and run tests
 ./build.sh --run    # build and launch
 ./build.sh --help   # all options
 ```
+
+On the first run, `./build.sh` checks for the required development packages
+and automatically starts the installer when something is missing. It detects
+`pacman`, `apt`, or `dnf`, shows the package list, and asks before changing the
+system. It installs the Qt 6, QtMultimedia, QTermWidget, SQLite, C/C++, and
+pkg-config development packages. On Arch the distro `zig` package is installed
+and then version-checked; on distributions with an older Zig package the
+script stops and points to <https://ziglang.org/download/> for Zig 0.17.0 or
+newer. `--install-deps` remains available to force the dependency installer.
 
 The raw Zig commands remain available:
 
