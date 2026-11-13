@@ -8,7 +8,8 @@
 #                              # (downloads a local Zig compiler if needed)
 #   ./build.sh --test          # build and run the unit tests
 #   ./build.sh --debug         # Debug build
-#   ./build.sh --install       # install binary and desktop integration
+#   ./build.sh                 # build and install (pkexec prompts for auth)
+#   ./build.sh --no-install    # build without installing
 #   ./build.sh --install-deps  # force a dependency check/install
 #   ./build.sh --run           # build and launch
 #
@@ -19,7 +20,7 @@ cd "$ROOT"
 
 OPTIMIZE="ReleaseSafe"
 RUN_TESTS=0
-DO_INSTALL=0
+DO_INSTALL=1
 DO_INSTALL_DEPS=0
 DO_RUN=0
 DO_CLEAN=0
@@ -33,7 +34,8 @@ Options:
   --debug       Build with Debug optimizations instead of ReleaseSafe.
   --release     Build with ReleaseSafe optimizations (default).
   --test        Run the unit tests with an offscreen Qt platform first.
-  --install     Install the binary and assets system-wide (needs sudo).
+  --install     Install the binary and assets after building (default).
+  --no-install  Build only; do not install system-wide.
   --install-deps
                 Force the development-package installer to run. This is
                 automatic when a dependency is missing. If Zig 0.17+ is not
@@ -45,7 +47,7 @@ Options:
 Examples:
   ./build.sh
   ./build.sh --test
-  ./build.sh --install
+  ./build.sh --no-install
   ./build.sh --debug --run
 EOF
 }
@@ -56,6 +58,7 @@ while (($# > 0)); do
         --release) OPTIMIZE="ReleaseSafe" ;;
         --test) RUN_TESTS=1 ;;
         --install) DO_INSTALL=1 ;;
+        --no-install) DO_INSTALL=0 ;;
         --install-deps) DO_INSTALL_DEPS=1 ;;
         --run) DO_RUN=1 ;;
         --clean) DO_CLEAN=1 ;;
@@ -235,16 +238,43 @@ ensure_zig() {
     bootstrap_zig
 }
 
-setup_sudo() {
+PRIV_KIND=""
+
+setup_privilege() {
     if ((EUID == 0)); then
-        SUDO=()
+        PRIV_KIND="direct"
+    elif command -v pkexec >/dev/null 2>&1; then
+        PRIV_KIND="pkexec"
     elif command -v sudo >/dev/null 2>&1; then
-        SUDO=(sudo)
-        "${SUDO[@]}" -v
+        PRIV_KIND="sudo"
+        sudo -v
     else
-        printf 'error: this action needs root or sudo.\n' >&2
+        printf 'error: this action needs root, pkexec, or sudo.\n' >&2
         exit 1
     fi
+}
+
+run_priv() {
+    if [[ "$PRIV_KIND" == "direct" ]]; then
+        "$@"
+        return
+    fi
+    if [[ "$PRIV_KIND" == "sudo" ]]; then
+        sudo "$@"
+        return
+    fi
+
+    local status=0
+    pkexec "$@" || status=$?
+    if ((status == 0)); then
+        return 0
+    fi
+    if ((status == 126 || status == 127)) && command -v sudo >/dev/null 2>&1; then
+        printf 'pkexec was cancelled or unavailable; retrying with sudo.\n' >&2
+        sudo "$@"
+        return
+    fi
+    return "$status"
 }
 
 confirm_install() {
@@ -260,18 +290,18 @@ confirm_install() {
 }
 
 install_deps() {
-    setup_sudo
+    setup_privilege
 
     if command -v pacman >/dev/null 2>&1; then
         local packages=(base-devel pkgconf qt6-base qt6-multimedia
             qt6-multimedia-ffmpeg sqlite qtermwidget zig)
         printf 'Detected pacman. Installing: %s\n' "${packages[*]}"
         confirm_install pacman
-        "${SUDO[@]}" pacman -S --needed "${packages[@]}"
+        run_priv pacman -S --needed --noconfirm "${packages[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
         local packages=(build-essential pkg-config qt6-base-dev
             qt6-multimedia-dev libsqlite3-dev)
-        "${SUDO[@]}" apt-get update
+        run_priv apt-get update
         local candidate=""
         local qterm_package=""
         for candidate in libqtermwidget6-2-dev libqtermwidget6-dev \
@@ -289,13 +319,13 @@ install_deps() {
         packages+=("$qterm_package")
         printf 'Detected apt. Installing: %s\n' "${packages[*]}"
         confirm_install apt
-        "${SUDO[@]}" apt-get install -y "${packages[@]}"
+        run_priv apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         local packages=(gcc-c++ pkgconf-pkg-config qt6-qtbase-devel
             qt6-qtmultimedia-devel sqlite-devel qtermwidget-devel)
         printf 'Detected dnf. Installing: %s\n' "${packages[*]}"
         confirm_install dnf
-        "${SUDO[@]}" dnf install -y "${packages[@]}"
+        run_priv dnf install -y "${packages[@]}"
     else
         printf 'error: unsupported package manager.\n' >&2
         printf 'Install the packages listed in README.md manually.\n' >&2
@@ -346,16 +376,21 @@ printf '  %s\n' "$ROOT/zig-out/bin/ligma"
 printf '  %s\n' "$ROOT/zig-out/share"
 
 if ((DO_INSTALL)); then
-    setup_sudo
+    setup_privilege
     printf '\nInstalling to /usr...\n'
-    "${SUDO[@]}" install -Dm755 zig-out/bin/ligma /usr/bin/ligma
-    "${SUDO[@]}" cp -a zig-out/share/. /usr/share/
-
-    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-        "${SUDO[@]}" gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
-    fi
-    if command -v update-desktop-database >/dev/null 2>&1; then
-        "${SUDO[@]}" update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+    if ! run_priv sh -c '
+        set -e
+        install -Dm755 "$1" /usr/bin/ligma
+        cp -a "$2/." /usr/share/
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
+        fi
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database /usr/share/applications || true
+        fi
+    ' sh "$ROOT/zig-out/bin/ligma" "$ROOT/zig-out/share"; then
+        printf 'error: installation failed.\n' >&2
+        exit 1
     fi
     printf 'Installed /usr/bin/ligma and desktop assets.\n'
 fi

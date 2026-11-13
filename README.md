@@ -12,7 +12,7 @@ cd ligma
 ./build.sh
 ```
 
-The build script installs missing development packages, then builds Ligma.
+The build script installs missing development packages, builds Ligma, then installs it system-wide after a successful build.
 
 ## Why
 
@@ -174,10 +174,11 @@ development packages, builds a ReleaseSafe binary, and stages the desktop
 entry and icons:
 
 ```bash
-./build.sh          # install missing packages, then ReleaseSafe build
-./build.sh --test   # build and run tests
-./build.sh --run    # build and launch
-./build.sh --help   # all options
+./build.sh              # install packages, build, then install Ligma
+./build.sh --test       # build, run tests, then install
+./build.sh --no-install # build/test without installing system-wide
+./build.sh --run        # build, install, and launch
+./build.sh --help       # all options
 ```
 
 On the first run, `./build.sh` checks for the required development packages
@@ -191,6 +192,11 @@ Zig 0.17.0 compiler from <https://ziglang.org>, verifies its SHA-256 checksum,
 and extracts it into the ignored `.tools/` directory. No compiler binary is
 committed to the repository. `--install-deps` remains available to force the
 package installer.
+
+After a successful build, the binary and desktop assets are installed
+automatically. The script uses `pkexec` for a polkit prompt when it needs
+root; if `pkexec` is unavailable or its prompt is cancelled, it falls back to
+`sudo`. Use `--no-install` when you only want a local build.
 
 The raw Zig commands remain available:
 
@@ -208,8 +214,8 @@ QT_QPA_PLATFORM=offscreen zig build run
 ```
 
 `zig build` also stages the desktop entry and icons under `zig-out/share`.
-Install the binary and desktop integration system-wide with `./build.sh
---install`, or manually:
+`./build.sh` installs them automatically. To install a previously built tree
+manually:
 
 ```bash
 sudo install -Dm755 zig-out/bin/ligma /usr/bin/ligma
