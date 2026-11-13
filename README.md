@@ -159,9 +159,11 @@ On Debian/Ubuntu-style systems:
 
 ```bash
 sudo apt install build-essential pkg-config qt6-base-dev qt6-multimedia-dev \
-  libsqlite3-dev libqtermwidget-dev
+  libsqlite3-dev libutf8proc-dev libqtermwidget-dev
 # Debian names the Qt 6 widget development package libqtermwidget-dev.
 # Newer Ubuntu releases use libqtermwidget6-2-dev instead.
+# libutf8proc-dev is required by qtermwidget6.pc but is not pulled in by
+# Debian's libqtermwidget-dev package.
 ```
 
 On Arch Linux: `sudo pacman -S qt6-base qt6-multimedia qt6-multimedia-ffmpeg sqlite qtermwidget`.

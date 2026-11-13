@@ -82,6 +82,7 @@ need_command() {
 need_pkg() {
     if ! pkg-config --exists "$1"; then
         printf 'error: pkg-config could not find %s development files.\n' "$1" >&2
+        pkg-config --print-errors --exists "$1" >&2 || true
         printf 'Install the missing development package or see README.md.\n' >&2
         exit 1
     fi
@@ -294,17 +295,17 @@ install_deps() {
 
     if command -v pacman >/dev/null 2>&1; then
         local packages=(base-devel pkgconf qt6-base qt6-multimedia
-            qt6-multimedia-ffmpeg sqlite qtermwidget zig)
+            qt6-multimedia-ffmpeg sqlite qtermwidget utf8proc zig)
         printf 'Detected pacman. Installing: %s\n' "${packages[*]}"
         confirm_install pacman
         run_priv pacman -S --needed --noconfirm "${packages[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
         local packages=(build-essential pkg-config qt6-base-dev
-            qt6-multimedia-dev libsqlite3-dev)
+            qt6-multimedia-dev libsqlite3-dev libutf8proc-dev)
         run_priv apt-get update
         local candidate=""
         local qterm_package=""
-        for candidate in libqtermwidget6-2-dev libqtermwidget-dev \
+        for candidate in libqtermwidget-dev libqtermwidget6-2-dev \
             libqtermwidget6-dev libqtermwidget6-1-dev; do
             if apt-cache show "$candidate" >/dev/null 2>&1; then
                 qterm_package="$candidate"
@@ -322,7 +323,8 @@ install_deps() {
         run_priv apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         local packages=(gcc-c++ pkgconf-pkg-config qt6-qtbase-devel
-            qt6-qtmultimedia-devel sqlite-devel qtermwidget-devel)
+            qt6-qtmultimedia-devel sqlite-devel qtermwidget-devel
+            utf8proc-devel)
         printf 'Detected dnf. Installing: %s\n' "${packages[*]}"
         confirm_install dnf
         run_priv dnf install -y "${packages[@]}"
