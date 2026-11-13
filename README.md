@@ -4,6 +4,11 @@ A Linux file manager that combines the best of Nautilus, Nemo, and Dolphin — b
 
 Ligma is licensed under **GPL-3.0-or-later** (see [`LICENSE`](LICENSE)).
 
+## Build Script
+```
+cd ~/Ligma
+./build.sh
+```
 ## Why
 
 Nautilus is polished, Nemo keeps the classic power features, and Dolphin has the best power-user workflow. Ligma aims to combine them with three hard differentiators:
