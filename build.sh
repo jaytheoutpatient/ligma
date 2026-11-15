@@ -101,7 +101,7 @@ system_deps_ready() {
     command -v pkg-config >/dev/null 2>&1 || return 1
     command -v lsblk >/dev/null 2>&1 || return 1
     command -v udisksctl >/dev/null 2>&1 || return 1
-    pkg-config --exists qtermwidget6 gstreamer-1.0 sqlite3
+    pkg-config --exists qtermwidget6 gstreamer-1.0 sqlite3 Qt6DBus
 }
 
 ZIG_BOOTSTRAP_VERSION="0.17.0"
@@ -365,6 +365,7 @@ need_command pkg-config
 need_pkg qtermwidget6
 need_pkg gstreamer-1.0
 need_pkg sqlite3
+need_pkg Qt6DBus
 
 printf 'Ligma build\n'
 printf '  Zig:      %s\n' "$(zig version)"

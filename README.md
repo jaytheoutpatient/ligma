@@ -35,7 +35,8 @@ This repository contains a working **v0.5 prototype**:
 - **Custom item model** — `src/ui/local_model.zig` lists folders and Trash on a worker thread, polls snapshots from the UI, and renders folder or trash-specific columns
 - **Live folder refresh** — watches every open pane and the Trash directory, coalesces filesystem events, reloads the affected snapshots, and restores the selection
 - **Drives** — the sidebar lists mounted volumes plus unmounted USB/removable partitions. Mounted rows show a free-space label and a used-capacity progress bar; unmounted rows show **not mounted** and mount when clicked. Tooltips include the mount path, device, filesystem, and free/total space. Right-click for **Mount** or **Unmount** (UDisks2 first, then `pkexec`), and the list updates automatically when devices appear, mount, unmount, or disappear
-- **Compact sidebar** — the Places and Drives lists size themselves to their contents and scroll once they reach a height cap, instead of leaving a large empty box. List borders are removed; selected and hovered rows use solid-to-transparent blue/purple gradients, and drive usage bars fade to transparent at their fill edge
+- **Compact sidebar** — the Places and Drives lists size themselves to their contents and scroll once they reach a height cap, instead of leaving a large empty box. List borders are removed; selected and hovered rows use solid-to-transparent theme-accent gradients, and drive usage bars fade to transparent at their fill edge
+- **Appearance** — **View > Appearance** switches between **Matugen**, **Light**, **Dark**, and **System**. Matugen reads the active qt6ct color scheme, so the file manager follows the same Material You palette as Qt applications; Light/Dark are built-in palettes and System follows the desktop. The choice persists in `$XDG_CONFIG_HOME/ligma/appearance` (or `~/.config/ligma/appearance`), and switching updates the sidebar, file pane, music player, and drive bars immediately. The Matugen entry is disabled when no scheme is installed
 - Back / forward / up / home / reload navigation with per-pane history
 - Editable path bar with `~`, relative-path, and `file://` resolution
 - In-memory current-folder filter and folder-first sorting by any column
@@ -43,7 +44,7 @@ This repository contains a working **v0.5 prototype**:
 - Opens files with the desktop's default application, except audio files that play in the built-in music player
 - **Tabs** — `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+W`
 - **Split view** — `F3` toggles, `F6` focuses the other pane; panes keep independent history and filters
-- **View modes** — **Details** (`Ctrl+1`), **Icons** (`Ctrl+2`), and **Compact** (`Ctrl+3`). The Details and icon views share one selection model, so switching modes preserves the selected paths; Details and Icons use themed file/folder icons
+- **View modes** — **Details** (`Ctrl+1`), **Icons** (`Ctrl+2`), and **Compact** (`Ctrl+3`). The Details and icon views share one selection model, so switching modes preserves the selected paths; Details and Icons use themed file/folder icons. Details rows use a full-row gradient delegate for selection and hover (readable light-theme text and light-on-dark text), while the icon and compact views use the shared list gradient
 - **Global filename search** — `Ctrl+Shift+F`, streamed results in a search dock
 - **SQLite FTS5 search index** — automatic background build, trigram substring matching, status-bar health, and `View > Rebuild Search Index`
 - **Async file operations** — copy, cut, paste, rename, new folder, trash, restore, permanent delete, empty Trash, and undo, all on a worker thread with progress and cancellation
@@ -52,10 +53,12 @@ This repository contains a working **v0.5 prototype**:
 - **Freedesktop.org Trash** — a dedicated **Trash** place browses `Trash/files`, shows each item's original location and deletion date, and supports **Restore**, **Delete Permanently**, and **Empty Trash**. Trash contents use `Path=`/`DeletionDate=` `.trashinfo` files, collision-safe storage names, and restore conflicts use `name (1).ext`; restoring is also available through undo for a just-trashed batch
 - **Undo journal** — the last completed batch can be reversed with `Ctrl+Z`, including copies, moves, renames, new folders, and trashed items
 - **Custom Places bookmarks** — right-click a folder and choose *Add to Places* to pin it to the sidebar; right-click a user-added entry and choose *Remove from Places* to unbookmark it. Bookmarks persist in `$XDG_CONFIG_HOME/ligma/places` (or `~/.config/ligma/places`). Right-click the built-in **Trash** entry for *Empty Trash…*, or right-click **Music** for *Play All Music*, which recursively queues audio files from that folder
-- **Embedded terminal** — `F12` toggles a terminal panel docked on the right; the first open starts the user's shell in the active folder, and the session survives hiding and reopening
+- **Embedded terminal** — `F12` toggles a terminal panel docked on the right; the first open starts the user's shell in the active folder, and the session survives hiding and reopening. Opening and closing the panel, and the music player, slide in from their dock edges; closing with the dock's title-bar button animates the same way
+- **Smooth scrolling** — wheel events animate the Places, Drives, file views, search results, and player playlist instead of jumping by whole rows
 - **Run executables** — activating an executable file asks for confirmation, then launches it detached with its folder as the working directory
 - **Preview panel** — selecting exactly one image or video file shows a larger thumbnail in the window's bottom-left corner
-- **Built-in music player** — GStreamer-powered playback with prev/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, optional EQ/ReplayGain, and a playlist. A direct-ALSA/bit-perfect output mode is available for exclusive playback. Finished tracks leave the queue unless repeat is active, and the context menu adds **Play** and **Add to Playlist**
+- **Built-in music player** — GStreamer-powered playback with prev/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, optional EQ/ReplayGain, and a playlist. A direct-ALSA/bit-perfect output mode is available for exclusive playback. Natural completion keeps the queue and advances to the next track; the context menu adds **Play** and **Add to Playlist**
+- **MPRIS / playerctl** — exposes `org.mpris.MediaPlayer2.ligma` with root and Player interfaces, so desktop media keys, `playerctl`, panels, and other MPRIS clients can read metadata, seek, set volume, change loop/shuffle, and control playback
 - **Discord Rich Presence** — shows the current song and artist in Discord through its local IPC socket, optionally enriched with canonical MusicBrainz title/artist/album data
 - **Blue-and-purple floppy icon** — a custom scalable app icon, installed as `org.ligma.FileManager` in the hicolor theme and embedded in the binary for the window icon
 
@@ -96,6 +99,7 @@ Activating a file whose MIME type is `audio/*` plays it in the built-in player i
 - Activating another audio file appends it to the playlist (or reuses its existing entry) and starts it. **Add to Playlist** appends every selected audio file without interrupting the current track.
 - **Play** in the context menu replaces the queue with the selected audio files and starts the first one. The playlist widget also accepts clicks to jump to a track.
 - Files are classified with `QMimeDatabase`, so content-detected audio formats work even when their extension is unusual.
+- The player exposes MPRIS 2 on the session bus. Metadata includes a stable per-track object path, title, artist, album, and length; `Position` and `Seeked` are reported in microseconds. The **Raise** method shows Ligma and opens the player dock, and **Quit** exits cleanly.
 - Closing the dock keeps the playlist and playback alive; reopening it shows the same state.
 - Playback uses GStreamer (`src/ui/music_engine.cpp`) rather than QtMultimedia. The default output is PipeWire, so it cooperates with the desktop mixer.
 - If no working audio backend is available, the player surfaces the decoder error in the now-playing label instead of crashing.
@@ -122,10 +126,25 @@ LIGMA_AUDIO_REPLAYGAIN=1 ./zig-out/bin/ligma  # use ReplayGain tags
 
 ### Queue behavior
 
-- With repeat **off**, a track that reaches its natural end is removed from the queue and the next track starts. When the queue has no more tracks to play, playback stops.
+- With repeat **off**, a track that reaches its natural end stays in the queue and the next track starts. When the last track ends, playback stops and the queue remains; **Play** starts again from the first track.
 - **Repeat all** and **Repeat one** keep every queue entry. Repeat all advances/wraps, while repeat one replays the same row.
-- **Shuffle** changes which row is chosen next but does not remove anything by itself. With repeat off, shuffle plus natural advancement eventually drains the queue.
-- Manual **Next** and **Previous** never remove queue entries, even when repeat is off. Only natural completion clears. **Stop** also leaves the queue intact.
+- **Shuffle** changes which row is chosen next. With repeat all it keeps picking random tracks; with repeat off it keeps picking a random other track, so previously played tracks can repeat.
+- Manual **Next** and **Previous** never remove queue entries. **Stop** also leaves the queue intact.
+
+### MPRIS and playerctl
+
+Ligma registers `org.mpris.MediaPlayer2.ligma` on the session bus at startup. MPRIS clients can use the standard root object (`Raise`, `Quit`, `Identity`, `CanRaise`, `DesktopEntry`) and Player interface (`Play`, `Pause`, `PlayPause`, `Stop`, `Next`, `Previous`, `Seek`, `SetPosition`, `PlaybackStatus`, `Metadata`, `Position`, `Volume`, `LoopStatus`, `Shuffle`, and `Seeked`).
+
+```bash
+playerctl -p ligma status
+playerctl -p ligma metadata
+playerctl -p ligma play-pause
+playerctl -p ligma next
+playerctl -p ligma position 42.5
+playerctl -p ligma volume 0.6
+```
+
+`OpenUri` is intentionally rejected: playback is local-file only, so a remote client cannot ask Ligma to fetch an arbitrary URI. The service is best-effort and silently disabled when no session bus is available (for example, in a bare TTY).
 
 ### Discord Rich Presence
 
@@ -189,12 +208,13 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 
 - Linux
 - Zig **0.17.0+** (the build script downloads an official compiler into `.tools/` when needed)
-- Qt **6.8+** development files (tested with 6.12.0; QtWidgets and QtNetwork)
+- Qt **6.8+** development files (tested with 6.12.0; QtWidgets, QtNetwork, and QtDBus)
 - GStreamer **1.x** development files and the base/good/bad/ugly plugin sets, plus a PipeWire or ALSA sink
 - QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`; Debian: `libqtermwidget-dev`; newer Ubuntu: `libqtermwidget6-2-dev`)
 - SQLite 3 development files with FTS5 and the trigram tokenizer (tested with 3.54.1)
 - `util-linux` (`lsblk`, `umount`) and **UDisks2** (`udisksctl`) for USB/removable-drive detection and mounting
 - A C/C++ toolchain (`g++`) and `pkg-config`
+- Optional: `playerctl` (or another MPRIS client) to verify the media interface
 
 On Debian/Ubuntu-style systems:
 

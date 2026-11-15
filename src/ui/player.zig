@@ -16,6 +16,11 @@ const qt6 = @import("libqt6zig");
 const discord = @import("../core/discord.zig");
 const music_engine = @import("music_engine.zig");
 const musicbrainz = @import("../core/musicbrainz.zig");
+const theme = @import("theme.zig");
+
+extern fn ligma_mpris_notify() void;
+extern fn ligma_mpris_seeked() void;
+extern fn ligma_smooth_scroll_attach(view: ?*anyopaque) void;
 
 const QHBoxLayout = qt6.QHBoxLayout;
 const QInputDialog = qt6.QInputDialog;
@@ -109,10 +114,11 @@ pub const PlayerPanel = struct {
         self.seek_slider.setEnabled(false);
 
         self.playlist_widget = QListWidget.new(self.container);
-        self.playlist_widget.setAlternatingRowColors(true);
+        self.playlist_widget.setAlternatingRowColors(false);
         self.playlist_widget.setUniformItemSizes(true);
         self.playlist_widget.setMinimumHeight(96);
         self.playlist_widget.setFixedHeight(120);
+        ligma_smooth_scroll_attach(self.playlist_widget.ptr);
 
         const previous_button = QPushButton.new3("⏮");
         self.play_button = QPushButton.new3("▶");
@@ -220,6 +226,7 @@ pub const PlayerPanel = struct {
         self.poll_timer.onTimeout(onPollTimer);
         self.poll_timer.start(100);
 
+        self.applyThemeStyle();
         self.discord = discord.DiscordRpc.create(gpa, io, self.container) catch null;
         self.musicbrainz = musicbrainz.MusicBrainz.create(
             gpa,
@@ -232,6 +239,170 @@ pub const PlayerPanel = struct {
 
         active = self;
         return self;
+    }
+
+    pub fn applyThemeStyle(self: *PlayerPanel) void {
+        var buffer: [4096]u8 = undefined;
+        self.playlist_widget.setStyleSheet(theme.listStyle(&buffer));
+    }
+
+    pub fn mprisPlay(self: *PlayerPanel) void {
+        if (self.playlist.items.len == 0) return;
+        if (self.current == null) {
+            self.playIndex(0);
+            return;
+        }
+        const engine = self.engine orelse return;
+        self.transport_active = true;
+        self.playback_intent_playing = true;
+        engine.play();
+        self.refreshPlayButton();
+        self.publishPresence(true);
+        self.notifyMpris();
+    }
+
+    pub fn mprisPause(self: *PlayerPanel) void {
+        const engine = self.engine orelse return;
+        if (engine.state() != .playing) return;
+        self.playback_intent_playing = false;
+        engine.pause();
+        self.refreshPlayButton();
+        self.publishPresence(false);
+        self.notifyMpris();
+    }
+
+    pub fn mprisPlayPause(self: *PlayerPanel) void {
+        self.togglePlayPause();
+    }
+
+    pub fn mprisStop(self: *PlayerPanel) void {
+        self.stop();
+    }
+
+    pub fn mprisNext(self: *PlayerPanel) void {
+        self.playNext();
+    }
+
+    pub fn mprisPrevious(self: *PlayerPanel) void {
+        self.playPrevious();
+    }
+
+    pub fn mprisSeekRelative(self: *PlayerPanel, microseconds: i64) void {
+        const engine = self.engine orelse return;
+        const delta_ms = @divTrunc(microseconds, 1000);
+        var target: i64 = engine.position() + delta_ms;
+        const duration = engine.duration();
+        if (target < 0) target = 0;
+        if (duration > 0 and target > duration) target = duration;
+        engine.setPosition(target);
+        self.seek_slider.setValue(@intCast(@max(target, 0)));
+        self.updateTime();
+        ligma_mpris_seeked();
+    }
+
+    pub fn mprisSetPosition(self: *PlayerPanel, microseconds: i64) void {
+        const engine = self.engine orelse return;
+        var target: i64 = @divTrunc(@max(microseconds, 0), 1000);
+        const duration = engine.duration();
+        if (duration > 0 and target > duration) target = duration;
+        engine.setPosition(target);
+        self.seek_slider.setValue(@intCast(@max(target, 0)));
+        self.updateTime();
+        ligma_mpris_seeked();
+    }
+
+    pub fn mprisSetVolume(self: *PlayerPanel, volume: f64) void {
+        const clamped = std.math.clamp(volume, 0.0, 1.0);
+        const percent: i32 = @intFromFloat(@round(clamped * 100.0));
+        self.volume_slider.setValue(percent);
+        if (self.engine) |engine| engine.setVolume(volumeFraction(percent));
+        self.notifyMpris();
+    }
+
+    pub fn mprisSetLoop(self: *PlayerPanel, mode: i32) void {
+        self.repeat_mode = switch (mode) {
+            1 => .one,
+            2 => .all,
+            else => .off,
+        };
+        self.refreshRepeatButton();
+        self.notifyMpris();
+    }
+
+    pub fn mprisSetShuffle(self: *PlayerPanel, enabled: bool) void {
+        self.shuffle = enabled;
+        self.refreshShuffleButton();
+        self.notifyMpris();
+    }
+
+    pub fn mprisState(self: *PlayerPanel) i32 {
+        const engine = self.engine orelse return 0;
+        return switch (engine.state()) {
+            .playing => 1,
+            .paused => 2,
+            .stopped => 0,
+        };
+    }
+
+    pub fn mprisPositionUs(self: *PlayerPanel) i64 {
+        const engine = self.engine orelse return 0;
+        return engine.position() * 1000;
+    }
+
+    pub fn mprisDurationUs(self: *PlayerPanel) i64 {
+        const engine = self.engine orelse return 0;
+        return engine.duration() * 1000;
+    }
+
+    pub fn mprisVolume(self: *PlayerPanel) f64 {
+        return @floatCast(volumeFraction(self.volume_slider.value()));
+    }
+
+    pub fn mprisLoop(self: *PlayerPanel) i32 {
+        return switch (self.repeat_mode) {
+            .off => 0,
+            .one => 1,
+            .all => 2,
+        };
+    }
+
+    pub fn mprisShuffle(self: *PlayerPanel) bool {
+        return self.shuffle;
+    }
+
+    pub fn mprisMetadata(self: *PlayerPanel, title_out: []u8, artist_out: []u8, album_out: []u8) void {
+        @memset(title_out, 0);
+        @memset(artist_out, 0);
+        @memset(album_out, 0);
+        const index = self.current orelse return;
+        if (index >= self.playlist.items.len) return;
+
+        var title: []const u8 = std.fs.path.basename(self.playlist.items[index]);
+        var artist: []const u8 = "";
+        var album: []const u8 = "";
+        if (self.tags) |*tags| {
+            if (nonEmpty(tags.titleSlice())) |value| title = value;
+            if (nonEmpty(tags.artistSlice())) |value| artist = value;
+            if (nonEmpty(tags.albumSlice())) |value| album = value;
+        }
+        copyMetadataField(title_out, title);
+        copyMetadataField(artist_out, artist);
+        copyMetadataField(album_out, album);
+    }
+
+    pub fn mprisTrackId(self: *PlayerPanel, out: []u8) void {
+        @memset(out, 0);
+        const index = self.current orelse return;
+        if (index >= self.playlist.items.len) return;
+        var buffer: [64]u8 = undefined;
+        const hash = std.hash.Wyhash.hash(0, self.playlist.items[index]);
+        const id = std.fmt.bufPrint(&buffer, "/org/ligma/track/{x}", .{hash}) catch return;
+        copyMetadataField(out, id);
+    }
+
+    pub fn notifyMpris(self: *PlayerPanel) void {
+        _ = self;
+        ligma_mpris_notify();
     }
 
     fn configureControl(self: *PlayerPanel, button: QPushButton, tooltip: []const u8) void {
@@ -324,6 +495,7 @@ pub const PlayerPanel = struct {
         engine.setVolume(volumeFraction(self.volume_slider.value()));
         self.refreshPlayButton();
         self.publishPresence(true);
+        self.notifyMpris();
     }
 
     fn playNext(self: *PlayerPanel) void {
@@ -386,35 +558,14 @@ pub const PlayerPanel = struct {
                 }
             },
             .off => {
-                const had_next = finished + 1 < self.playlist.items.len;
-                const shuffled = self.shuffle;
-                self.removeTrack(finished);
-
-                if (shuffled and self.playlist.items.len > 0) {
-                    self.playIndex(self.randomAny());
-                } else if (had_next and finished < self.playlist.items.len) {
-                    self.playIndex(finished);
+                if (self.shuffle and self.playlist.items.len > 1) {
+                    self.playIndex(self.randomOther(finished));
+                } else if (finished + 1 < self.playlist.items.len) {
+                    self.playIndex(finished + 1);
                 } else {
                     self.finishQueue();
                 }
             },
-        }
-    }
-
-    fn removeTrack(self: *PlayerPanel, index: usize) void {
-        if (index >= self.playlist.items.len) return;
-        const path = self.playlist.orderedRemove(index);
-        self.gpa.free(path);
-
-        const item = self.playlist_widget.takeItem(@intCast(index));
-        if (item.ptr != null) item.delete();
-
-        if (self.current) |current| {
-            if (current > index) {
-                self.current = current - 1;
-            } else if (current == index) {
-                self.current = null;
-            }
         }
     }
 
@@ -432,9 +583,13 @@ pub const PlayerPanel = struct {
         self.seek_slider.setRange(0, 0);
         self.seek_slider.setEnabled(false);
         self.time_label.setText("0:00 / 0:00");
+        self.playlist_updating = true;
+        self.playlist_widget.setCurrentRow(-1);
+        self.playlist_updating = false;
         self.updateTitle();
         self.refreshPlayButton();
         if (self.discord) |client| client.clearActivity();
+        self.notifyMpris();
     }
 
     fn randomOther(self: *PlayerPanel, current: usize) usize {
@@ -442,10 +597,6 @@ pub const PlayerPanel = struct {
         if (length <= 1) return current;
         const candidate = self.rng.random().uintLessThan(usize, length - 1);
         return if (candidate >= current) candidate + 1 else candidate;
-    }
-
-    fn randomAny(self: *PlayerPanel) usize {
-        return self.rng.random().uintLessThan(usize, self.playlist.items.len);
     }
 
     fn togglePlayPause(self: *PlayerPanel) void {
@@ -456,6 +607,7 @@ pub const PlayerPanel = struct {
             engine.pause();
             self.refreshPlayButton();
             self.publishPresence(false);
+            self.notifyMpris();
             return;
         }
         if (self.current == null) {
@@ -467,6 +619,7 @@ pub const PlayerPanel = struct {
         engine.play();
         self.refreshPlayButton();
         self.publishPresence(true);
+        self.notifyMpris();
     }
 
     fn stop(self: *PlayerPanel) void {
@@ -477,6 +630,7 @@ pub const PlayerPanel = struct {
         self.seek_slider.setValue(0);
         self.time_label.setText("0:00 / 0:00");
         self.refreshPlayButton();
+        self.notifyMpris();
     }
 
     fn cycleRepeat(self: *PlayerPanel) void {
@@ -486,6 +640,7 @@ pub const PlayerPanel = struct {
             .one => .off,
         };
         self.refreshRepeatButton();
+        self.notifyMpris();
     }
 
     fn refreshRepeatButton(self: *PlayerPanel) void {
@@ -501,6 +656,7 @@ pub const PlayerPanel = struct {
     fn toggleShuffle(self: *PlayerPanel) void {
         self.shuffle = !self.shuffle;
         self.refreshShuffleButton();
+        self.notifyMpris();
     }
 
     fn refreshShuffleButton(self: *PlayerPanel) void {
@@ -528,6 +684,7 @@ pub const PlayerPanel = struct {
         self.seek_slider.setRange(0, 0);
         self.seek_slider.setEnabled(false);
         self.refreshPlayButton();
+        self.notifyMpris();
     }
 
     fn updateTitle(self: *PlayerPanel) void {
@@ -598,6 +755,7 @@ pub const PlayerPanel = struct {
                     );
                 }
                 self.publishPresence(self.playback_intent_playing);
+                self.notifyMpris();
             }
         }
 
@@ -605,6 +763,7 @@ pub const PlayerPanel = struct {
         if (duration > 0 and !self.duration_ready) {
             self.duration_ready = true;
             self.publishPresence(self.playback_intent_playing);
+            self.notifyMpris();
         }
         if (duration > 0) {
             const clamped: i32 = @intCast(@min(duration, std.math.maxInt(i32)));
@@ -759,6 +918,13 @@ fn nonEmpty(value: []const u8) ?[]const u8 {
     return if (trimmed.len == 0) null else trimmed;
 }
 
+fn copyMetadataField(destination: []u8, source: []const u8) void {
+    if (destination.len == 0) return;
+    const length = @min(source.len, destination.len - 1);
+    @memcpy(destination[0..length], source[0..length]);
+    destination[length] = 0;
+}
+
 fn envFlag(name: [*:0]const u8) bool {
     const raw = std.c.getenv(name) orelse return false;
     const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
@@ -836,7 +1002,10 @@ fn onSeekMoved(_: QSlider, value: i32) callconv(.c) void {
 }
 
 fn onSeekReleased(_: QSlider) callconv(.c) void {
-    if (active) |panel| panel.publishPresence(panel.playback_intent_playing);
+    if (active) |panel| {
+        panel.publishPresence(panel.playback_intent_playing);
+        ligma_mpris_seeked();
+    }
 }
 
 fn onRepeatClicked(_: QPushButton) callconv(.c) void {
@@ -868,6 +1037,7 @@ fn onOutputClicked(_: QPushButton) callconv(.c) void {
 fn onVolumeChanged(_: QSlider, value: i32) callconv(.c) void {
     if (active) |panel| {
         if (panel.engine) |engine| engine.setVolume(volumeFraction(value));
+        ligma_mpris_notify();
     }
 }
 

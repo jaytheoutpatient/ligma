@@ -8,6 +8,7 @@ const search_scan = @import("core/search_scan.zig");
 const local_model = @import("ui/local_model.zig");
 const mounts = @import("ui/mounts.zig");
 const player_mod = @import("ui/player.zig");
+const theme = @import("ui/theme.zig");
 const preview_mod = @import("ui/preview.zig");
 const terminal_mod = @import("ui/terminal.zig");
 
@@ -98,6 +99,75 @@ const ClipMode = enum { none, copy, cut };
 
 const ViewMode = enum { details, icons, compact };
 
+const Appearance = enum { matugen, light, dark, system };
+
+extern fn ligma_apply_qt6ct_palette(path: [*:0]const u8) c_int;
+extern fn ligma_apply_builtin_palette(dark: c_int) void;
+extern fn ligma_apply_system_palette() void;
+const MprisCallbacks = extern struct {
+    play: *const fn () callconv(.c) void,
+    pause: *const fn () callconv(.c) void,
+    play_pause: *const fn () callconv(.c) void,
+    stop: *const fn () callconv(.c) void,
+    next: *const fn () callconv(.c) void,
+    previous: *const fn () callconv(.c) void,
+    seek_relative: *const fn (i64) callconv(.c) void,
+    set_position: *const fn (i64) callconv(.c) void,
+    set_volume: *const fn (f64) callconv(.c) void,
+    set_loop: *const fn (c_int) callconv(.c) void,
+    set_shuffle: *const fn (c_int) callconv(.c) void,
+    raise: *const fn () callconv(.c) void,
+    quit: *const fn () callconv(.c) void,
+    state: *const fn () callconv(.c) c_int,
+    position_us: *const fn () callconv(.c) i64,
+    duration_us: *const fn () callconv(.c) i64,
+    volume: *const fn () callconv(.c) f64,
+    loop: *const fn () callconv(.c) c_int,
+    shuffle: *const fn () callconv(.c) c_int,
+    metadata: *const fn ([*]u8, usize, [*]u8, usize, [*]u8, usize) callconv(.c) void,
+    track_id: *const fn ([*]u8, usize) callconv(.c) void,
+};
+
+extern fn ligma_mpris_start(callbacks: *const MprisCallbacks) c_int;
+extern fn ligma_mpris_stop() void;
+extern fn ligma_mpris_notify() void;
+extern fn ligma_mpris_seeked() void;
+
+const mpris_callbacks: MprisCallbacks = .{
+    .play = ligma_mpris_play_command,
+    .pause = ligma_mpris_pause_command,
+    .play_pause = ligma_mpris_play_pause_command,
+    .stop = ligma_mpris_stop_command,
+    .next = ligma_mpris_next_command,
+    .previous = ligma_mpris_previous_command,
+    .seek_relative = ligma_mpris_seek_relative_command,
+    .set_position = ligma_mpris_set_position_command,
+    .set_volume = ligma_mpris_set_volume_command,
+    .set_loop = ligma_mpris_set_loop_command,
+    .set_shuffle = ligma_mpris_set_shuffle_command,
+    .raise = ligma_mpris_raise_command,
+    .quit = ligma_mpris_quit_command,
+    .state = ligma_mpris_state,
+    .position_us = ligma_mpris_position_us,
+    .duration_us = ligma_mpris_duration_us,
+    .volume = ligma_mpris_volume,
+    .loop = ligma_mpris_loop,
+    .shuffle = ligma_mpris_shuffle,
+    .metadata = ligma_mpris_metadata,
+    .track_id = ligma_mpris_track_id,
+};
+extern fn ligma_smooth_scroll_attach(view: ?*anyopaque) void;
+extern fn ligma_set_row_gradient_colors(start_r: c_int, start_g: c_int, start_b: c_int, end_r: c_int, end_g: c_int, end_b: c_int) void;
+extern fn ligma_attach_row_gradient(view: ?*anyopaque) void;
+extern fn ligma_dock_slide_show(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
+extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
+extern fn ligma_dock_new(title: [*:0]const u8, parent: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) ?*anyopaque;
+
+var appearance_mode: Appearance = .system;
+var matugen_scheme_buf: [4096]u8 = undefined;
+var matugen_scheme_len: usize = 0;
+var matugen_available = false;
+
 const App = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -144,6 +214,10 @@ const App = struct {
     view_details_action: QAction,
     view_icons_action: QAction,
     view_compact_action: QAction,
+    appearance_matugen_action: QAction,
+    appearance_light_action: QAction,
+    appearance_dark_action: QAction,
+    appearance_system_action: QAction,
     ctx_open_action: QAction,
     ctx_restore_action: QAction,
     ctx_empty_trash_action: QAction,
@@ -235,22 +309,6 @@ var app: App = undefined;
 /// other sizes for launchers and panels.
 const window_icon_png = @embedFile("assets/org.ligma.FileManager-256.png");
 
-const sidebar_list_style =
-    "QListWidget { background: transparent; border: none; outline: none; padding: 2px; }" ++
-    "QListWidget::item { border: none; border-radius: 6px; padding: 4px 6px; margin: 1px 0; }" ++
-    "QListWidget::item:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
-    "stop:0 rgba(96, 165, 250, 0.34), stop:1 rgba(96, 165, 250, 0.0)); }" ++
-    "QListWidget::item:selected { color: white; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
-    "stop:0 rgba(59, 130, 246, 0.88), stop:0.6 rgba(99, 102, 241, 0.50), " ++
-    "stop:1 rgba(99, 102, 241, 0.0)); }" ++
-    "QListWidget QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }" ++
-    "QListWidget QScrollBar::handle:vertical { background: rgba(148, 163, 184, 0.5); " ++
-    "border-radius: 4px; min-height: 18px; }" ++
-    "QListWidget QScrollBar::add-line:vertical, QListWidget QScrollBar::sub-line:vertical " ++
-    "{ height: 0; background: none; }" ++
-    "QListWidget QScrollBar::add-page:vertical, QListWidget QScrollBar::sub-page:vertical " ++
-    "{ background: transparent; }";
-
 fn loadApplicationIcon() QIcon {
     const pixmap = QPixmap.new();
     defer pixmap.delete();
@@ -264,6 +322,11 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     QApplication.setApplicationName("Ligma");
     QApplication.setApplicationDisplayName("Ligma");
     QApplication.setDesktopFileName("org.ligma.FileManager");
+
+    detectMatugenScheme(init.gpa, init.io);
+    appearance_mode = loadAppearanceSetting(init.gpa, init.io);
+    if (appearance_mode == .matugen and !matugen_available) appearance_mode = .system;
+    applyAppearancePalette(init.gpa, init.io);
 
     const window_icon = loadApplicationIcon();
     defer window_icon.delete();
@@ -300,7 +363,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     places.setVerticalScrollBarPolicy(qnamespace_enums.ScrollBarPolicy.ScrollBarAsNeeded);
     places.setMouseTracking(true);
     places.setAttribute2(qnamespace_enums.WidgetAttribute.WA_Hover, true);
-    places.setStyleSheet(sidebar_list_style);
+    setListStyle(places);
+    ligma_smooth_scroll_attach(places.ptr);
     sidebar_layout.addWidget(places);
 
     const drives_label = QLabel.new3("Drives");
@@ -313,7 +377,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     drives.setVerticalScrollBarPolicy(qnamespace_enums.ScrollBarPolicy.ScrollBarAsNeeded);
     drives.setMouseTracking(true);
     drives.setAttribute2(qnamespace_enums.WidgetAttribute.WA_Hover, true);
-    drives.setStyleSheet(sidebar_list_style);
+    setListStyle(drives);
+    ligma_smooth_scroll_attach(drives.ptr);
     drives.hide();
     sidebar_layout.addWidget(drives);
 
@@ -369,8 +434,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         qdockwidget_enums.DockWidgetFeature.DockWidgetMovable);
     const search_list = QListWidget.new(search_dock);
     search_list.setUniformItemSizes(true);
-    search_list.setAlternatingRowColors(true);
+    search_list.setAlternatingRowColors(false);
     search_list.setWordWrap(false);
+    ligma_smooth_scroll_attach(search_list.ptr);
     search_dock.setWidget(search_list);
     window.addDockWidget(qnamespace_enums.DockWidgetArea.BottomDockWidgetArea, search_dock);
     search_dock.hide();
@@ -378,7 +444,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     // ---- Terminal dock ---------------------------------------------------
     // F12 toggles this panel. The shell itself is started lazily the first
     // time the panel is shown, in the active pane's folder.
-    const terminal_dock = QDockWidget.new4("Terminal", window);
+    const terminal_dock = createDock("Terminal", window, true, 190, 400);
     terminal_dock.setAllowedAreas(qnamespace_enums.DockWidgetArea.RightDockWidgetArea);
     terminal_dock.setFeatures(qdockwidget_enums.DockWidgetFeature.DockWidgetClosable |
         qdockwidget_enums.DockWidgetFeature.DockWidgetMovable);
@@ -387,12 +453,11 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     terminal_dock.setWidget(terminal_widget);
     window.addDockWidget(qnamespace_enums.DockWidgetArea.RightDockWidgetArea, terminal_dock);
     terminal_dock.hide();
-
     // ---- Music player dock ----------------------------------------------
     // Hidden until an audio file is activated or the user adds tracks to the
     // playlist. The panel owns the GStreamer engine; the dock owns the
     // widget tree.
-    const player_dock = QDockWidget.new4("Music Player", window);
+    const player_dock = createDock("Music Player", window, false, 190, 0);
     player_dock.setAllowedAreas(qnamespace_enums.DockWidgetArea.BottomDockWidgetArea);
     player_dock.setFeatures(qdockwidget_enums.DockWidgetFeature.DockWidgetClosable |
         qdockwidget_enums.DockWidgetFeature.DockWidgetMovable);
@@ -527,6 +592,28 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     _ = view_group.addAction(compact_view_action);
     view_menu.addAction(compact_view_action);
     _ = view_menu.addSeparator();
+    const appearance_menu = QMenu.new4("&Appearance", view_menu);
+    _ = view_menu.addMenu(appearance_menu);
+    const appearance_group = QActionGroup.new(appearance_menu);
+    appearance_group.setExclusive(true);
+    const appearance_matugen_action = makeAction(appearance_menu, "Matugen", null, onAppearanceMatugen);
+    appearance_matugen_action.setCheckable(true);
+    appearance_matugen_action.setEnabled(matugen_available);
+    _ = appearance_group.addAction(appearance_matugen_action);
+    appearance_menu.addAction(appearance_matugen_action);
+    const appearance_light_action = makeAction(appearance_menu, "Light", null, onAppearanceLight);
+    appearance_light_action.setCheckable(true);
+    _ = appearance_group.addAction(appearance_light_action);
+    appearance_menu.addAction(appearance_light_action);
+    const appearance_dark_action = makeAction(appearance_menu, "Dark", null, onAppearanceDark);
+    appearance_dark_action.setCheckable(true);
+    _ = appearance_group.addAction(appearance_dark_action);
+    appearance_menu.addAction(appearance_dark_action);
+    const appearance_system_action = makeAction(appearance_menu, "System", null, onAppearanceSystem);
+    appearance_system_action.setCheckable(true);
+    _ = appearance_group.addAction(appearance_system_action);
+    appearance_menu.addAction(appearance_system_action);
+    _ = view_menu.addSeparator();
     const terminal_action = makeAction(view_menu, "Terminal Panel", "F12", onToggleTerminal);
     terminal_action.setCheckable(true);
     view_menu.addAction(terminal_action);
@@ -639,6 +726,10 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .view_details_action = details_view_action,
         .view_icons_action = icons_view_action,
         .view_compact_action = compact_view_action,
+        .appearance_matugen_action = appearance_matugen_action,
+        .appearance_light_action = appearance_light_action,
+        .appearance_dark_action = appearance_dark_action,
+        .appearance_system_action = appearance_system_action,
         .ctx_open_action = ctx_open_action,
         .ctx_restore_action = ctx_restore_action,
         .ctx_empty_trash_action = ctx_empty_trash_action,
@@ -674,6 +765,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .hidden_action = hidden_action,
         .undo_action = undo_action,
     };
+
+    updateAppearanceActions();
+    applyThemeStyles();
 
     file_ops.ensureTrashDirs(init.gpa, init.io) catch {};
 
@@ -714,6 +808,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
 
     const first_tab = createTab(home);
     window.show();
+    _ = ligma_mpris_start(&mpris_callbacks);
+    ligma_mpris_notify();
     model_timer.start(50);
     mount_timer.start(2000);
     initSearchIndex(home);
@@ -724,7 +820,254 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     shutdown();
 }
 
+fn configHome(gpa: std.mem.Allocator) ![]u8 {
+    if (std.c.getenv("XDG_CONFIG_HOME")) |raw| {
+        const value = std.mem.span(raw);
+        if (value.len > 0 and value[0] == '/') return gpa.dupe(u8, value);
+    }
+    const home = std.c.getenv("HOME") orelse return error.NoHomeDirectory;
+    return std.fs.path.join(gpa, &.{ std.mem.span(home), ".config" });
+}
+
+fn appearanceSettingsPath(gpa: std.mem.Allocator) ![]u8 {
+    const config = try configHome(gpa);
+    defer gpa.free(config);
+    return std.fs.path.join(gpa, &.{ config, "ligma", "appearance" });
+}
+
+fn loadAppearanceSetting(gpa: std.mem.Allocator, io: std.Io) Appearance {
+    const path = appearanceSettingsPath(gpa) catch {
+        return if (matugen_available) .matugen else .system;
+    };
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, std.Io.Limit.limited(256)) catch {
+        return if (matugen_available) .matugen else .system;
+    };
+    defer gpa.free(data);
+    const value = std.mem.trim(u8, data, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(value, "matugen")) return .matugen;
+    if (std.ascii.eqlIgnoreCase(value, "light")) return .light;
+    if (std.ascii.eqlIgnoreCase(value, "dark")) return .dark;
+    if (std.ascii.eqlIgnoreCase(value, "system")) return .system;
+    return if (matugen_available) .matugen else .system;
+}
+
+fn saveAppearanceSetting() void {
+    const path = appearanceSettingsPath(app.gpa) catch return;
+    defer app.gpa.free(path);
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(app.io, dir) catch {};
+    }
+    const value: []const u8 = switch (appearance_mode) {
+        .matugen => "matugen\n",
+        .light => "light\n",
+        .dark => "dark\n",
+        .system => "system\n",
+    };
+    std.Io.Dir.cwd().writeFile(app.io, .{
+        .sub_path = path,
+        .data = value,
+        .flags = .{ .truncate = true },
+    }) catch {};
+}
+
+fn setMatugenPath(path: []const u8) void {
+    matugen_scheme_len = @min(path.len, matugen_scheme_buf.len - 1);
+    @memcpy(matugen_scheme_buf[0..matugen_scheme_len], path[0..matugen_scheme_len]);
+    matugen_scheme_buf[matugen_scheme_len] = 0;
+}
+
+fn detectMatugenScheme(gpa: std.mem.Allocator, io: std.Io) void {
+    matugen_available = false;
+    matugen_scheme_len = 0;
+
+    const config = configHome(gpa) catch return;
+    defer gpa.free(config);
+    const qt6ct_dir = std.fs.path.join(gpa, &.{ config, "qt6ct" }) catch return;
+    defer gpa.free(qt6ct_dir);
+    const qt6ct_config = std.fs.path.join(gpa, &.{ qt6ct_dir, "qt6ct.conf" }) catch return;
+    defer gpa.free(qt6ct_config);
+
+    var scheme_path: ?[]u8 = null;
+    defer if (scheme_path) |path| gpa.free(path);
+
+    if (std.Io.Dir.cwd().readFileAlloc(io, qt6ct_config, gpa, std.Io.Limit.limited(64 * 1024))) |data| {
+        defer gpa.free(data);
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (!std.mem.startsWith(u8, line, "color_scheme_path=")) continue;
+            const value = std.mem.trim(u8, line["color_scheme_path=".len..], " \t\r");
+            if (value.len == 0) continue;
+            if (std.fs.path.isAbsolute(value)) {
+                scheme_path = gpa.dupe(u8, value) catch null;
+            } else if (std.mem.startsWith(u8, value, "~/")) {
+                const home = std.c.getenv("HOME") orelse continue;
+                scheme_path = std.fs.path.join(gpa, &.{ std.mem.span(home), value[2..] }) catch null;
+            } else {
+                const colors_dir = std.fs.path.join(gpa, &.{ qt6ct_dir, "colors" }) catch continue;
+                defer gpa.free(colors_dir);
+                scheme_path = std.fs.path.join(gpa, &.{ colors_dir, value }) catch null;
+            }
+            break;
+        }
+    } else |_| {}
+
+    if (scheme_path == null) {
+        const colors_dir = std.fs.path.join(gpa, &.{ qt6ct_dir, "colors" }) catch return;
+        defer gpa.free(colors_dir);
+        scheme_path = std.fs.path.join(gpa, &.{ colors_dir, "matugen.conf" }) catch null;
+    }
+    const path = scheme_path orelse return;
+    _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch return;
+    setMatugenPath(path);
+    matugen_available = true;
+}
+
+fn parseMatugenAccents(gpa: std.mem.Allocator, io: std.Io) void {
+    if (!matugen_available or matugen_scheme_len == 0) return;
+    const path = matugen_scheme_buf[0..matugen_scheme_len];
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, std.Io.Limit.limited(64 * 1024)) catch return;
+    defer gpa.free(data);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "active_colors=")) continue;
+        var index: usize = 0;
+        var colors = std.mem.splitScalar(u8, line["active_colors=".len..], ',');
+        var highlight: ?[]const u8 = null;
+        var link: ?[]const u8 = null;
+        while (colors.next()) |color| : (index += 1) {
+            if (index == 12) highlight = std.mem.trim(u8, color, " \t");
+            if (index == 14) link = std.mem.trim(u8, color, " \t");
+        }
+        if (highlight != null and link != null)
+            theme.setAccentFromHex(highlight.?, link.?);
+        return;
+    }
+}
+
+fn applyAppearancePalette(gpa: std.mem.Allocator, io: std.Io) void {
+    switch (appearance_mode) {
+        .matugen => {
+            if (matugen_available and matugen_scheme_len > 0) {
+                const path: [*:0]const u8 = @ptrCast(&matugen_scheme_buf);
+                if (ligma_apply_qt6ct_palette(path) != 0) {
+                    parseMatugenAccents(gpa, io);
+                    return;
+                }
+            }
+            theme.setDefaultAccent();
+            ligma_apply_builtin_palette(1);
+        },
+        .light => {
+            theme.setDefaultAccent();
+            ligma_apply_builtin_palette(0);
+        },
+        .dark => {
+            theme.setDefaultAccent();
+            ligma_apply_builtin_palette(1);
+        },
+        .system => {
+            theme.setDefaultAccent();
+            ligma_apply_system_palette();
+        },
+    }
+}
+
+fn updateAppearanceActions() void {
+    app.appearance_matugen_action.setEnabled(matugen_available);
+    app.appearance_matugen_action.setChecked(appearance_mode == .matugen);
+    app.appearance_light_action.setChecked(appearance_mode == .light);
+    app.appearance_dark_action.setChecked(appearance_mode == .dark);
+    app.appearance_system_action.setChecked(appearance_mode == .system);
+}
+
+fn setAppearance(mode: Appearance) void {
+    if (mode == .matugen) {
+        // Re-read the scheme so a wallpaper change or a fresh `matugen image`
+        // invocation is picked up without restarting Ligma.
+        detectMatugenScheme(app.gpa, app.io);
+        if (!matugen_available) {
+            updateAppearanceActions();
+            return;
+        }
+    }
+    appearance_mode = mode;
+    saveAppearanceSetting();
+    applyAppearancePalette(app.gpa, app.io);
+    applyThemeStyles();
+    updateAppearanceActions();
+}
+
+fn onAppearanceMatugen(_: QAction) callconv(.c) void {
+    setAppearance(.matugen);
+}
+
+fn onAppearanceLight(_: QAction) callconv(.c) void {
+    setAppearance(.light);
+}
+
+fn onAppearanceDark(_: QAction) callconv(.c) void {
+    setAppearance(.dark);
+}
+
+fn onAppearanceSystem(_: QAction) callconv(.c) void {
+    setAppearance(.system);
+}
+
+fn createDock(title: [:0]const u8, parent: anytype, horizontal: bool, duration_ms: c_int, minimum: c_int) QDockWidget {
+    const ptr = ligma_dock_new(
+        title.ptr,
+        parent.ptr,
+        @intFromBool(horizontal),
+        duration_ms,
+        minimum,
+    ) orelse @panic("Could not create dock widget");
+    return .{ .ptr = @ptrCast(ptr) };
+}
+
+fn setListStyle(list: QListWidget) void {
+    var buffer: [4096]u8 = undefined;
+    list.setStyleSheet(theme.listStyle(&buffer));
+}
+
+fn setViewStyle(view: anytype) void {
+    var buffer: [2048]u8 = undefined;
+    view.setStyleSheet(theme.viewStyle(&buffer));
+}
+
+fn refreshDriveBarStyles() void {
+    var buffer: [1024]u8 = undefined;
+    const style = theme.progressStyle(&buffer);
+    for (app.drive_bars.items) |bar| bar.setStyleSheet(style);
+}
+
+fn applyThemeStyles() void {
+    // The gradient delegate paints tree rows, so it needs the current accent
+    // pair before the panes are styled and repainted.
+    ligma_set_row_gradient_colors(
+        theme.accent_start.r,
+        theme.accent_start.g,
+        theme.accent_start.b,
+        theme.accent_end.r,
+        theme.accent_end.g,
+        theme.accent_end.b,
+    );
+    setListStyle(app.places);
+    setListStyle(app.drives);
+    for (app.panes_list.items) |pane| {
+        setViewStyle(pane.tree);
+        setViewStyle(pane.list);
+        ligma_attach_row_gradient(pane.tree.ptr);
+    }
+    refreshDriveBarStyles();
+    app.player.applyThemeStyle();
+}
+
 fn shutdown() void {
+    ligma_mpris_stop();
     // Stop playback and release GStreamer before the window disappears.
     app.player.deinit();
 
@@ -853,7 +1196,7 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
     nav.setStretch(1, 2);
 
     const tree = QTreeView.new(container);
-    tree.setAlternatingRowColors(true);
+    tree.setAlternatingRowColors(false);
     tree.setUniformRowHeights(true);
     tree.setSortingEnabled(true);
     tree.setRootIsDecorated(false);
@@ -888,6 +1231,16 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
     list.setResizeMode(qlistview_enums.ResizeMode.Adjust);
     list.setMovement(qlistview_enums.Movement.Static);
     list.setViewMode(qlistview_enums.ViewMode.IconMode);
+
+    tree.setMouseTracking(true);
+    tree.setAttribute2(qnamespace_enums.WidgetAttribute.WA_Hover, true);
+    list.setMouseTracking(true);
+    list.setAttribute2(qnamespace_enums.WidgetAttribute.WA_Hover, true);
+    setViewStyle(tree);
+    setViewStyle(list);
+    ligma_attach_row_gradient(tree.ptr);
+    ligma_smooth_scroll_attach(tree.ptr);
+    ligma_smooth_scroll_attach(list.ptr);
 
     const model = local_model.LocalModel.create(app.gpa, app.io, container) catch
         @panic("Out of memory creating model");
@@ -1655,7 +2008,9 @@ fn showStatus(message: []const u8, timeout_ms: i32) void {
 }
 
 fn showPlayer() void {
-    app.player_dock.show();
+    if (!app.player_dock.isVisible()) {
+        ligma_dock_slide_show(app.player_dock.ptr, 0, 190, 0);
+    }
     app.player_dock.raise();
 }
 
@@ -3218,14 +3573,8 @@ fn refreshMountedPlaces() void {
         bar.setRange(0, 100);
         bar.setTextVisible(false);
         bar.setFixedHeight(8);
-        bar.setStyleSheet(
-            "QProgressBar { border: 0; border-radius: 3px; " ++
-                "background: rgba(128, 128, 128, 0.22); } " ++
-                "QProgressBar::chunk { border-radius: 3px; background: " ++
-                "qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
-                "stop:0 #3b82f6, stop:0.58 #6366f1, " ++
-                "stop:1 rgba(99, 102, 241, 0.0)); }",
-        );
+        var bar_style_buffer: [1024]u8 = undefined;
+        bar.setStyleSheet(theme.progressStyle(&bar_style_buffer));
         item_layout.addWidget(bar);
 
         app.drives.setItemWidget(item, item_widget);
@@ -4354,7 +4703,7 @@ fn onTerminalVisibilityChanged(_: QDockWidget, visible: bool) callconv(.c) void 
 
 fn onTogglePlayer(_: QAction) callconv(.c) void {
     if (app.player_dock.isVisible()) {
-        app.player_dock.hide();
+        ligma_dock_slide_hide(app.player_dock.ptr, 0, 170, 0);
         if (activePane()) |pane| focusPane(pane);
         return;
     }
@@ -4367,7 +4716,7 @@ fn onPlayerVisibilityChanged(_: QDockWidget, visible: bool) callconv(.c) void {
 
 fn toggleTerminal() void {
     if (app.terminal_dock.isVisible()) {
-        app.terminal_dock.hide();
+        ligma_dock_slide_hide(app.terminal_dock.ptr, 1, 170, 400);
         if (activePane()) |pane| focusPane(pane);
         return;
     }
@@ -4378,7 +4727,9 @@ fn toggleTerminal() void {
 /// is already running is asked to change directory; QTermWidget only forwards
 /// the `cd` while the shell is at a prompt, so foreground jobs are safe.
 fn openTerminalAt(directory: []const u8) void {
-    app.terminal_dock.show();
+    if (!app.terminal_dock.isVisible()) {
+        ligma_dock_slide_show(app.terminal_dock.ptr, 1, 190, 400);
+    }
     app.terminal_dock.raise();
     if (!app.terminal_started) {
         app.terminal_started = terminal_mod.start(app.terminal_widget, app.gpa, userShell(), directory);
@@ -4435,8 +4786,108 @@ fn onAbout(_: QAction) callconv(.c) void {
             "Built with Zig and Qt 6. This build adds a custom asynchronous " ++
             "item model, tabs, split view, recursive filename search, " ++
             "undoable file operations, a browsable freedesktop.org Trash, " ++
-            "live folder refresh, mounted-drive shortcuts, and multiple " ++
-            "view modes.\n\n" ++
+            "live folder refresh, mounted-drive shortcuts, multiple view " ++
+            "modes, and MPRIS media control.\n\n" ++
             "The roadmap adds metadata, remote locations, and an extension API.",
     );
+}
+
+// ---- MPRIS command bridge ------------------------------------------------
+
+export fn ligma_mpris_play_command() callconv(.c) void {
+    app.player.mprisPlay();
+}
+
+export fn ligma_mpris_pause_command() callconv(.c) void {
+    app.player.mprisPause();
+}
+
+export fn ligma_mpris_play_pause_command() callconv(.c) void {
+    app.player.mprisPlayPause();
+}
+
+export fn ligma_mpris_stop_command() callconv(.c) void {
+    app.player.mprisStop();
+}
+
+export fn ligma_mpris_next_command() callconv(.c) void {
+    app.player.mprisNext();
+}
+
+export fn ligma_mpris_previous_command() callconv(.c) void {
+    app.player.mprisPrevious();
+}
+
+export fn ligma_mpris_seek_relative_command(microseconds: i64) callconv(.c) void {
+    app.player.mprisSeekRelative(microseconds);
+}
+
+export fn ligma_mpris_set_position_command(microseconds: i64) callconv(.c) void {
+    app.player.mprisSetPosition(microseconds);
+}
+
+export fn ligma_mpris_set_volume_command(volume: f64) callconv(.c) void {
+    app.player.mprisSetVolume(volume);
+}
+
+export fn ligma_mpris_set_loop_command(mode: c_int) callconv(.c) void {
+    app.player.mprisSetLoop(mode);
+}
+
+export fn ligma_mpris_set_shuffle_command(enabled: c_int) callconv(.c) void {
+    app.player.mprisSetShuffle(enabled != 0);
+}
+
+export fn ligma_mpris_raise_command() callconv(.c) void {
+    app.window.show();
+    app.window.raise();
+    app.window.activateWindow();
+    showPlayer();
+}
+
+export fn ligma_mpris_quit_command() callconv(.c) void {
+    QApplication.quit();
+}
+
+export fn ligma_mpris_state() callconv(.c) c_int {
+    return app.player.mprisState();
+}
+
+export fn ligma_mpris_position_us() callconv(.c) i64 {
+    return app.player.mprisPositionUs();
+}
+
+export fn ligma_mpris_duration_us() callconv(.c) i64 {
+    return app.player.mprisDurationUs();
+}
+
+export fn ligma_mpris_volume() callconv(.c) f64 {
+    return app.player.mprisVolume();
+}
+
+export fn ligma_mpris_loop() callconv(.c) c_int {
+    return app.player.mprisLoop();
+}
+
+export fn ligma_mpris_shuffle() callconv(.c) c_int {
+    return if (app.player.mprisShuffle()) 1 else 0;
+}
+
+export fn ligma_mpris_metadata(
+    title: [*]u8,
+    title_len: usize,
+    artist: [*]u8,
+    artist_len: usize,
+    album: [*]u8,
+    album_len: usize,
+) callconv(.c) void {
+    app.player.mprisMetadata(
+        title[0..title_len],
+        artist[0..artist_len],
+        album[0..album_len],
+    );
+}
+
+export fn ligma_mpris_track_id(out: [*]u8, out_len: usize) callconv(.c) void {
+    app.player.mprisTrackId(out[0..out_len]);
 }

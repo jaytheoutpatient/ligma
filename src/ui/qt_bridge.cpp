@@ -4,8 +4,282 @@
 // expects one for DecorationRole. Keeping this in C++ avoids a second
 // hand-written Zig representation of QVariant's internal storage.
 
+#include <QAbstractAnimation>
+#include <QAbstractItemView>
+#include <QCloseEvent>
+#include <QApplication>
+#include <QDockWidget>
+#include <QEasingCurve>
+#include <QEvent>
 #include <QIcon>
+#include <QLinearGradient>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPropertyAnimation>
+#include <QScrollBar>
+#include <QString>
+#include <QStyledItemDelegate>
+#include <QTreeView>
 #include <QVariant>
+#include <QWheelEvent>
+#include <QWidget>
+
+#include <algorithm>
+
+extern "C" void ligma_dock_slide_hide(void *dock_pointer, int horizontal, int duration_ms, int minimum);
+
+namespace {
+
+QColor row_gradient_start(59, 130, 246);
+QColor row_gradient_end(99, 102, 241);
+
+QRect treeRowRect(const QTreeView *tree, const QModelIndex &index, const QRect &fallback)
+{
+    const QRect cell = tree->visualRect(index.sibling(index.row(), 0));
+    const int height = cell.height() > 0 ? cell.height() : fallback.height();
+    if (height <= 0)
+        return fallback;
+    return QRect(0, cell.top(), tree->viewport()->width(), height);
+}
+
+class GradientRowDelegate final : public QStyledItemDelegate {
+  public:
+    explicit GradientRowDelegate(QAbstractItemView *view)
+        : QStyledItemDelegate(view)
+        , view_(view)
+    {
+        if (QWidget *viewport = view_->viewport()) {
+            viewport->setMouseTracking(true);
+            viewport->installEventFilter(this);
+        }
+        if (QScrollBar *bar = view_->verticalScrollBar()) {
+            QObject::connect(bar, &QScrollBar::valueChanged, this,
+                [this](int) { updateHoverFromCursor(); });
+        }
+        if (QScrollBar *bar = view_->horizontalScrollBar()) {
+            QObject::connect(bar, &QScrollBar::valueChanged, this,
+                [this](int) { updateHoverFromCursor(); });
+        }
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == view_->viewport()) {
+            if (event->type() == QEvent::MouseMove) {
+                const auto *motion = static_cast<QMouseEvent *>(event);
+                updateHover(view_->indexAt(motion->position().toPoint()).row());
+            } else if (event->type() == QEvent::Leave) {
+                updateHover(-1);
+            }
+        }
+        return QStyledItemDelegate::eventFilter(watched, event);
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+        const QModelIndex &index) const override
+    {
+        QStyleOptionViewItem opt = option;
+        initStyleOption(&opt, index);
+
+        // initStyleOption rebuilds the state from the index and can drop the
+        // view's selection bit, so read it from the untouched option first.
+        const bool selected = (option.state & QStyle::State_Selected) != 0;
+        const bool hovered = index.row() == hover_row_;
+        if (selected || hovered) {
+            const auto *tree = qobject_cast<const QTreeView *>(view_);
+            const QRect row = tree != nullptr
+                ? treeRowRect(tree, index, opt.rect)
+                : opt.rect;
+            const QRect painted = row.adjusted(2, 1, -2, -1);
+            QLinearGradient gradient(painted.topLeft(),
+                QPointF(painted.right() + 1, painted.top()));
+            const bool light = lightBackground();
+            if (selected) {
+                gradient.setColorAt(0.0, withAlpha(row_gradient_start, light ? 0.34 : 0.88));
+                gradient.setColorAt(0.6, withAlpha(row_gradient_end, light ? 0.16 : 0.50));
+                gradient.setColorAt(1.0, withAlpha(row_gradient_end, 0.0));
+            } else {
+                gradient.setColorAt(0.0, withAlpha(row_gradient_start, light ? 0.20 : 0.34));
+                gradient.setColorAt(1.0, withAlpha(row_gradient_end, 0.0));
+            }
+
+            QPainterPath path;
+            path.addRoundedRect(painted, 6, 6);
+            painter->save();
+            painter->setClipRect(opt.rect);
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            painter->fillPath(path, gradient);
+            painter->restore();
+
+            opt.state &= ~(QStyle::State_Selected | QStyle::State_MouseOver);
+            if (selected) {
+                const QColor selectedText = light ? QColor(QStringLiteral("#171a1f"))
+                                                  : QColor(Qt::white);
+                opt.palette.setColor(QPalette::Text, selectedText);
+                opt.palette.setColor(QPalette::WindowText, selectedText);
+                opt.palette.setColor(QPalette::HighlightedText, selectedText);
+            }
+        }
+
+        QStyledItemDelegate::paint(painter, opt, index);
+    }
+
+  public:
+    void refreshHover() { updateHoverFromCursor(); }
+
+  private:
+    static bool lightBackground()
+    {
+        return QApplication::palette().color(QPalette::Base).lightness() > 128;
+    }
+
+    static QColor withAlpha(const QColor &color, qreal alpha)
+    {
+        QColor result = color;
+        result.setAlphaF(alpha);
+        return result;
+    }
+
+    void updateHover(int row)
+    {
+        if (row == hover_row_)
+            return;
+        hover_row_ = row;
+        if (QWidget *viewport = view_->viewport())
+            viewport->update();
+    }
+
+    void updateHoverFromCursor()
+    {
+        if (view_->viewport() == nullptr)
+            return;
+        const QPoint local = view_->viewport()->mapFromGlobal(QCursor::pos());
+        if (!view_->viewport()->rect().contains(local)) {
+            updateHover(-1);
+            return;
+        }
+        updateHover(view_->indexAt(local).row());
+    }
+
+    QAbstractItemView *view_;
+    int hover_row_ = -1;
+};
+
+
+
+class SmoothScrollFilter final : public QObject {
+  public:
+    SmoothScrollFilter(QWidget *viewport, QScrollBar *bar)
+        : QObject(viewport)
+        , bar_(bar)
+        , animation_(new QPropertyAnimation(bar, "value", this))
+    {
+        animation_->setDuration(160);
+        animation_->setEasingCurve(QEasingCurve::OutCubic);
+        QObject::connect(bar, &QScrollBar::sliderPressed, animation_,
+            &QPropertyAnimation::stop);
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() != QEvent::Wheel || bar_ == nullptr ||
+            bar_->maximum() <= bar_->minimum()) {
+            return QObject::eventFilter(watched, event);
+        }
+
+        auto *wheel = static_cast<QWheelEvent *>(event);
+        if (wheel->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier))
+            return QObject::eventFilter(watched, event);
+        int distance = wheel->pixelDelta().y();
+        if (distance == 0) {
+            const int angle = wheel->angleDelta().y();
+            if (angle == 0)
+                return QObject::eventFilter(watched, event);
+            distance = (angle > 0 ? -1 : 1) * std::max(bar_->singleStep() * 3, 48);
+        }
+
+        animation_->stop();
+        const int start = bar_->value();
+        const int target = std::clamp(start + distance, bar_->minimum(), bar_->maximum());
+        if (target == start)
+            return true;
+        animation_->setStartValue(start);
+        animation_->setEndValue(target);
+        animation_->start();
+        return true;
+    }
+
+  private:
+    QScrollBar *bar_;
+    QPropertyAnimation *animation_;
+};
+
+class LigmaDockWidget final : public QDockWidget {
+  public:
+    LigmaDockWidget(const QString &title, QWidget *parent, bool horizontal,
+        int duration_ms, int minimum)
+        : QDockWidget(title, parent)
+        , horizontal_(horizontal)
+        , duration_ms_(duration_ms)
+        , minimum_(minimum)
+    {
+    }
+
+  protected:
+    void closeEvent(QCloseEvent *event) override
+    {
+        event->ignore();
+        ligma_dock_slide_hide(this, horizontal_ ? 1 : 0, duration_ms_, minimum_);
+    }
+
+  private:
+    bool horizontal_;
+    int duration_ms_;
+    int minimum_;
+};
+
+void stopDockAnimation(QDockWidget *dock)
+{
+    auto *existing = dock->findChild<QPropertyAnimation *>("ligmaDockAnimation");
+    if (existing != nullptr) {
+        existing->stop();
+        existing->deleteLater();
+    }
+}
+
+void setDockMinimum(QDockWidget *dock, bool horizontal, int minimum)
+{
+    if (horizontal) {
+        dock->setMinimumWidth(std::max(minimum, 0));
+        dock->setMaximumWidth(QWIDGETSIZE_MAX);
+    } else {
+        dock->setMinimumHeight(std::max(minimum, 0));
+        dock->setMaximumHeight(QWIDGETSIZE_MAX);
+    }
+}
+
+void startDockAnimation(QDockWidget *dock, bool horizontal, int start, int end,
+    int duration_ms, int minimum, bool hide_after)
+{
+    stopDockAnimation(dock);
+    auto *animation = new QPropertyAnimation(
+        dock, horizontal ? "maximumWidth" : "maximumHeight", dock);
+    animation->setObjectName("ligmaDockAnimation");
+    animation->setDuration(std::max(duration_ms, 1));
+    animation->setEasingCurve(QEasingCurve::OutCubic);
+    animation->setStartValue(start);
+    animation->setEndValue(end);
+    QObject::connect(animation, &QPropertyAnimation::finished, dock,
+        [dock, horizontal, minimum, hide_after]() {
+            if (hide_after)
+                dock->hide();
+            setDockMinimum(dock, horizontal, minimum);
+        });
+    animation->start(QAbstractAnimation::DeleteWhenStopped);
+}
+
+} // namespace
 
 extern "C" {
 
@@ -14,6 +288,101 @@ void *ligma_qvariant_from_icon(void *icon)
     if (icon == nullptr)
         return nullptr;
     return new QVariant(*static_cast<QIcon *>(icon));
+}
+
+void ligma_set_row_gradient_colors(int start_r, int start_g, int start_b, int end_r,
+    int end_g, int end_b)
+{
+    row_gradient_start = QColor(start_r, start_g, start_b);
+    row_gradient_end = QColor(end_r, end_g, end_b);
+}
+
+void ligma_attach_row_gradient(void *view_pointer)
+{
+    auto *view = static_cast<QAbstractItemView *>(view_pointer);
+    if (view == nullptr)
+        return;
+
+    auto *delegate = dynamic_cast<GradientRowDelegate *>(view->itemDelegate());
+    if (delegate == nullptr) {
+        delegate = new GradientRowDelegate(view);
+        view->setItemDelegate(delegate);
+    }
+
+    // The delegate paints the full-row gradient itself. Keep the style from
+    // drawing an opaque selection panel on top of it.
+    QPalette palette = QApplication::palette();
+    palette.setColor(QPalette::Highlight, Qt::transparent);
+    palette.setColor(QPalette::HighlightedText, QColor(Qt::white));
+    view->setPalette(palette);
+    if (QWidget *viewport = view->viewport()) {
+        viewport->setPalette(palette);
+        viewport->update();
+    }
+    delegate->refreshHover();
+}
+
+void ligma_smooth_scroll_attach(void *view)
+{
+    auto *item_view = static_cast<QAbstractItemView *>(view);
+    if (item_view == nullptr)
+        return;
+    QWidget *viewport = item_view->viewport();
+    if (viewport == nullptr)
+        return;
+    viewport->installEventFilter(new SmoothScrollFilter(viewport, item_view->verticalScrollBar()));
+}
+
+void *ligma_dock_new(const char *title, void *parent_pointer, int horizontal,
+    int duration_ms, int minimum)
+{
+    auto *parent = static_cast<QWidget *>(parent_pointer);
+    return new LigmaDockWidget(QString::fromUtf8(title), parent, horizontal != 0,
+        duration_ms, minimum);
+}
+
+void ligma_dock_slide_show(void *dock_pointer, int horizontal, int duration_ms, int minimum)
+{
+    auto *dock = static_cast<QDockWidget *>(dock_pointer);
+    if (dock == nullptr || dock->isVisible())
+        return;
+
+    stopDockAnimation(dock);
+    int target = 0;
+    if (horizontal) {
+        target = std::max(dock->sizeHint().width(), std::max(minimum, 0));
+        if (target <= 0)
+            target = minimum > 0 ? minimum : 360;
+        dock->setMinimumWidth(0);
+        dock->setMaximumWidth(0);
+    } else {
+        target = std::max(dock->sizeHint().height(), std::max(minimum, 0));
+        if (target <= 0)
+            target = minimum > 0 ? minimum : 220;
+        dock->setMinimumHeight(0);
+        dock->setMaximumHeight(0);
+    }
+
+    dock->show();
+    startDockAnimation(dock, horizontal != 0, 0, target, duration_ms, minimum, false);
+}
+
+void ligma_dock_slide_hide(void *dock_pointer, int horizontal, int duration_ms, int minimum)
+{
+    auto *dock = static_cast<QDockWidget *>(dock_pointer);
+    if (dock == nullptr || !dock->isVisible())
+        return;
+
+    stopDockAnimation(dock);
+    const int start = horizontal ? dock->width() : dock->height();
+    if (horizontal) {
+        dock->setMinimumWidth(0);
+        dock->setMaximumWidth(std::max(start, 0));
+    } else {
+        dock->setMinimumHeight(0);
+        dock->setMaximumHeight(std::max(start, 0));
+    }
+    startDockAnimation(dock, horizontal != 0, start, 0, duration_ms, minimum, true);
 }
 
 } // extern "C"

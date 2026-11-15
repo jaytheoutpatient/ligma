@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) !void {
     // libqt6zig does not expose a QVariant constructor for QIcon, so the item
     // model uses this tiny helper for DecorationRole.
     const qt_bridge_cflags = switch (b.runFallible(
-        &.{ "pkg-config", "--cflags", "Qt6Core", "Qt6Gui" },
+        &.{ "pkg-config", "--cflags", "Qt6Widgets", "Qt6Gui", "Qt6Core" },
         .{},
     )) {
         .success => |stdout| stdout,
@@ -62,6 +62,37 @@ pub fn build(b: *std.Build) !void {
     var qt_bridge_flags = std.mem.tokenizeAny(u8, qt_bridge_cflags, " \t\r\n");
     while (qt_bridge_flags.next()) |flag| qt_bridge_shim.addArg(flag);
     exe.root_module.addObjectFile(qt_bridge_object);
+
+    const palette_cflags = switch (b.runFallible(
+        &.{ "pkg-config", "--cflags", "Qt6Widgets", "Qt6Gui", "Qt6Core" },
+        .{},
+    )) {
+        .success => |stdout| stdout,
+        else => @panic("Qt 6 Widgets development files not found."),
+    };
+    const palette_shim = b.addSystemCommand(&.{ "g++", "-std=c++17", "-O2", "-fPIC", "-c" });
+    palette_shim.addFileArg(b.path("src/ui/palette.cpp"));
+    palette_shim.addArg("-o");
+    const palette_object = palette_shim.addOutputFileArg("palette.o");
+    var palette_flags = std.mem.tokenizeAny(u8, palette_cflags, " \t\r\n");
+    while (palette_flags.next()) |flag| palette_shim.addArg(flag);
+    exe.root_module.addObjectFile(palette_object);
+
+    const mpris_cflags = switch (b.runFallible(
+        &.{ "pkg-config", "--cflags", "Qt6DBus", "Qt6Core" },
+        .{},
+    )) {
+        .success => |stdout| stdout,
+        else => @panic("Qt 6 D-Bus development files not found (Qt6DBus.pc)."),
+    };
+    const mpris_shim = b.addSystemCommand(&.{ "g++", "-std=c++17", "-O2", "-fPIC", "-c" });
+    mpris_shim.addFileArg(b.path("src/ui/mpris.cpp"));
+    mpris_shim.addArg("-o");
+    const mpris_object = mpris_shim.addOutputFileArg("mpris.o");
+    var mpris_flags = std.mem.tokenizeAny(u8, mpris_cflags, " \t\r\n");
+    while (mpris_flags.next()) |flag| mpris_shim.addArg(flag);
+    exe.root_module.addObjectFile(mpris_object);
+    exe.root_module.linkSystemLibrary("Qt6DBus", .{});
 
     // GStreamer owns the audio pipeline so the music player can use direct
     // ALSA output and optional DSP filters. Like QTermWidget, the engine is a

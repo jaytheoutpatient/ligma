@@ -1,7 +1,8 @@
 # Ligma — Product and Technical Specification
 
-**Status:** v0.4 prototype implemented  
-**Date:** 2026-11-09  
+**Status:** v0.5 prototype implemented
+
+**Date:** 2026-11-16
 **Target platform:** Linux (Wayland first, X11 supported)  
 **Implementation:** Zig 0.17 + Qt 6 Widgets via `libqt6zig`  
 **Audience:** users who have outgrown a casual file manager but do not want Dolphin's full configuration surface
@@ -302,7 +303,10 @@ The details view supports dragging selected rows and dropping them onto folders 
 - The player is a bottom `QDockWidget` toggled with `F9` or **View > Music Player**. It shows the current track and playlist position, elapsed/total time, a seek slider, volume, previous/play-pause/next/stop, repeat, and shuffle.
 - Repeat cycles **off → all → one**. Repeat all wraps at the end of the queue; repeat one reloads the current row. Shuffle chooses a random other row for Next and for automatic advancement.
 - The playlist is in memory and parallel to the list widget. Activating another audio file appends it if missing and starts it; **Add to Playlist** appends the selected audio files without interrupting the current track; **Play** replaces the queue and starts the first selected track.
-- Clicking a playlist row jumps to that track. The media-status callback handles `EndOfMedia`: with repeat off it removes the finished entry before selecting the next one; repeat all/one preserve the queue. Manual Next/Previous and Stop do not remove entries.
+- Clicking a playlist row jumps to that track. The media-status callback handles `EndOfMedia`: with repeat off it advances to the next row and keeps every entry; at the end playback stops with the queue intact. Repeat all/one also preserve the queue. Manual Next/Previous and Stop do not remove entries.
+- **Implemented (v0.5):** MPRIS 2 at `org.mpris.MediaPlayer2.ligma` on the session bus. The root interface exposes `Raise`, `Quit`, `Identity`, `DesktopEntry`, `CanRaise`, and `CanQuit`; the Player interface exposes transport, `Seek`, `SetPosition`, `PlaybackStatus`, `Metadata`, `Position`, `Volume`, `LoopStatus`, `Shuffle`, and the `Seeked` signal. Metadata uses a stable hash-based `mpris:trackid`, GStreamer tags for title/artist/album, and microsecond lengths. `OpenUri` is rejected because Ligma only plays local files. The service is best-effort and disabled when no session bus exists.
+- The playlist retains completed tracks. With repeat off, natural completion advances to the next row and stops at the end; with repeat all/one the queue loops. Manual Next/Previous and Stop keep the queue as well.
+- The player dock, terminal dock, and their title-bar close buttons animate open/close with a 170–190 ms eased slide. Wheel scrolling in Places, Drives, file views, search results, and the player playlist is animated through a Qt scrollbar property animation.
 - Seeking is slider-driven (`sliderMoved`), so playback position updates do not fight a drag. Volume is applied through the GStreamer pipeline in the 0–1 range, except in bit-perfect mode where the hardware mixer is used.
 - Closing the dock keeps playback and queue state. Shutdown stops and frees the GStreamer engine explicitly before the window is torn down.
 - Playback runs through GStreamer (`src/ui/music_engine.cpp`), not QtMultimedia. The default sink is PipeWire; the base/good/bad/ugly plugin sets provide codecs for MP3, Opus, FLAC, WAV, and similar formats.
@@ -864,7 +868,11 @@ Implemented in the v0.5 prototype:
 - Hidden-file toggle that applies to every pane.
 - File opening through the desktop's default application, with audio routed to the built-in player.
 - Built-in music player (`src/ui/player.zig`): GStreamer engine, MIME-based audio activation, bottom dock (`F9`), playlist, previous/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, auto-advance at end of media, optional direct-ALSA/bit-perfect output, EQ presets, and ReplayGain. Audio selections also expose **Play** and **Add to Playlist** in the context menu.
-- Queue clearing on natural completion when repeat is off; manual Next/Previous and Stop leave the queue intact. Repeat all/one preserve entries.
+- Queue retention on natural completion with repeat off; playback advances through the queue and stops at the end with the entries intact. Manual Next/Previous and Stop also leave the queue intact. Repeat all/one preserve entries.
+- MPRIS 2 service (`src/ui/mpris.cpp`) with root and Player interfaces, dynamic track IDs, tag metadata, seek/volume/loop/shuffle control, and `Seeked` notifications. Verified with `playerctl` (metadata, next/previous, seek, volume, loop, shuffle, pause/play, stop, and `Raise`).
+- **Appearance** menu with Matugen/qt6ct, Light, Dark, and System palettes. Matugen reads the active qt6ct `active_colors`/`inactive_colors`/`disabled_colors` groups and the accent pair; the built-in light/dark palettes set every color group so runtime switches cannot leak dark inactive colors. The selection persists in `$XDG_CONFIG_HOME/ligma/appearance`.
+- Theme-aware gradients for Places, Drives, drive usage bars, the player playlist, and icon/compact file views. The Details view uses a full-row gradient delegate so selection and hover span all columns; light backgrounds use dark selected text, while dark and Matugen backgrounds use white text.
+- Smooth wheel scrolling through a reusable Qt event filter, and eased slide open/close animations for the terminal and music player docks, including their title-bar close buttons.
 - Discord Rich Presence (`src/core/discord.zig`): title/artist/album from GStreamer tags, timestamps while playing, pause/stop handling, local socket discovery for native and Flatpak clients, and configurable app ID. Optional MusicBrainz enrichment supplies canonical metadata and release years.
 - Executable files (ELF binaries, scripts, AppImages) can be launched after a confirmation prompt by pressing Enter, double-clicking, or choosing `File > Run Selected` (`Ctrl+Return`); the process starts detached with the file's folder as its working directory.
 - Tabs (`Ctrl+T`, `Ctrl+W`) and split view (`F3`, `F6`); panes keep independent state.
