@@ -296,7 +296,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
 
     // ---- Music player dock ----------------------------------------------
     // Hidden until an audio file is activated or the user adds tracks to the
-    // playlist. The panel owns the QtMultimedia objects; the dock owns the
+    // playlist. The panel owns the GStreamer engine; the dock owns the
     // widget tree.
     const player_dock = QDockWidget.new4("Music Player", window);
     player_dock.setAllowedAreas(qnamespace_enums.DockWidgetArea.BottomDockWidgetArea);
@@ -545,7 +545,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
 }
 
 fn shutdown() void {
-    // Stop playback and release QtMultimedia before the window disappears.
+    // Stop playback and release GStreamer before the window disappears.
     app.player.deinit();
 
     // Stop any in-flight thumbnail extraction before other teardown.

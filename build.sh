@@ -99,7 +99,7 @@ zig_version_ok() {
 system_deps_ready() {
     command -v g++ >/dev/null 2>&1 || return 1
     command -v pkg-config >/dev/null 2>&1 || return 1
-    pkg-config --exists qtermwidget6 Qt6Multimedia sqlite3
+    pkg-config --exists qtermwidget6 gstreamer-1.0 sqlite3
 }
 
 ZIG_BOOTSTRAP_VERSION="0.17.0"
@@ -294,14 +294,19 @@ install_deps() {
     setup_privilege
 
     if command -v pacman >/dev/null 2>&1; then
-        local packages=(base-devel pkgconf qt6-base qt6-multimedia
-            qt6-multimedia-ffmpeg sqlite qtermwidget utf8proc zig)
+        local packages=(base-devel pkgconf qt6-base sqlite qtermwidget
+            utf8proc gstreamer gst-plugins-base gst-plugins-good
+            gst-plugins-bad gst-plugins-ugly gst-plugin-pipewire zig)
         printf 'Detected pacman. Installing: %s\n' "${packages[*]}"
         confirm_install pacman
         run_priv pacman -S --needed --noconfirm "${packages[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
         local packages=(build-essential pkg-config qt6-base-dev
-            qt6-multimedia-dev libsqlite3-dev libutf8proc-dev)
+            libsqlite3-dev libutf8proc-dev libgstreamer1.0-dev
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+            gstreamer1.0-plugins-ugly gstreamer1.0-pipewire
+            gstreamer1.0-alsa)
         run_priv apt-get update
         local candidate=""
         local qterm_package=""
@@ -323,8 +328,11 @@ install_deps() {
         run_priv apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         local packages=(gcc-c++ pkgconf-pkg-config qt6-qtbase-devel
-            qt6-qtmultimedia-devel sqlite-devel qtermwidget-devel
-            utf8proc-devel)
+            sqlite-devel qtermwidget-devel utf8proc-devel
+            gstreamer1-devel gstreamer1-plugins-base-devel
+            gstreamer1-plugins-base gstreamer1-plugins-good
+            gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free
+            pipewire-gstreamer)
         printf 'Detected dnf. Installing: %s\n' "${packages[*]}"
         confirm_install dnf
         run_priv dnf install -y "${packages[@]}"
@@ -352,7 +360,7 @@ need_command zig
 need_command g++
 need_command pkg-config
 need_pkg qtermwidget6
-need_pkg Qt6Multimedia
+need_pkg gstreamer-1.0
 need_pkg sqlite3
 
 printf 'Ligma build\n'

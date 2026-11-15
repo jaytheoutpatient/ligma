@@ -51,8 +51,8 @@ This repository contains a working **v0.5 prototype**:
 - **Embedded terminal** — `F12` toggles a terminal panel docked on the right; the first open starts the user's shell in the active folder, and the session survives hiding and reopening
 - **Run executables** — activating an executable file asks for confirmation, then launches it detached with its folder as the working directory
 - **Preview panel** — selecting exactly one image or video file shows a larger thumbnail in the window's bottom-left corner
-- **Built-in music player** — activating an audio file opens a bottom panel with prev/play-pause/next/stop, repeat (off/all/one), shuffle, a seek bar, volume, and a playlist. Finished tracks leave the queue unless repeat is active, and the context menu adds **Play** and **Add to Playlist** for audio selections
-- **Discord Rich Presence** — shows the current song title and artist/album in Discord through its local IPC socket, with no bot token, network service, or account linking
+- **Built-in music player** — GStreamer-powered playback with prev/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, optional EQ/ReplayGain, and a playlist. A direct-ALSA/bit-perfect output mode is available for exclusive playback. Finished tracks leave the queue unless repeat is active, and the context menu adds **Play** and **Add to Playlist**
+- **Discord Rich Presence** — shows the current song and artist in Discord through its local IPC socket, optionally enriched with canonical MusicBrainz title/artist/album data
 - **Blue-and-purple floppy icon** — a custom scalable app icon, installed as `org.ligma.FileManager` in the hicolor theme and embedded in the binary for the window icon
 
 Search falls back to a cancellable breadth-first filename scan while the index is building, when no index exists, or when the active folder is outside the indexed root.
@@ -88,11 +88,33 @@ Activating a file whose MIME type is `audio/*` plays it in the built-in player i
 - **Repeat** cycles **off → all → one**. Repeat all wraps at the end; repeat one restarts the current track.
 - **Shuffle** picks a random other track for Next and for automatic advancement.
 - The seek slider follows playback and can be dragged to jump. The volume slider sets output volume for this player.
+- The **Output** button switches between the default PipeWire sink and a direct ALSA device at runtime. Enter `hw:X,Y` for exclusive/bit-perfect output, or leave it empty for PipeWire.
 - Activating another audio file appends it to the playlist (or reuses its existing entry) and starts it. **Add to Playlist** appends every selected audio file without interrupting the current track.
 - **Play** in the context menu replaces the queue with the selected audio files and starts the first one. The playlist widget also accepts clicks to jump to a track.
 - Files are classified with `QMimeDatabase`, so content-detected audio formats work even when their extension is unusual.
 - Closing the dock keeps the playlist and playback alive; reopening it shows the same state.
-- QtMultimedia uses the FFmpeg backend when available. If the system has no working audio backend, the player surfaces the decoder error in the now-playing label instead of crashing.
+- Playback uses GStreamer (`src/ui/music_engine.cpp`) rather than QtMultimedia. The default output is PipeWire, so it cooperates with the desktop mixer.
+- If no working audio backend is available, the player surfaces the decoder error in the now-playing label instead of crashing.
+
+### Audio quality and bit-perfect output
+
+The default PipeWire path is mixed and may resample to the graph's sample rate. For direct, exclusive playback set:
+
+```bash
+LIGMA_AUDIO_MODE=alsa LIGMA_ALSA_DEVICE=hw:0,0 ./zig-out/bin/ligma
+```
+
+- `LIGMA_AUDIO_MODE=alsa` selects a direct ALSA sink and clears software volume/DSP.
+- `LIGMA_ALSA_DEVICE` must be a hardware device (`hw:X,Y`), not `default`, if you want to bypass PipeWire. Find devices with `aplay -L` and `cat /proc/asound/cards`.
+- In this mode the in-app volume slider is disabled; use the hardware mixer. Notifications and other applications cannot play through the same device.
+- EQ and ReplayGain are disabled in bit-perfect mode.
+
+Optional DSP for normal output:
+
+```bash
+LIGMA_AUDIO_EQ=bass ./zig-out/bin/ligma       # bass, vocal, or rock preset
+LIGMA_AUDIO_REPLAYGAIN=1 ./zig-out/bin/ligma  # use ReplayGain tags
+```
 
 ### Queue behavior
 
@@ -107,6 +129,7 @@ While a track is playing, Ligma publishes the song title and artist/album to a r
 
 - The activity shows the tagged title, artist, and album when available. Missing tags fall back to the filename; an unknown artist is omitted from the displayed details.
 - Discord's `status_display_type` is set to **Details**, so the compact member-list line shows **Song — Artist** instead of only the application name. The profile card also shows the album when tagged.
+- MusicBrainz enrichment is **enabled by default**. Ligma queries the public MusicBrainz recording API for a canonical title/artist and release data, then updates the presence. Requests are rate-limited to one per 1.1 seconds and only run when a track has title and artist tags. Set `LIGMA_MUSICBRAINZ=0` to disable them; Discord IPC itself never leaves the machine, but MusicBrainz enrichment does make HTTPS requests.
 - Discord shows elapsed/remaining progress while playing. Pausing keeps the title/artist but removes progress; stopping or quitting clears the activity.
 - The connection is best-effort: if Discord/Vesktop is not running or restarts, playback continues normally and the client reconnects in the background.
 - Set `LIGMA_DISCORD=0` to disable Rich Presence. `LIGMA_DISCORD_APP_ID` overrides the built-in application ID for development builds.
@@ -150,7 +173,8 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 
 - Linux
 - Zig **0.17.0+** (the build script downloads an official compiler into `.tools/` when needed)
-- Qt **6.8+** development files (tested with 6.12.0), including QtMultimedia and a multimedia backend
+- Qt **6.8+** development files (tested with 6.12.0; QtWidgets and QtNetwork)
+- GStreamer **1.x** development files and the base/good/bad/ugly plugin sets, plus a PipeWire or ALSA sink
 - QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`; Debian: `libqtermwidget-dev`; newer Ubuntu: `libqtermwidget6-2-dev`)
 - SQLite 3 development files with FTS5 and the trigram tokenizer (tested with 3.54.1)
 - A C/C++ toolchain (`g++`) and `pkg-config`
@@ -158,15 +182,25 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 On Debian/Ubuntu-style systems:
 
 ```bash
-sudo apt install build-essential pkg-config qt6-base-dev qt6-multimedia-dev \
-  libsqlite3-dev libutf8proc-dev libqtermwidget-dev
+sudo apt install build-essential pkg-config qt6-base-dev \
+  libsqlite3-dev libutf8proc-dev libqtermwidget-dev \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gstreamer1.0-pipewire gstreamer1.0-alsa
 # Debian names the Qt 6 widget development package libqtermwidget-dev.
 # Newer Ubuntu releases use libqtermwidget6-2-dev instead.
 # libutf8proc-dev is required by qtermwidget6.pc but is not pulled in by
 # Debian's libqtermwidget-dev package.
 ```
 
-On Arch Linux: `sudo pacman -S qt6-base qt6-multimedia qt6-multimedia-ffmpeg sqlite qtermwidget`.
+On Arch Linux:
+
+```bash
+sudo pacman -S qt6-base sqlite qtermwidget utf8proc \
+  gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
+  gst-plugins-ugly gst-plugin-pipewire
+```
 
 The build fetches the pinned `libqt6zig` dependency automatically. The first build compiles only the Qt wrappers the app uses, so it is much faster than building the entire binding repository.
 
@@ -187,7 +221,7 @@ entry and icons:
 On the first run, `./build.sh` checks for the required development packages
 and automatically starts the installer when something is missing. It detects
 `pacman`, `apt`, or `dnf`, shows the package list, and asks before changing the
-system. It installs the Qt 6, QtMultimedia, QTermWidget, SQLite, C/C++, and
+system. It installs the Qt 6, GStreamer, QTermWidget, SQLite, C/C++, and
 pkg-config development packages.
 
 If Zig 0.17.0 or newer is not available, the script downloads the official
@@ -264,7 +298,10 @@ src/app.zig            window, tabs, panes, navigation, search and file-operatio
 src/ui/local_model.zig  async flat directory model with filter and sort
 src/ui/terminal.zig     Zig wrapper for the embedded terminal panel
 src/ui/terminal_widget.cpp  QTermWidget C ABI shim (compiled with g++)
-src/ui/player.zig       QtMultimedia music player and playlist
+src/ui/player.zig       music player UI, playlist, repeat/shuffle, Discord
+src/ui/music_engine.cpp GStreamer C ABI engine (Output/DSP/ALSA)
+src/ui/music_engine.zig Zig bridge for the GStreamer engine
+src/core/musicbrainz.zig optional MusicBrainz metadata enrichment
 assets/                 .desktop entry and hicolor icon set
 src/core/file_ops.zig  async copy/move/trash/delete/rename/mkdir/undo engine
 src/core/paths.zig     path and file:// resolution

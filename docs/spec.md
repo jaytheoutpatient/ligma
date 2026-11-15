@@ -302,10 +302,13 @@ The details view supports dragging selected rows and dropping them onto folders 
 - Repeat cycles **off → all → one**. Repeat all wraps at the end of the queue; repeat one reloads the current row. Shuffle chooses a random other row for Next and for automatic advancement.
 - The playlist is in memory and parallel to the list widget. Activating another audio file appends it if missing and starts it; **Add to Playlist** appends the selected audio files without interrupting the current track; **Play** replaces the queue and starts the first selected track.
 - Clicking a playlist row jumps to that track. The media-status callback handles `EndOfMedia`: with repeat off it removes the finished entry before selecting the next one; repeat all/one preserve the queue. Manual Next/Previous and Stop do not remove entries.
-- Seeking is slider-driven (`sliderMoved`), so playback position updates do not fight a drag. Volume is applied to `QAudioOutput` in the 0–1 range.
-- Closing the dock keeps playback and queue state. Shutdown stops the player and deletes the `QMediaPlayer`/`QAudioOutput` objects explicitly before the window is torn down.
-- QtMultimedia is linked as `Qt6Multimedia`; at runtime the FFmpeg multimedia backend supplies codecs for common formats such as MP3, Opus, FLAC, and WAV.
-- **Implemented (v0.5):** Discord Rich Presence uses the local `discord-ipc-*` socket and the registered Ligma application ID. `QMediaMetaData` supplies title, contributing artist/album artist/author, and album title; untagged files fall back to the filename and omit an unknown artist. `details` combines song and artist and `status_display_type` is set to Details, so the member-list status text shows the track rather than only the application name. Presence includes playback timestamps while playing, drops them while paused, and is cleared on stop/exit. `LIGMA_DISCORD=0` disables it and `LIGMA_DISCORD_APP_ID` overrides the app ID.
+- Seeking is slider-driven (`sliderMoved`), so playback position updates do not fight a drag. Volume is applied through the GStreamer pipeline in the 0–1 range, except in bit-perfect mode where the hardware mixer is used.
+- Closing the dock keeps playback and queue state. Shutdown stops and frees the GStreamer engine explicitly before the window is torn down.
+- Playback runs through GStreamer (`src/ui/music_engine.cpp`), not QtMultimedia. The default sink is PipeWire; the base/good/bad/ugly plugin sets provide codecs for MP3, Opus, FLAC, WAV, and similar formats.
+- `LIGMA_AUDIO_MODE=alsa` plus `LIGMA_ALSA_DEVICE=hw:X,Y` selects a direct ALSA sink, clears software volume and DSP, and provides exclusive/bit-perfect playback. The in-app volume slider is disabled in this mode. The **Output** button switches between the PipeWire default and a direct ALSA device at runtime.
+- Normal mode supports optional ReplayGain (`LIGMA_AUDIO_REPLAYGAIN=1`) and a 10-band EQ preset (`LIGMA_AUDIO_EQ=bass|vocal|rock`). EQ/ReplayGain are intentionally bypassed in bit-perfect mode.
+- **Implemented (v0.5):** Discord Rich Presence uses the local `discord-ipc-*` socket and the registered Ligma application ID. GStreamer tags supply title, artist, and album; untagged files fall back to the filename and omit an unknown artist. `details` combines song and artist and `status_display_type` is set to Details, so the member-list status text shows the track rather than only the application name. Presence includes playback timestamps while playing, drops them while paused, and is cleared on stop/exit. `LIGMA_DISCORD=0` disables it and `LIGMA_DISCORD_APP_ID` overrides the app ID.
+- Optional MusicBrainz enrichment (`src/core/musicbrainz.zig`) fills canonical title/artist/release data and a release year from the public MusicBrainz API. Requests are rate-limited to one every 1.1 seconds, only run for tracks with title+artist tags, and can be disabled with `LIGMA_MUSICBRAINZ=0`.
 - Rich Presence is best-effort and reconnects in the background. It never blocks playback when Discord is absent, and it only talks to the local Discord client — no bot token or remote service is involved.
 
 ### 4.12 Application identity
@@ -375,6 +378,7 @@ src/
       extract.zig          text/metadata extraction
     integration/
       discord.zig          local Discord Rich Presence IPC
+      musicbrainz.zig      optional MusicBrainz metadata enrichment
     meta/
       metadata.zig         tags, ratings, comments, emblems
       xattr.zig            portable xattr encoding
@@ -400,7 +404,9 @@ src/
     quick_look.zig
     terminal.zig           right-side QTermWidget panel
     terminal_widget.cpp    C ABI shim for QTermWidget (g++)
-    player.zig             QtMultimedia player, transport controls, repeat/shuffle, playlist
+    player.zig             music player UI, repeat/shuffle, playlist, Discord
+    music_engine.cpp       GStreamer C ABI engine (PipeWire/ALSA, DSP)
+    music_engine.zig       Zig bridge for the GStreamer engine
     status_bar.zig
   platform/
     linux/
@@ -850,9 +856,9 @@ Implemented in the v0.5 prototype:
 - In-memory case-insensitive substring filter (directories remain visible) that never touches the filesystem.
 - Hidden-file toggle that applies to every pane.
 - File opening through the desktop's default application, with audio routed to the built-in player.
-- Built-in music player (`src/ui/player.zig`): MIME-based audio activation, bottom dock (`F9`), playlist, previous/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, and auto-advance at end of media. Audio selections also expose **Play** and **Add to Playlist** in the context menu.
+- Built-in music player (`src/ui/player.zig`): GStreamer engine, MIME-based audio activation, bottom dock (`F9`), playlist, previous/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, auto-advance at end of media, optional direct-ALSA/bit-perfect output, EQ presets, and ReplayGain. Audio selections also expose **Play** and **Add to Playlist** in the context menu.
 - Queue clearing on natural completion when repeat is off; manual Next/Previous and Stop leave the queue intact. Repeat all/one preserve entries.
-- Discord Rich Presence (`src/core/discord.zig`): title/artist/album from `QMediaMetaData`, timestamps while playing, pause/stop handling, local socket discovery for native and Flatpak clients, and configurable app ID.
+- Discord Rich Presence (`src/core/discord.zig`): title/artist/album from GStreamer tags, timestamps while playing, pause/stop handling, local socket discovery for native and Flatpak clients, and configurable app ID. Optional MusicBrainz enrichment supplies canonical metadata and release years.
 - Executable files (ELF binaries, scripts, AppImages) can be launched after a confirmation prompt by pressing Enter, double-clicking, or choosing `File > Run Selected` (`Ctrl+Return`); the process starts detached with the file's folder as its working directory.
 - Tabs (`Ctrl+T`, `Ctrl+W`) and split view (`F3`, `F6`); panes keep independent state.
 - Global filename search with streamed results in a dock.
@@ -877,7 +883,9 @@ Known prototype limitations (addressed in later phases):
 - Copy does not preserve xattrs, ACLs, sparse regions, hard links, or timestamps yet.
 - No metadata editing, remote locations, archives, or extensions yet.
 - The music playlist is in memory only and is not persisted across restarts; album art is not shown in the player.
-- Discord Rich Presence requires a running Discord desktop client; metadata depends on tags supplied by the FFmpeg backend, and the app falls back to filenames for untagged files.
+- Discord Rich Presence requires a running Discord desktop client; metadata depends on tags supplied by GStreamer, and the app falls back to filenames for untagged files. MusicBrainz enrichment is optional and makes HTTPS requests unless disabled.
+- Bit-perfect ALSA output bypasses PipeWire and therefore blocks other applications from using the same device; the volume slider is disabled, and EQ/ReplayGain do not apply in that mode.
+- Gapless playback and crossfade are not implemented yet; GStreamer auto-advance may leave a small gap between tracks.
 - Search index has no incremental watcher or multiple roots; rebuild manually after large changes. File operations do not update the index.
 - Status bar selection message can be stale after some navigation transitions.
 - Place selection does not follow path-bar navigation.

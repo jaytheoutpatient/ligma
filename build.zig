@@ -44,8 +44,28 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addObjectFile(terminal_object);
     exe.root_module.linkSystemLibrary("qtermwidget6", .{});
     exe.root_module.linkSystemLibrary("stdc++", .{});
-    exe.root_module.linkSystemLibrary("Qt6Multimedia", .{});
     exe.root_module.linkSystemLibrary("Qt6Network", .{});
+
+    // GStreamer owns the audio pipeline so the music player can use direct
+    // ALSA output and optional DSP filters. Like QTermWidget, the engine is a
+    // C++ translation unit with a plain C ABI.
+    const gstreamer_cflags = switch (b.runFallible(
+        &.{ "pkg-config", "--cflags", "gstreamer-1.0" },
+        .{},
+    )) {
+        .success => |stdout| stdout,
+        else => @panic("GStreamer development files not found (gstreamer-1.0.pc). Install the GStreamer development package before building Ligma."),
+    };
+    const music_shim = b.addSystemCommand(&.{ "g++", "-std=c++17", "-O2", "-fPIC", "-c" });
+    music_shim.addFileArg(b.path("src/ui/music_engine.cpp"));
+    music_shim.addArg("-o");
+    const music_object = music_shim.addOutputFileArg("music_engine.o");
+    var music_cflags = std.mem.tokenizeAny(u8, gstreamer_cflags, " \t\r\n");
+    while (music_cflags.next()) |flag| music_shim.addArg(flag);
+    exe.root_module.addObjectFile(music_object);
+    exe.root_module.linkSystemLibrary("gstreamer-1.0", .{});
+    exe.root_module.linkSystemLibrary("gobject-2.0", .{});
+    exe.root_module.linkSystemLibrary("glib-2.0", .{});
 
     // Only the Qt wrappers this application actually calls need to be linked.
     // Keeping this list tight is the difference between a fast build and a
@@ -107,7 +127,6 @@ const qt_libraries = [_][]const u8{
     "qabstractslider",
     "qaction",
     "qapplication",
-    "qaudiooutput",
     "qboxlayout",
     "qcoreapplication",
     "qdesktopservices",
@@ -130,11 +149,12 @@ const qt_libraries = [_][]const u8{
     "qlistview",
     "qlistwidget",
     "qmainwindow",
-    "qmediaplayer",
-    "qmediametadata",
     "qmenu",
     "qmenubar",
     "qmessagebox",
+    "qnetworkaccessmanager",
+    "qnetworkreply",
+    "qnetworkrequest",
     "qmimedata",
     "qmimedatabase",
     "qmimetype",

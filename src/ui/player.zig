@@ -1,36 +1,35 @@
 //! Built-in music player.
 //!
-//! A bottom dock that plays local audio files through QtMultimedia. The
-//! playlist is in memory and belongs to this panel: activating an audio file
-//! appends it (unless it is already present) and starts playback, while the
-//! context-menu action adds files without interrupting the current track.
+//! Audio is decoded and rendered by GStreamer (`music_engine.cpp`), not
+//! QtMultimedia. This gives the player a direct ALSA output mode, optional DSP
+//! filters, and reliable tag events for Discord Rich Presence. The playlist,
+//! repeat/shuffle policy, and Discord updates stay in this Zig module.
 //!
-//! QtMultimedia is a separate Qt module; on Linux it is a regular shared
-//! library and the FFmpeg backend package provides the codecs. Files are
-//! classified with `QMimeDatabase`, so any format the desktop recognizes as
-//! `audio/*` is routed here instead of the desktop opener.
+//! Two output paths are available:
+//! - The default PipeWire/GStreamer sink, which cooperates with the desktop.
+//! - `LIGMA_AUDIO_MODE=alsa` plus `LIGMA_ALSA_DEVICE=hw:X,Y`, which uses a
+//!   direct ALSA device, disables software volume, and bypasses DSP.
 
 const std = @import("std");
 const qt6 = @import("libqt6zig");
 
 const discord = @import("../core/discord.zig");
+const music_engine = @import("music_engine.zig");
+const musicbrainz = @import("../core/musicbrainz.zig");
 
-const QAudioOutput = qt6.QAudioOutput;
 const QHBoxLayout = qt6.QHBoxLayout;
+const QInputDialog = qt6.QInputDialog;
 const QLabel = qt6.QLabel;
 const QListWidget = qt6.QListWidget;
-const QMediaMetaData = qt6.QMediaMetaData;
-const QMediaPlayer = qt6.QMediaPlayer;
 const QMimeDatabase = qt6.QMimeDatabase;
 const QPushButton = qt6.QPushButton;
 const QSlider = qt6.QSlider;
-const QUrl = qt6.QUrl;
+const QTimer = qt6.QTimer;
 const QVBoxLayout = qt6.QVBoxLayout;
 const QWidget = qt6.QWidget;
 
+const qlineedit_enums = qt6.qlineedit_enums;
 const qnamespace_enums = qt6.qnamespace_enums;
-const qmediaplayer_enums = qt6.qmediaplayer_enums;
-const qmediametadata_enums = qt6.qmediametadata_enums;
 
 const RepeatMode = enum { off, all, one };
 
@@ -56,8 +55,8 @@ pub const PlayerPanel = struct {
     io: std.Io,
 
     container: QWidget = undefined,
-    media: QMediaPlayer = undefined,
-    audio: QAudioOutput = undefined,
+    engine: ?music_engine.Engine = null,
+    poll_timer: QTimer = undefined,
 
     title_label: QLabel = undefined,
     time_label: QLabel = undefined,
@@ -79,12 +78,17 @@ pub const PlayerPanel = struct {
     repeat_mode: RepeatMode = .off,
     shuffle: bool = false,
     rng: std.Random.DefaultPrng = undefined,
-    metadata_ready: bool = false,
+    tags: ?music_engine.Engine.Tags = null,
+    tag_serial_seen: u32 = 0,
     track_loaded: bool = false,
     duration_ready: bool = false,
     transport_active: bool = false,
     playback_intent_playing: bool = false,
+    output_device: ?[]u8 = null,
     discord: ?*discord.DiscordRpc = null,
+    musicbrainz: ?*musicbrainz.MusicBrainz = null,
+    mb_result: ?musicbrainz.Result = null,
+    mb_serial: u64 = 0,
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io) !*PlayerPanel {
         const self = try gpa.create(PlayerPanel);
@@ -150,6 +154,12 @@ pub const PlayerPanel = struct {
         volume_row.setSpacing(6);
         volume_row.addWidget(volume_label);
         volume_row.addWidget(self.volume_slider);
+        const output_button = QPushButton.new3("Output");
+        output_button.setFlat(true);
+        output_button.setFixedWidth(64);
+        output_button.setToolTip("Choose PipeWire or a direct ALSA device");
+        output_button.onClicked(onOutputClicked);
+        volume_row.addWidget(output_button);
         volume_row.addStretch();
 
         const layout = QVBoxLayout.new(self.container);
@@ -160,17 +170,39 @@ pub const PlayerPanel = struct {
         layout.addLayout(volume_row);
         layout.addWidget(self.playlist_widget);
 
-        self.audio = QAudioOutput.new();
-        self.audio.setVolume(0.7);
-        self.media = QMediaPlayer.new2(self.container);
-        self.media.setAudioOutput(self.audio);
-
-        self.media.onPlaybackStateChanged(onPlaybackStateChanged);
-        self.media.onMediaStatusChanged(onMediaStatusChanged);
-        self.media.onPositionChanged(onPositionChanged);
-        self.media.onDurationChanged(onDurationChanged);
-        self.media.onMetaDataChanged(onMetaDataChanged);
-        self.media.onErrorOccurred(onErrorOccurred);
+        // The environment selects the initial output/DSP setup. The Output
+        // button can switch between PipeWire and direct ALSA at runtime.
+        const output_mode = audioOutputMode();
+        const alsa_device = if (std.c.getenv("LIGMA_ALSA_DEVICE")) |raw|
+            std.mem.span(raw)
+        else
+            "default";
+        const eq_preset = eqPresetGains();
+        const replaygain = envFlag("LIGMA_AUDIO_REPLAYGAIN");
+        self.engine = music_engine.Engine.create(
+            output_mode,
+            alsa_device,
+            eq_preset != null,
+            replaygain,
+        );
+        if (output_mode == .alsa) {
+            self.output_device = gpa.dupe(u8, alsa_device) catch null;
+        }
+        if (self.engine) |engine| {
+            if (eq_preset) |gains| _ = engine.setEq(true, gains[0..]);
+            if (replaygain) _ = engine.setReplayGain(true);
+            if (engine.isBitPerfect()) {
+                self.volume_slider.setValue(100);
+                self.volume_slider.setEnabled(false);
+                self.volume_slider.setToolTip("Bit-perfect output: use the hardware volume control");
+                self.title_label.setToolTip("Direct ALSA output; software volume and DSP are disabled");
+            } else {
+                engine.setVolume(0.7);
+            }
+        } else {
+            self.title_label.setText("Audio engine unavailable");
+            std.debug.print("player: could not create the GStreamer engine\n", .{});
+        }
 
         self.seek_slider.onSliderMoved(onSeekMoved);
         self.seek_slider.onSliderReleased(onSeekReleased);
@@ -183,7 +215,18 @@ pub const PlayerPanel = struct {
         self.repeat_button.onClicked(onRepeatClicked);
         self.shuffle_button.onClicked(onShuffleClicked);
 
+        self.poll_timer = QTimer.new2(self.container);
+        self.poll_timer.setInterval(100);
+        self.poll_timer.onTimeout(onPollTimer);
+        self.poll_timer.start(100);
+
         self.discord = discord.DiscordRpc.create(gpa, io, self.container) catch null;
+        self.musicbrainz = musicbrainz.MusicBrainz.create(
+            gpa,
+            io,
+            self.container,
+            onMusicBrainzResult,
+        ) catch null;
         self.refreshRepeatButton();
         self.refreshShuffleButton();
 
@@ -254,19 +297,33 @@ pub const PlayerPanel = struct {
         self.playlist_widget.setCurrentRow(@intCast(row));
         self.playlist_updating = false;
 
-        self.metadata_ready = false;
+        self.tags = null;
+        self.mb_result = null;
+        self.mb_serial +%= 1;
+        self.tag_serial_seen = 0;
         self.track_loaded = false;
         self.duration_ready = false;
         self.updateTitle();
         self.seek_slider.setEnabled(true);
+        self.seek_slider.setRange(0, 0);
         self.seek_slider.setValue(0);
+        self.time_label.setText("0:00 / 0:00");
 
+        const engine = self.engine orelse {
+            self.title_label.setText("Audio engine unavailable");
+            return;
+        };
         self.transport_active = true;
         self.playback_intent_playing = true;
-        const url = QUrl.fromLocalFile(self.playlist.items[row]);
-        defer url.delete();
-        self.media.setSource(url);
-        self.media.play();
+        if (!engine.load(self.gpa, self.playlist.items[row])) {
+            self.handleEngineError();
+            return;
+        }
+        self.track_loaded = true;
+        engine.play();
+        engine.setVolume(volumeFraction(self.volume_slider.value()));
+        self.refreshPlayButton();
+        self.publishPresence(true);
     }
 
     fn playNext(self: *PlayerPanel) void {
@@ -295,9 +352,10 @@ pub const PlayerPanel = struct {
             if (self.playlist.items.len > 0) self.playIndex(0);
             return;
         };
+        const engine = self.engine orelse return;
         // Restart the current track unless it has just started.
-        if (self.media.position() > 3000) {
-            self.media.setPosition(0);
+        if (engine.position() > 3000) {
+            engine.setPosition(0);
             return;
         }
         if (current > 0) {
@@ -308,10 +366,10 @@ pub const PlayerPanel = struct {
             self.playIndex(self.playlist.items.len - 1);
             return;
         }
-        self.media.setPosition(0);
+        engine.setPosition(0);
     }
 
-    /// Called when the media backend reports EndOfMedia.
+    /// Called when GStreamer reports EndOfMedia.
     fn finishTrack(self: *PlayerPanel) void {
         const finished = self.current orelse return;
         if (finished >= self.playlist.items.len) return;
@@ -362,16 +420,20 @@ pub const PlayerPanel = struct {
 
     fn finishQueue(self: *PlayerPanel) void {
         self.current = null;
+        self.tags = null;
+        self.mb_result = null;
+        self.mb_serial +%= 1;
         self.track_loaded = false;
         self.duration_ready = false;
         self.transport_active = false;
         self.playback_intent_playing = false;
-        self.media.stop();
+        if (self.engine) |engine| engine.stop();
         self.seek_slider.setValue(0);
         self.seek_slider.setRange(0, 0);
         self.seek_slider.setEnabled(false);
         self.time_label.setText("0:00 / 0:00");
         self.updateTitle();
+        self.refreshPlayButton();
         if (self.discord) |client| client.clearActivity();
     }
 
@@ -388,22 +450,22 @@ pub const PlayerPanel = struct {
 
     fn togglePlayPause(self: *PlayerPanel) void {
         if (self.playlist.items.len == 0) return;
-        if (self.media.playbackState() == qmediaplayer_enums.PlaybackState.PlayingState) {
+        const engine = self.engine orelse return;
+        if (engine.state() == .playing) {
             self.playback_intent_playing = false;
-            self.media.pause();
+            engine.pause();
+            self.refreshPlayButton();
             self.publishPresence(false);
             return;
         }
-        // Tracks added with "Add to Playlist" before anything has played have
-        // no loaded source yet; start the first one instead of calling play()
-        // with an empty media player.
         if (self.current == null) {
             self.playIndex(0);
             return;
         }
         self.transport_active = true;
         self.playback_intent_playing = true;
-        self.media.play();
+        engine.play();
+        self.refreshPlayButton();
         self.publishPresence(true);
     }
 
@@ -411,9 +473,10 @@ pub const PlayerPanel = struct {
         self.transport_active = false;
         self.playback_intent_playing = false;
         if (self.discord) |client| client.clearActivity();
-        self.media.stop();
+        if (self.engine) |engine| engine.stop();
         self.seek_slider.setValue(0);
         self.time_label.setText("0:00 / 0:00");
+        self.refreshPlayButton();
     }
 
     fn cycleRepeat(self: *PlayerPanel) void {
@@ -450,9 +513,11 @@ pub const PlayerPanel = struct {
         if (self.discord) |client| client.clearActivity();
         self.transport_active = false;
         self.playback_intent_playing = false;
-        self.media.stop();
+        if (self.engine) |engine| engine.stop();
         self.current = null;
-        self.metadata_ready = false;
+        self.tags = null;
+        self.mb_result = null;
+        self.mb_serial +%= 1;
         self.track_loaded = false;
         self.duration_ready = false;
         self.playlist_widget.clear();
@@ -462,6 +527,7 @@ pub const PlayerPanel = struct {
         self.time_label.setText("0:00 / 0:00");
         self.seek_slider.setRange(0, 0);
         self.seek_slider.setEnabled(false);
+        self.refreshPlayButton();
     }
 
     fn updateTitle(self: *PlayerPanel) void {
@@ -495,21 +561,116 @@ pub const PlayerPanel = struct {
         var position_buffer: [32]u8 = undefined;
         var duration_buffer: [32]u8 = undefined;
         var buffer: [96]u8 = undefined;
-        const position = formatTime(&position_buffer, self.media.position());
-        const duration = formatTime(&duration_buffer, self.media.duration());
+        const position_ms = if (self.engine) |engine| engine.position() else 0;
+        const duration_ms = if (self.engine) |engine| engine.duration() else 0;
+        const position = formatTime(&position_buffer, position_ms);
+        const duration = formatTime(&duration_buffer, duration_ms);
         const text = std.fmt.bufPrint(&buffer, "{s} / {s}", .{ position, duration }) catch "0:00 / 0:00";
         self.time_label.setText(text);
     }
 
     fn refreshPlayButton(self: *PlayerPanel) void {
-        const playing = self.media.playbackState() ==
-            qmediaplayer_enums.PlaybackState.PlayingState;
+        const playing = if (self.engine) |engine| engine.state() == .playing else false;
         self.play_button.setText(if (playing) "⏸" else "▶");
     }
 
-    /// Publish title/artist (and progress while playing) to Discord. Audio
-    /// metadata can arrive after playback starts, so callers pass through
-    /// again from `metaDataChanged` and media-status callbacks.
+    fn pollEngine(self: *PlayerPanel) void {
+        const engine = self.engine orelse return;
+        const events = engine.poll();
+        if ((events & music_engine.Failed) != 0) {
+            self.handleEngineError();
+            return;
+        }
+
+        const serial = engine.tagSerial();
+        if (serial != self.tag_serial_seen) {
+            self.tag_serial_seen = serial;
+            if (engine.readTags()) |tags| {
+                self.tags = tags;
+                self.mb_result = null;
+                self.mb_serial +%= 1;
+                if (self.musicbrainz) |brainz| {
+                    brainz.lookup(
+                        tags.titleSlice(),
+                        tags.artistSlice(),
+                        tags.albumSlice(),
+                        self.mb_serial,
+                    );
+                }
+                self.publishPresence(self.playback_intent_playing);
+            }
+        }
+
+        const duration = engine.duration();
+        if (duration > 0 and !self.duration_ready) {
+            self.duration_ready = true;
+            self.publishPresence(self.playback_intent_playing);
+        }
+        if (duration > 0) {
+            const clamped: i32 = @intCast(@min(duration, std.math.maxInt(i32)));
+            if (self.seek_slider.maximum() != clamped)
+                self.seek_slider.setRange(0, clamped);
+        }
+
+        const position: i32 = @intCast(@min(engine.position(), std.math.maxInt(i32)));
+        if (!self.seek_slider.isSliderDown())
+            self.seek_slider.setValue(position);
+        self.updateTime();
+
+        if (self.transport_active and (events & music_engine.Eos) != 0) {
+            self.finishTrack();
+        }
+    }
+
+    fn handleEngineError(self: *PlayerPanel) void {
+        const detail = if (self.engine) |engine|
+            if (engine.readError()) |error_text| error_text.slice() else "unknown audio error"
+        else
+            "audio engine unavailable";
+        var buffer: [1024]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buffer,
+            "Cannot play “{s}”: {s}",
+            .{ self.currentName(), detail },
+        ) catch "Cannot play this file";
+        self.title_label.setText(text);
+        self.transport_active = false;
+        self.playback_intent_playing = false;
+        self.track_loaded = false;
+        self.duration_ready = false;
+        self.seek_slider.setEnabled(false);
+        if (self.discord) |client| client.clearActivity();
+        self.refreshPlayButton();
+    }
+
+    fn applyOutputDevice(self: *PlayerPanel, device: []const u8) void {
+        const engine = self.engine orelse return;
+        const trimmed = std.mem.trim(u8, device, " \t\r\n");
+        const bitperfect = trimmed.len > 0;
+        if (bitperfect) {
+            if (!engine.setOutput(.alsa, trimmed)) return;
+        } else {
+            if (!engine.setOutput(.automatic, "")) return;
+        }
+
+        if (self.output_device) |old| self.gpa.free(old);
+        self.output_device = if (trimmed.len > 0) self.gpa.dupe(u8, trimmed) catch null else null;
+
+        if (bitperfect) {
+            self.volume_slider.setValue(100);
+            self.volume_slider.setEnabled(false);
+            self.volume_slider.setToolTip("Bit-perfect output: use the hardware volume control");
+            self.title_label.setToolTip("Direct ALSA output; software volume and DSP are disabled");
+            engine.setVolume(1.0);
+        } else {
+            self.volume_slider.setEnabled(true);
+            self.volume_slider.setToolTip("");
+            self.title_label.setToolTip("PipeWire audio output");
+            engine.setVolume(volumeFraction(self.volume_slider.value()));
+        }
+    }
+
+    /// Publish title/artist (and progress while playing) to Discord.
     fn publishPresence(self: *PlayerPanel, playing: bool) void {
         const client = self.discord orelse return;
         const index = self.current orelse {
@@ -519,46 +680,26 @@ pub const PlayerPanel = struct {
         if (index >= self.playlist.items.len or !self.track_loaded) return;
         if (!self.transport_active) return;
 
-        var title_meta: ?[]const u8 = null;
-        var contributing: ?[]const u8 = null;
-        var album_artist: ?[]const u8 = null;
-        var author: ?[]const u8 = null;
-        var album: ?[]const u8 = null;
-        var details_owned: ?[]const u8 = null;
-        defer {
-            if (title_meta) |value| self.gpa.free(value);
-            if (contributing) |value| self.gpa.free(value);
-            if (album_artist) |value| self.gpa.free(value);
-            if (author) |value| self.gpa.free(value);
-            if (album) |value| self.gpa.free(value);
-            if (details_owned) |value| self.gpa.free(value);
-        }
-
         var title: []const u8 = std.fs.path.basename(self.playlist.items[index]);
         var artist: []const u8 = "Unknown artist";
         var album_name: []const u8 = "";
-
-        if (self.metadata_ready) {
-            const metadata = self.media.metaData();
-            defer metadata.delete();
-
-            title_meta = metadata.stringValue(self.gpa, qmediametadata_enums.Key.Title);
-            if (nonEmpty(title_meta.?)) |value| title = value;
-
-            contributing = metadata.stringValue(self.gpa, qmediametadata_enums.Key.ContributingArtist);
-            album_artist = metadata.stringValue(self.gpa, qmediametadata_enums.Key.AlbumArtist);
-            author = metadata.stringValue(self.gpa, qmediametadata_enums.Key.Author);
-            album = metadata.stringValue(self.gpa, qmediametadata_enums.Key.AlbumTitle);
-
-            if (nonEmpty(contributing.?)) |value| {
-                artist = value;
-            } else if (nonEmpty(album_artist.?)) |value| {
-                artist = value;
-            } else if (nonEmpty(author.?)) |value| {
-                artist = value;
-            }
-            if (nonEmpty(album.?)) |value| album_name = value;
+        var year: []const u8 = "";
+        if (self.tags) |*tags| {
+            if (nonEmpty(tags.titleSlice())) |value| title = value;
+            if (nonEmpty(tags.artistSlice())) |value| artist = value;
+            if (nonEmpty(tags.albumSlice())) |value| album_name = value;
         }
+        if (self.mb_result) |*result| {
+            if (nonEmpty(result.titleSlice())) |value| title = value;
+            if (nonEmpty(result.artistSlice())) |value| artist = value;
+            if (album_name.len == 0) {
+                if (nonEmpty(result.albumSlice())) |value| album_name = value;
+            }
+            if (nonEmpty(result.yearSlice())) |value| year = value;
+        }
+
+        var details_owned: ?[]u8 = null;
+        defer if (details_owned) |value| self.gpa.free(value);
 
         // The member-list line can show only one activity field. Put the song
         // and artist together in `details`, and ask Discord to display that
@@ -569,10 +710,20 @@ pub const PlayerPanel = struct {
             if (details_owned) |value| details = value;
         }
 
-        const state: []const u8 = album_name;
-        const ready = self.track_loaded and self.duration_ready;
-        const position = if (ready) self.media.position() else 0;
-        const duration = if (ready) self.media.duration() else 0;
+        var state_buffer: [320]u8 = undefined;
+        var state: []const u8 = album_name;
+        if (album_name.len > 0 and year.len > 0) {
+            state = std.fmt.bufPrint(
+                &state_buffer,
+                "{s} • {s}",
+                .{ album_name, year },
+            ) catch album_name;
+        } else if (album_name.len == 0 and year.len > 0) {
+            state = year;
+        }
+
+        const position = if (self.engine) |engine| engine.position() else 0;
+        const duration = if (self.engine) |engine| engine.duration() else 0;
         client.setActivity(details, state, playing, position, duration);
     }
 
@@ -580,13 +731,23 @@ pub const PlayerPanel = struct {
     /// itself is owned by the dock's window and is deleted with it.
     pub fn deinit(self: *PlayerPanel) void {
         if (active == self) active = null;
+        self.poll_timer.stop();
+        if (self.musicbrainz) |brainz| {
+            brainz.deinit();
+            self.musicbrainz = null;
+        }
+        if (self.output_device) |device| {
+            self.gpa.free(device);
+            self.output_device = null;
+        }
         if (self.discord) |client| {
             client.deinit();
             self.discord = null;
         }
-        self.media.stop();
-        self.media.delete();
-        self.audio.delete();
+        if (self.engine) |*engine| {
+            engine.destroy();
+            self.engine = null;
+        }
         for (self.playlist.items) |path| self.gpa.free(path);
         self.playlist.deinit(self.gpa);
         self.gpa.destroy(self);
@@ -596,6 +757,46 @@ pub const PlayerPanel = struct {
 fn nonEmpty(value: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     return if (trimmed.len == 0) null else trimmed;
+}
+
+fn envFlag(name: [*:0]const u8) bool {
+    const raw = std.c.getenv(name) orelse return false;
+    const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+    return !(value.len == 0 or
+        std.mem.eql(u8, value, "0") or
+        std.mem.eql(u8, value, "false") or
+        std.mem.eql(u8, value, "off"));
+}
+
+fn audioOutputMode() music_engine.OutputMode {
+    const raw = std.c.getenv("LIGMA_AUDIO_MODE") orelse return .automatic;
+    const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(value, "alsa") or
+        std.ascii.eqlIgnoreCase(value, "bitperfect") or
+        std.ascii.eqlIgnoreCase(value, "bit-perfect"))
+    {
+        return .alsa;
+    }
+    return .automatic;
+}
+
+fn eqPresetGains() ?[10]f64 {
+    const raw = std.c.getenv("LIGMA_AUDIO_EQ") orelse return null;
+    const name = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(name, "bass")) {
+        return .{ 6, 5, 4, 2, 0, 0, 0, 0, 0, 0 };
+    }
+    if (std.ascii.eqlIgnoreCase(name, "vocal")) {
+        return .{ -2, -1, 0, 2, 4, 4, 3, 1, 0, -1 };
+    }
+    if (std.ascii.eqlIgnoreCase(name, "rock")) {
+        return .{ 4, 3, 2, 0, -1, -1, 0, 2, 3, 4 };
+    }
+    return null;
+}
+
+fn volumeFraction(value: i32) f32 {
+    return @as(f32, @floatFromInt(value)) / 100.0;
 }
 
 fn formatTime(buffer: []u8, milliseconds: i64) []const u8 {
@@ -629,7 +830,9 @@ fn onStopClicked(_: QPushButton) callconv(.c) void {
 }
 
 fn onSeekMoved(_: QSlider, value: i32) callconv(.c) void {
-    if (active) |panel| panel.media.setPosition(value);
+    if (active) |panel| {
+        if (panel.engine) |engine| engine.setPosition(value);
+    }
 }
 
 fn onSeekReleased(_: QSlider) callconv(.c) void {
@@ -644,10 +847,27 @@ fn onShuffleClicked(_: QPushButton) callconv(.c) void {
     if (active) |panel| panel.toggleShuffle();
 }
 
+fn onOutputClicked(_: QPushButton) callconv(.c) void {
+    const panel = active orelse return;
+    var ok = false;
+    const current = panel.output_device orelse "";
+    const raw = QInputDialog.getText6(
+        panel.gpa,
+        panel.container,
+        "Audio Output",
+        "Empty = PipeWire. Enter an ALSA device such as hw:1,0 for direct/bit-perfect output:",
+        qlineedit_enums.EchoMode.Normal,
+        current,
+        &ok,
+    );
+    defer panel.gpa.free(raw);
+    if (!ok) return;
+    panel.applyOutputDevice(raw);
+}
+
 fn onVolumeChanged(_: QSlider, value: i32) callconv(.c) void {
     if (active) |panel| {
-        const volume: f32 = @as(f32, @floatFromInt(value)) / 100.0;
-        panel.audio.setVolume(volume);
+        if (panel.engine) |engine| engine.setVolume(volumeFraction(value));
     }
 }
 
@@ -657,72 +877,16 @@ fn onPlaylistRowChanged(_: QListWidget, row: i32) callconv(.c) void {
     panel.playIndex(@intCast(row));
 }
 
-fn onPlaybackStateChanged(_: QMediaPlayer, state: i32) callconv(.c) void {
-    const panel = active orelse return;
-    panel.refreshPlayButton();
-    if (state == qmediaplayer_enums.PlaybackState.PlayingState) {
-        panel.playback_intent_playing = true;
-        panel.publishPresence(true);
-    } else if (state == qmediaplayer_enums.PlaybackState.PausedState) {
-        panel.playback_intent_playing = false;
-        panel.publishPresence(false);
-    }
+fn onPollTimer(_: QTimer) callconv(.c) void {
+    if (active) |panel| panel.pollEngine();
 }
 
-fn onMediaStatusChanged(_: QMediaPlayer, status: i32) callconv(.c) void {
+fn onMusicBrainzResult(result: musicbrainz.Result) void {
     const panel = active orelse return;
-    if (status == qmediaplayer_enums.MediaStatus.EndOfMedia) {
-        panel.finishTrack();
-        return;
-    }
-    if (status == qmediaplayer_enums.MediaStatus.LoadedMedia or
-        status == qmediaplayer_enums.MediaStatus.BufferedMedia)
-    {
-        panel.track_loaded = true;
-        panel.metadata_ready = true;
-        panel.publishPresence(panel.playback_intent_playing);
-    }
-}
-
-fn onMetaDataChanged(_: QMediaPlayer) callconv(.c) void {
-    const panel = active orelse return;
-    if (!panel.track_loaded) return;
-    panel.metadata_ready = true;
+    if (panel.current == null) return;
+    if (result.serial != panel.mb_serial) return;
+    panel.mb_result = result;
     panel.publishPresence(panel.playback_intent_playing);
-}
-
-fn onPositionChanged(_: QMediaPlayer, position: i64) callconv(.c) void {
-    const panel = active orelse return;
-    if (!panel.seek_slider.isSliderDown()) {
-        const clamped: i32 = @intCast(@min(position, std.math.maxInt(i32)));
-        panel.seek_slider.setValue(clamped);
-    }
-    panel.updateTime();
-}
-
-fn onDurationChanged(_: QMediaPlayer, duration: i64) callconv(.c) void {
-    const panel = active orelse return;
-    const clamped: i32 = @intCast(@min(duration, std.math.maxInt(i32)));
-    panel.seek_slider.setRange(0, clamped);
-    panel.duration_ready = true;
-    panel.updateTime();
-    if (panel.track_loaded) panel.publishPresence(panel.playback_intent_playing);
-}
-
-fn onErrorOccurred(_: QMediaPlayer, _: i32, description: [*:0]const u8) callconv(.c) void {
-    const panel = active orelse return;
-    var buffer: [768]u8 = undefined;
-    const detail = std.mem.span(description);
-    const text = std.fmt.bufPrint(
-        &buffer,
-        "Cannot play “{s}”: {s}",
-        .{ panel.currentName(), detail },
-    ) catch "Cannot play this file";
-    panel.title_label.setText(text);
-    panel.transport_active = false;
-    panel.playback_intent_playing = false;
-    panel.duration_ready = false;
-    if (panel.discord) |client| client.clearActivity();
 }
 
 fn findPath(paths: []const []u8, path: []const u8) ?usize {
