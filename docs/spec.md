@@ -190,7 +190,7 @@ Per-folder state remembers view mode, sort column/order, grouping, zoom, hidden-
 - Breadcrumb path bar; click a segment to navigate; Ctrl+L or click empty space to edit the full path.
 - `~`, relative paths, and `file://` URIs accepted in the location bar.
 - Places sidebar with Home, XDG directories, Starred, Recent, Trash, Filesystem, devices, network.
-- **Implemented (v0.4):** right-click a folder → *Add to Places* pins it to the sidebar; right-click a user-added entry → *Remove from Places*. Custom entries persist in `$XDG_CONFIG_HOME/ligma/places`, one absolute path per line, and load at startup after the built-ins. Built-in entries cannot be removed. The file-list menu also offers *Open in Terminal*.
+- **Implemented (v0.4):** right-click a folder → *Add to Places* pins it to the sidebar; right-click a user-added entry → *Remove from Places*. Custom entries persist in `$XDG_CONFIG_HOME/ligma/places`, one absolute path per line, and load at startup after the built-ins. Built-in entries cannot be removed. Right-clicking the built-in Trash entry offers *Empty Trash…*. The file-list menu also offers *Open in Terminal*.
 - **Implemented (v0.4):** the file-list context menu exposes *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, *Delete Permanently*, and *Add to Places* (shown only when the selection contains a folder). Right-clicking an unselected row selects it first, right-clicking a row that is already selected preserves a multi-selection, and right-clicking empty space clears the selection so only folder-wide actions (*Paste*, *New Folder…*) remain enabled. *Paste* is enabled only while the clipboard holds items and no file operation is running. *Properties* shows name, kind, size, location, modified time, permissions, and the symlink target for one item, and the item count, folder/file breakdown, total size, and location for a multi-selection. In Trash the menu becomes *Restore*, *Properties*, *Delete Permanently*, and *Empty Trash…*.
 - Drag a folder to the sidebar to bookmark it.
 - Middle-click a folder to open it in a new tab.
@@ -276,6 +276,7 @@ Decision: ship desktop icons as an optional component in P6, with a clear warnin
 | F2 | Rename |
 | Ctrl+Shift+N | New folder |
 | Ctrl+H | Show/hide hidden files |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 | Details / Icons / Compact view |
 | Ctrl+Shift+V | Paste into current folder |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo file operation |
 | Delete / Shift+Delete | Move to trash / delete permanently |
@@ -408,6 +409,7 @@ src/
     music_engine.cpp       GStreamer C ABI engine (PipeWire/ALSA, DSP)
     music_engine.zig       Zig bridge for the GStreamer engine
     mounts.zig             mounted-volume discovery for the Drives list
+    qt_bridge.cpp           QVariant-from-QIcon bridge for view icons
     status_bar.zig
   platform/
     linux/
@@ -849,13 +851,14 @@ These need a product decision before the relevant phase:
 Implemented in the v0.5 prototype:
 
 - Zig 0.17 + Qt 6.12 window using `libqt6zig`, split into `main.zig`, `app.zig`, `ui/`, and `core/`.
-- Places sidebar (Home, XDG folders, Trash, Filesystem) plus a **Drives** section populated from `QStorageInfo`.
+- Places sidebar (Home, XDG folders, Trash, Filesystem) plus a **Drives** section populated from `QStorageInfo`. Each drive row shows free space and a used-capacity progress bar; right-clicking a drive offers **Unmount** and falls back from `udisksctl` to `pkexec`.
 - Compact Places and Drives lists that size to their content and scroll after a window-relative height cap.
 - Automatic directory refresh through `QFileSystemWatcher` for every open pane and for `Trash/files`/`Trash/info`; events are coalesced and selection plus scroll position are restored after the snapshot reset.
 - Back/forward/up/home/reload navigation with independent per-pane history.
 - Editable path bar with `~`, relative-path, and `file://` resolution.
 - Custom `LocalModel` (`src/ui/local_model.zig`) replacing `QFileSystemModel`: worker-thread folder enumeration, UI-timer polling, and a flat details snapshot.
-- Details view with Name, Size, Kind, and Modified columns; folder-first sorting by any column.
+- Details, Icons, and Compact views (`Ctrl+1`/`Ctrl+2`/`Ctrl+3`) over the same model. Details keeps the Name/Size/Kind/Modified columns, Icons uses a wrapped icon grid, and Compact uses a dense icon list. A shared selection model preserves selected paths across view changes.
+- Details and Icons show themed file, folder, and symlink icons through `QFileIconProvider`.
 - In-memory case-insensitive substring filter (directories remain visible) that never touches the filesystem.
 - Hidden-file toggle that applies to every pane.
 - File opening through the desktop's default application, with audio routed to the built-in player.
@@ -877,9 +880,9 @@ Implemented in the v0.5 prototype:
 
 Known prototype limitations (addressed in later phases):
 
-- The model is a flat single-folder snapshot: no tree expansion, icons, thumbnails, or per-folder view state yet.
+- The model is a flat single-folder snapshot: no tree expansion, thumbnails, or per-folder view state yet. View mode is per-pane and resets to Details for new panes.
 - Directory watchers cover entry creates, deletes, renames, and moves. In-place edits that only change an existing file's contents may still need a manual reload (`F5`).
-- Mounted drives are polled every 2 seconds through `QStorageInfo`; mount/unmount actions and UDisks2 integration are not implemented yet.
+- Mounted drives are polled every 2 seconds through `QStorageInfo`. Unmount uses the `udisksctl`/`pkexec` helpers; mounting, formatting, and full UDisks2 integration are not implemented yet.
 - Trash browsing uses the home Trash directory only; per-mount `.Trash-$uid` locations are not implemented yet.
 - Restore, permanent delete, and empty Trash are not undoable. Undo only reverses the original move-to-Trash batch.
 - Executables run detached without a terminal, allow-list, or remembered confirmation, so command-line tools with no GUI produce no visible output.

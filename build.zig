@@ -46,6 +46,23 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.linkSystemLibrary("stdc++", .{});
     exe.root_module.linkSystemLibrary("Qt6Network", .{});
 
+    // libqt6zig does not expose a QVariant constructor for QIcon, so the item
+    // model uses this tiny helper for DecorationRole.
+    const qt_bridge_cflags = switch (b.runFallible(
+        &.{ "pkg-config", "--cflags", "Qt6Core", "Qt6Gui" },
+        .{},
+    )) {
+        .success => |stdout| stdout,
+        else => @panic("Qt 6 Core/Gui development files not found."),
+    };
+    const qt_bridge_shim = b.addSystemCommand(&.{ "g++", "-std=c++17", "-O2", "-fPIC", "-c" });
+    qt_bridge_shim.addFileArg(b.path("src/ui/qt_bridge.cpp"));
+    qt_bridge_shim.addArg("-o");
+    const qt_bridge_object = qt_bridge_shim.addOutputFileArg("qt_bridge.o");
+    var qt_bridge_flags = std.mem.tokenizeAny(u8, qt_bridge_cflags, " \t\r\n");
+    while (qt_bridge_flags.next()) |flag| qt_bridge_shim.addArg(flag);
+    exe.root_module.addObjectFile(qt_bridge_object);
+
     // GStreamer owns the audio pipeline so the music player can use direct
     // ALSA output and optional DSP filters. Like QTermWidget, the engine is a
     // C++ translation unit with a plain C ABI.
@@ -127,6 +144,7 @@ const qt_libraries = [_][]const u8{
     "qabstractscrollarea",
     "qabstractslider",
     "qaction",
+    "qactiongroup",
     "qapplication",
     "qboxlayout",
     "qcoreapplication",
@@ -134,6 +152,7 @@ const qt_libraries = [_][]const u8{
     "qdir",
     "qdockwidget",
     "qevent",
+    "qfileiconprovider",
     "qfileinfo",
     "qframe",
     "qfilesystemwatcher",
@@ -165,11 +184,13 @@ const qt_libraries = [_][]const u8{
     "qpoint",
     "qpixmap",
     "qprocess",
+    "qprogressbar",
     "qpushbutton",
     "qscrollbar",
     "qsize",
     "qslider",
     "qsplitter",
+    "qstackedwidget",
     "qstatusbar",
     "qstorageinfo",
     "qtabwidget",

@@ -31,10 +31,10 @@ Read the full product and technical specification in [`docs/spec.md`](docs/spec.
 This repository contains a working **v0.5 prototype**:
 
 - Zig 0.17 + Qt 6.12 via [`libqt6zig`](https://github.com/rcalixte/libqt6zig)
-- Places and Drives sidebar, details view, item count, and window title
+- Places and Drives sidebar, Details/Icons/Compact views, item count, and window title
 - **Custom item model** — `src/ui/local_model.zig` lists folders and Trash on a worker thread, polls snapshots from the UI, and renders folder or trash-specific columns
 - **Live folder refresh** — watches every open pane and the Trash directory, coalesces filesystem events, reloads the affected snapshots, and restores the selection
-- **Mounted drives** — a **Drives** section under Places lists real mounted volumes with labels, mount paths, filesystem types, and free-space tooltips; it updates automatically when drives appear or disappear
+- **Mounted drives** — a **Drives** section under Places lists real mounted volumes with labels, an inline free-space label, and a used-capacity progress bar. Tooltips include the mount path, device, filesystem, and free/total space. Right-click a drive to **Unmount** it (UDisks2 first, then `pkexec`), and the list updates automatically when drives appear or disappear
 - **Compact sidebar** — the Places and Drives lists size themselves to their contents and scroll once they reach a height cap, instead of leaving a large empty box
 - Back / forward / up / home / reload navigation with per-pane history
 - Editable path bar with `~`, relative-path, and `file://` resolution
@@ -43,6 +43,7 @@ This repository contains a working **v0.5 prototype**:
 - Opens files with the desktop's default application, except audio files that play in the built-in music player
 - **Tabs** — `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+W`
 - **Split view** — `F3` toggles, `F6` focuses the other pane; panes keep independent history and filters
+- **View modes** — **Details** (`Ctrl+1`), **Icons** (`Ctrl+2`), and **Compact** (`Ctrl+3`). The Details and icon views share one selection model, so switching modes preserves the selected paths; Details and Icons use themed file/folder icons
 - **Global filename search** — `Ctrl+Shift+F`, streamed results in a search dock
 - **SQLite FTS5 search index** — automatic background build, trigram substring matching, status-bar health, and `View > Rebuild Search Index`
 - **Async file operations** — copy, cut, paste, rename, new folder, trash, restore, permanent delete, empty Trash, and undo, all on a worker thread with progress and cancellation
@@ -50,7 +51,7 @@ This repository contains a working **v0.5 prototype**:
 - **Drag and drop** — drag selected rows to move them, or hold Ctrl to copy. Drop onto a folder row or into a pane's empty space. Drags from other applications always copy, same-folder drops are no-ops, and collisions use the same `name (1).ext` naming as paste
 - **Freedesktop.org Trash** — a dedicated **Trash** place browses `Trash/files`, shows each item's original location and deletion date, and supports **Restore**, **Delete Permanently**, and **Empty Trash**. Trash contents use `Path=`/`DeletionDate=` `.trashinfo` files, collision-safe storage names, and restore conflicts use `name (1).ext`; restoring is also available through undo for a just-trashed batch
 - **Undo journal** — the last completed batch can be reversed with `Ctrl+Z`, including copies, moves, renames, new folders, and trashed items
-- **Custom Places bookmarks** — right-click a folder and choose *Add to Places* to pin it to the sidebar; right-click a user-added entry to remove it. Bookmarks persist in `$XDG_CONFIG_HOME/ligma/places` (or `~/.config/ligma/places`)
+- **Custom Places bookmarks** — right-click a folder and choose *Add to Places* to pin it to the sidebar; right-click a user-added entry and choose *Remove from Places* to unbookmark it. Bookmarks persist in `$XDG_CONFIG_HOME/ligma/places` (or `~/.config/ligma/places`). Right-click the built-in **Trash** entry for *Empty Trash…*
 - **Embedded terminal** — `F12` toggles a terminal panel docked on the right; the first open starts the user's shell in the active folder, and the session survives hiding and reopening
 - **Run executables** — activating an executable file asks for confirmation, then launches it detached with its folder as the working directory
 - **Preview panel** — selecting exactly one image or video file shows a larger thumbnail in the window's bottom-left corner
@@ -167,7 +168,8 @@ The schema uses SQLite FTS5 external-content tables (`files`, `files_fts`, and a
 - `QFileSystemWatcher` watches every open pane's current folder plus `Trash/files` and `Trash/info`. Events are coalesced for 180 ms, then the relevant snapshots reload.
 - Creates, deletes, renames, moves between folders, and Trash changes update counts and rows without a manual reload. Selected paths and the scroll position are captured before the snapshot reset and restored afterward when they still exist.
 - Directory watches report directory-entry changes. An in-place save that only changes an existing file's contents may still need `F5`.
-- Mounted volumes are refreshed every 2 seconds with `QStorageInfo`. The **Drives** list excludes pseudo-filesystems and snap loop devices, sorts by label, and shows the mount path, device, filesystem, and free space in each row's tooltip.
+- Mounted volumes are refreshed every 2 seconds with `QStorageInfo`. The **Drives** list excludes pseudo-filesystems and snap loop devices, sorts by label, and shows a free-space label plus a used-capacity progress bar for each volume. Each row's tooltip includes the mount path, device, filesystem, and free/total space.
+- Right-click a drive and choose **Unmount**. Ligma tries `udisksctl unmount` first so user-mounted media can unmount without a password, then falls back to `pkexec umount` for authorization. Failures such as a busy device are reported without removing the drive from the list.
 - The Places and Drives lists collapse to their content height. When they exceed a fraction of the window height they get scrollbars, leaving the remaining sidebar space outside the boxes.
 
 ## Drag and drop
@@ -281,6 +283,7 @@ sudo update-desktop-database /usr/share/applications
 | `Ctrl+T` / `Ctrl+W` | New tab / close tab |
 | `Ctrl+Shift+W` | Close window |
 | `F3` / `F6` | Toggle split view / focus other pane |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Details / Icons / Compact view |
 | `F12` | Toggle the terminal panel |
 | `F9` | Toggle the music player |
 | `Ctrl+L` | Edit location |
@@ -312,6 +315,7 @@ src/main.zig           Qt entrypoint
 src/app.zig            window, tabs, panes, navigation, search and file-operation UI
 src/ui/local_model.zig  async flat directory model with filter and sort
 src/ui/mounts.zig       QStorageInfo-backed mounted-drive discovery
+src/ui/qt_bridge.cpp    QVariant-from-QIcon bridge for view decorations
 src/ui/terminal.zig     Zig wrapper for the embedded terminal panel
 src/ui/terminal_widget.cpp  QTermWidget C ABI shim (compiled with g++)
 src/ui/player.zig       music player UI, playlist, repeat/shuffle, Discord

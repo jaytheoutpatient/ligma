@@ -4,10 +4,14 @@ const qt6 = @import("libqt6zig");
 const file_ops = @import("../core/file_ops.zig");
 
 const QAbstractItemModel = qt6.QAbstractItemModel;
+const QFileIconProvider = qt6.QFileIconProvider;
+const QFileInfo = qt6.QFileInfo;
 const QMimeData = qt6.QMimeData;
 const QModelIndex = qt6.QModelIndex;
 const QUrl = qt6.QUrl;
 const QVariant = qt6.QVariant;
+
+extern fn ligma_qvariant_from_icon(icon: ?*anyopaque) ?*anyopaque;
 
 const qnamespace_enums = qt6.qnamespace_enums;
 
@@ -28,6 +32,7 @@ pub const LocalModel = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     qt: QAbstractItemModel,
+    icon_provider: QFileIconProvider = undefined,
 
     root_path: ?[]u8 = null,
     location: Location = .directory,
@@ -97,7 +102,13 @@ pub const LocalModel = struct {
 
         const self = try gpa.create(LocalModel);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .io = io, .qt = qt_model };
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .qt = qt_model,
+            .icon_provider = QFileIconProvider.new(),
+        };
+        errdefer self.icon_provider.delete();
 
         try registry.put(registry_allocator, @intFromPtr(qt_model.ptr.?), self);
         errdefer _ = registry.remove(@intFromPtr(qt_model.ptr.?));
@@ -135,6 +146,7 @@ pub const LocalModel = struct {
     /// Unregister before the parent widget deletes the C++ object.
     pub fn destroy(self: *LocalModel) void {
         _ = registry.remove(@intFromPtr(self.qt.ptr.?));
+        self.icon_provider.delete();
 
         if (self.job) |job| {
             job.requestCancel();
@@ -690,6 +702,15 @@ fn onData(
 ) callconv(.c) QVariant {
     const self = findModel(model) orelse return emptyVariant();
     const entry = self.entryAt(index) orelse return emptyVariant();
+
+    if (role == qnamespace_enums.ItemDataRole.DecorationRole and index.column() == 0) {
+        const info = QFileInfo.new2(entry.path);
+        defer info.delete();
+        const icon = self.icon_provider.icon2(info);
+        defer icon.delete();
+        const variant_ptr = ligma_qvariant_from_icon(icon.ptr) orelse return emptyVariant();
+        return QVariant{ .ptr = @ptrCast(variant_ptr) };
+    }
 
     if (role == qnamespace_enums.ItemDataRole.DisplayRole) {
         if (self.location == .trash) {

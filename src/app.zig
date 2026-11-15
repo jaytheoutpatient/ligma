@@ -12,6 +12,7 @@ const preview_mod = @import("ui/preview.zig");
 const terminal_mod = @import("ui/terminal.zig");
 
 const QAction = qt6.QAction;
+const QActionGroup = qt6.QActionGroup;
 const QApplication = qt6.QApplication;
 const QDesktopServices = qt6.QDesktopServices;
 const QDir = qt6.QDir;
@@ -26,6 +27,7 @@ const QItemSelectionModel = qt6.QItemSelectionModel;
 const QKeySequence = qt6.QKeySequence;
 const QLabel = qt6.QLabel;
 const QLineEdit = qt6.QLineEdit;
+const QListView = qt6.QListView;
 const QListWidget = qt6.QListWidget;
 const QListWidgetItem = qt6.QListWidgetItem;
 const QMainWindow = qt6.QMainWindow;
@@ -36,9 +38,11 @@ const QMouseEvent = qt6.QMouseEvent;
 const QPixmap = qt6.QPixmap;
 const QPoint = qt6.QPoint;
 const QProcess = qt6.QProcess;
+const QProgressBar = qt6.QProgressBar;
 const QPushButton = qt6.QPushButton;
 const QSize = qt6.QSize;
 const QSplitter = qt6.QSplitter;
+const QStackedWidget = qt6.QStackedWidget;
 const QStatusBar = qt6.QStatusBar;
 const QTabWidget = qt6.QTabWidget;
 const QTimer = qt6.QTimer;
@@ -51,14 +55,20 @@ const qabstractitemview_enums = qt6.qabstractitemview_enums;
 const qnamespace_enums = qt6.qnamespace_enums;
 const qdockwidget_enums = qt6.qdockwidget_enums;
 const qfiledevice_enums = qt6.qfiledevice_enums;
+const qiodevicebase_enums = qt6.qiodevicebase_enums;
 const qitemselectionmodel_enums = qt6.qitemselectionmodel_enums;
 const qlineedit_enums = qt6.qlineedit_enums;
+const qlistview_enums = qt6.qlistview_enums;
 const qmessagebox_enums = qt6.qmessagebox_enums;
+const qprocess_enums = qt6.qprocess_enums;
 
 pub const Pane = struct {
     tab: *Tab,
     container: QWidget,
+    stack: QStackedWidget,
     tree: QTreeView,
+    list: QListView,
+    view_mode: ViewMode = .details,
     model: *local_model.LocalModel,
     path_edit: QLineEdit,
     search_edit: QLineEdit,
@@ -86,6 +96,8 @@ const UndoBatch = std.ArrayList(file_ops.UndoItem);
 
 const ClipMode = enum { none, copy, cut };
 
+const ViewMode = enum { details, icons, compact };
+
 const App = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -97,6 +109,8 @@ const App = struct {
     places: QListWidget,
     drives_label: QLabel,
     drives: QListWidget,
+    drive_bars: std.ArrayList(QProgressBar) = .empty,
+    drive_labels: std.ArrayList(QLabel) = .empty,
     mount_places: std.ArrayList(mounts.Volume) = .empty,
     drives_updating: bool = false,
     mount_timer: QTimer,
@@ -119,6 +133,15 @@ const App = struct {
 
     tree_menu: QMenu,
     places_menu: QMenu,
+    drive_menu: QMenu,
+    ctx_unmount_action: QAction,
+    ctx_empty_place_trash_action: QAction,
+    context_drive_row: i32 = -1,
+    mount_generation: u64 = 0,
+    context_drive_generation: u64 = 0,
+    view_details_action: QAction,
+    view_icons_action: QAction,
+    view_compact_action: QAction,
     ctx_open_action: QAction,
     ctx_restore_action: QAction,
     ctx_empty_trash_action: QAction,
@@ -159,6 +182,14 @@ const App = struct {
     file_timer: QTimer,
     file_job: ?*file_ops.Job = null,
     file_job_clears_clipboard: bool = false,
+
+    unmount_process: QProcess,
+    unmount_path: ?[]u8 = null,
+    unmount_device: ?[]u8 = null,
+    unmount_label: [256]u8 = undefined,
+    unmount_label_len: usize = 0,
+    unmount_tried_pkexec: bool = false,
+    unmount_active: bool = false,
 
     model_timer: QTimer,
 
@@ -363,6 +394,10 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const mount_timer = QTimer.new2(window);
     mount_timer.setInterval(2000);
 
+    const unmount_process = QProcess.new2(window);
+    unmount_process.onFinished(onUnmountFinished);
+    unmount_process.onErrorOccurred(onUnmountError);
+
     const status = window.statusBar();
     const count_label = QLabel.new3("");
     status.addPermanentWidget(count_label);
@@ -442,6 +477,22 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const focus_other_action = makeAction(view_menu, "Focus Other Pane", "F6", onFocusOtherPane);
     view_menu.addAction(focus_other_action);
     _ = view_menu.addSeparator();
+    const view_group = QActionGroup.new(view_menu);
+    view_group.setExclusive(true);
+    const details_view_action = makeAction(view_menu, "Details", "Ctrl+1", onViewDetails);
+    details_view_action.setCheckable(true);
+    details_view_action.setChecked(true);
+    _ = view_group.addAction(details_view_action);
+    view_menu.addAction(details_view_action);
+    const icons_view_action = makeAction(view_menu, "Icons", "Ctrl+2", onViewIcons);
+    icons_view_action.setCheckable(true);
+    _ = view_group.addAction(icons_view_action);
+    view_menu.addAction(icons_view_action);
+    const compact_view_action = makeAction(view_menu, "Compact", "Ctrl+3", onViewCompact);
+    compact_view_action.setCheckable(true);
+    _ = view_group.addAction(compact_view_action);
+    view_menu.addAction(compact_view_action);
+    _ = view_menu.addSeparator();
     const terminal_action = makeAction(view_menu, "Terminal Panel", "F12", onToggleTerminal);
     terminal_action.setCheckable(true);
     view_menu.addAction(terminal_action);
@@ -509,8 +560,13 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const ctx_add_places_action = tree_menu.addAction2("&Add to Places");
     ctx_add_places_action.onTriggered(onCtxAddToPlaces);
     const places_menu = QMenu.new(window);
+    const ctx_empty_place_trash_action = places_menu.addAction2("&Empty Trash…");
+    ctx_empty_place_trash_action.onTriggered(onCtxEmptyPlaceTrash);
     const ctx_remove_place_action = places_menu.addAction2("Remove from Places");
     ctx_remove_place_action.onTriggered(onCtxRemovePlace);
+    const drive_menu = QMenu.new(window);
+    const ctx_unmount_action = drive_menu.addAction2("&Unmount");
+    ctx_unmount_action.onTriggered(onCtxUnmountDrive);
 
     // ---- Shared state ----------------------------------------------------
     app = .{
@@ -537,6 +593,12 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .player_action = player_action,
         .tree_menu = tree_menu,
         .places_menu = places_menu,
+        .drive_menu = drive_menu,
+        .ctx_unmount_action = ctx_unmount_action,
+        .ctx_empty_place_trash_action = ctx_empty_place_trash_action,
+        .view_details_action = details_view_action,
+        .view_icons_action = icons_view_action,
+        .view_compact_action = compact_view_action,
         .ctx_open_action = ctx_open_action,
         .ctx_restore_action = ctx_restore_action,
         .ctx_empty_trash_action = ctx_empty_trash_action,
@@ -564,6 +626,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .index_timer = index_timer,
         .file_timer = file_timer,
         .model_timer = model_timer,
+        .unmount_process = unmount_process,
         .back_action = back_action,
         .forward_action = forward_action,
         .split_action = split_action,
@@ -589,8 +652,10 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
 
     places.setContextMenuPolicy(qnamespace_enums.ContextMenuPolicy.CustomContextMenu);
     places.onCustomContextMenuRequested(onPlacesContextMenu);
-    places.onCurrentRowChanged(onPlaceSelected);
-    drives.onCurrentRowChanged(onDriveSelected);
+    places.onItemClicked(onPlaceItemClicked);
+    drives.setContextMenuPolicy(qnamespace_enums.ContextMenuPolicy.CustomContextMenu);
+    drives.onCustomContextMenuRequested(onDrivesContextMenu);
+    drives.onItemClicked(onDriveItemClicked);
     fs_watcher.onDirectoryChanged(onFsDirectoryChanged);
     fs_refresh_timer.onTimeout(onFsRefreshTimer);
     mount_timer.onTimeout(onMountTimer);
@@ -611,7 +676,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     model_timer.start(50);
     mount_timer.start(2000);
     initSearchIndex(home);
-    if (first_tab.panes[0]) |pane| pane.tree.setFocus();
+    if (first_tab.panes[0]) |pane| focusPane(pane);
 
     _ = QApplication.exec();
 
@@ -635,8 +700,16 @@ fn shutdown() void {
     app.file_timer.stop();
     app.fs_refresh_timer.stop();
     app.mount_timer.stop();
+    app.unmount_active = false;
+    if (app.unmount_process.state() != qprocess_enums.ProcessState.NotRunning) {
+        _ = app.unmount_process.kill();
+        _ = app.unmount_process.waitForFinished();
+    }
+    clearUnmountState();
     for (app.fs_watch_paths.items) |path| app.gpa.free(path);
     app.fs_watch_paths.deinit(app.gpa);
+    app.drive_bars.deinit(app.gpa);
+    app.drive_labels.deinit(app.gpa);
     for (app.mount_places.items) |*volume| volume.deinit(app.gpa);
     app.mount_places.deinit(app.gpa);
     if (app.file_job) |job| {
@@ -752,20 +825,49 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
     tree.setColumnWidth(2, 170);
     tree.setColumnWidth(3, 190);
 
+    const list = QListView.new(container);
+    list.setUniformItemSizes(true);
+    list.setSelectionBehavior(qabstractitemview_enums.SelectionBehavior.SelectItems);
+    list.setSelectionMode(qabstractitemview_enums.SelectionMode.ExtendedSelection);
+    list.setDragEnabled(true);
+    list.setAcceptDrops(true);
+    list.setDropIndicatorShown(true);
+    list.setDragDropMode(qabstractitemview_enums.DragDropMode.DragDrop);
+    list.setDefaultDropAction(qnamespace_enums.DropAction.MoveAction);
+    list.setDragDropOverwriteMode(false);
+    list.setModelColumn(0);
+    list.setWordWrap(true);
+    list.setSpacing(6);
+    list.setResizeMode(qlistview_enums.ResizeMode.Adjust);
+    list.setMovement(qlistview_enums.Movement.Static);
+    list.setViewMode(qlistview_enums.ViewMode.IconMode);
+
     const model = local_model.LocalModel.create(app.gpa, app.io, container) catch
         @panic("Out of memory creating model");
     model.setShowHidden(app.show_hidden);
     model.setDropHandler(onModelDrop);
     tree.setModel(model.qt);
+    list.setModel(model.qt);
     tree.sortByColumn(0, qnamespace_enums.SortOrder.AscendingOrder);
 
-    const selection = tree.selectionModel();
+    // Both views share one selection model, so switching between Details,
+    // Icons, and Compact preserves the selected paths.
+    const selection = QItemSelectionModel.new2(model.qt, container);
+    tree.setSelectionModel(selection);
+    list.setSelectionModel(selection);
+
+    const stack = QStackedWidget.new2();
+    _ = stack.addWidget(tree);
+    _ = stack.addWidget(list);
+    stack.setCurrentIndex(0);
 
     const pane = app.gpa.create(Pane) catch @panic("Out of memory creating pane");
     pane.* = .{
         .tab = tab,
         .container = container,
+        .stack = stack,
         .tree = tree,
+        .list = list,
         .model = model,
         .path_edit = path_edit,
         .search_edit = search_edit,
@@ -774,14 +876,21 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
     app.panes_list.append(app.gpa, pane) catch @panic("Out of memory creating pane");
 
     tree.onClicked(onTreeClicked);
-    tree.onActivated(onItemActivated);
+    tree.onActivated(onTreeActivated);
     tree.onMousePressEvent(onTreeMousePress);
     tree.setContextMenuPolicy(qnamespace_enums.ContextMenuPolicy.CustomContextMenu);
     tree.onCustomContextMenuRequested(onTreeContextMenu);
+
+    list.onClicked(onListClicked);
+    list.onActivated(onListActivated);
+    list.onMousePressEvent(onListMousePress);
+    list.setContextMenuPolicy(qnamespace_enums.ContextMenuPolicy.CustomContextMenu);
+    list.onCustomContextMenuRequested(onListContextMenu);
+
     selection.onCurrentChanged(onSelectionChanged);
     selection.onSelectionChanged(onSelectionModelChanged);
 
-    layout.addWidget(tree);
+    layout.addWidget(stack);
     layout.setStretch(1, 1);
     tab.splitter.addWidget(container);
 
@@ -833,14 +942,14 @@ fn closeTab(index: i32) void {
     const current = activeTab() orelse return;
     const pane = current.panes[current.active] orelse current.panes[0] orelse return;
     setActivePane(pane);
-    pane.tree.setFocus();
+    focusPane(pane);
 }
 
 fn newTab() void {
     const current = activePane();
     const path = if (current) |pane| (pane.current_path orelse "/") else "/";
     const tab = createTab(path);
-    if (tab.panes[tab.active]) |pane| pane.tree.setFocus();
+    if (tab.panes[tab.active]) |pane| focusPane(pane);
 }
 
 fn toggleSplit() void {
@@ -862,7 +971,7 @@ fn toggleSplit() void {
             tab.active = 0;
             if (tab.panes[0]) |pane| {
                 setActivePane(pane);
-                pane.tree.setFocus();
+                focusPane(pane);
             }
         }
         if (tab.panes[1]) |pane| pane.container.hide();
@@ -879,7 +988,7 @@ fn focusOtherPane() void {
     const other: u8 = if (tab.active == 0) 1 else 0;
     if (tab.panes[other]) |pane| {
         setActivePane(pane);
-        pane.tree.setFocus();
+        focusPane(pane);
     }
 }
 
@@ -916,6 +1025,7 @@ fn setActivePane(pane: *Pane) void {
     pane.tab.active = if (pane.tab.panes[1] == pane) 1 else 0;
     updateHistoryActions();
     updateFileActionState();
+    updateViewModeActions();
     refreshCount(pane);
     refreshPreview(pane);
     updateSelectionStatus(pane, true);
@@ -926,6 +1036,110 @@ fn setActivePane(pane: *Pane) void {
 fn updateFileActionState() void {
     const trash_view = if (activePane()) |pane| pane.model.isTrash() else false;
     app.file_trash_action.setEnabled(!trash_view);
+}
+
+fn focusPane(pane: *Pane) void {
+    if (pane.view_mode == .details) {
+        pane.tree.setFocus();
+    } else {
+        pane.list.setFocus();
+    }
+}
+
+fn currentViewScroll(pane: *Pane) i32 {
+    return if (pane.view_mode == .details)
+        pane.tree.verticalScrollBar().value()
+    else
+        pane.list.verticalScrollBar().value();
+}
+
+fn setCurrentViewScroll(pane: *Pane, value: i32) void {
+    if (pane.view_mode == .details) {
+        pane.tree.verticalScrollBar().setValue(value);
+    } else {
+        pane.list.verticalScrollBar().setValue(value);
+    }
+}
+
+fn applyViewMode(pane: *Pane, mode: ViewMode) void {
+    pane.view_mode = mode;
+    pane.has_pending_scroll = false;
+    switch (mode) {
+        .details => pane.stack.setCurrentIndex(0),
+        .icons => {
+            configureListView(pane, true);
+            pane.stack.setCurrentIndex(1);
+        },
+        .compact => {
+            configureListView(pane, false);
+            pane.stack.setCurrentIndex(1);
+        },
+    }
+
+    const current = pane.selection.currentIndex();
+    if (current.isValid()) {
+        if (mode == .details) {
+            pane.tree.scrollTo(current, qabstractitemview_enums.ScrollHint.EnsureVisible);
+        } else {
+            pane.list.scrollTo(current, qabstractitemview_enums.ScrollHint.EnsureVisible);
+        }
+    }
+}
+
+fn configureListView(pane: *Pane, large_icons: bool) void {
+    if (large_icons) {
+        pane.list.setUniformItemSizes(true);
+        const icon_size = QSize.new4(64, 64);
+        defer icon_size.delete();
+        pane.list.setIconSize(icon_size);
+        const grid = QSize.new4(132, 108);
+        defer grid.delete();
+        pane.list.setGridSize(grid);
+        pane.list.setViewMode(qlistview_enums.ViewMode.IconMode);
+        pane.list.setFlow(qlistview_enums.Flow.LeftToRight);
+        pane.list.setWrapping(true);
+        pane.list.setWordWrap(true);
+        pane.list.setSpacing(8);
+    } else {
+        pane.list.setUniformItemSizes(false);
+        const icon_size = QSize.new4(24, 24);
+        defer icon_size.delete();
+        pane.list.setIconSize(icon_size);
+        const grid = QSize.new4(0, 34);
+        defer grid.delete();
+        pane.list.setGridSize(grid);
+        pane.list.setViewMode(qlistview_enums.ViewMode.ListMode);
+        pane.list.setFlow(qlistview_enums.Flow.TopToBottom);
+        pane.list.setWrapping(false);
+        pane.list.setWordWrap(false);
+        pane.list.setSpacing(2);
+    }
+}
+
+fn updateViewModeActions() void {
+    const mode = if (activePane()) |pane| pane.view_mode else .details;
+    app.view_details_action.setChecked(mode == .details);
+    app.view_icons_action.setChecked(mode == .icons);
+    app.view_compact_action.setChecked(mode == .compact);
+}
+
+fn setViewMode(mode: ViewMode) void {
+    const pane = activePane() orelse return;
+    applyViewMode(pane, mode);
+    updateViewModeActions();
+    focusPane(pane);
+}
+
+fn onViewDetails(_: QAction) callconv(.c) void {
+    setViewMode(.details);
+}
+
+fn onViewIcons(_: QAction) callconv(.c) void {
+    setViewMode(.icons);
+}
+
+fn onViewCompact(_: QAction) callconv(.c) void {
+    setViewMode(.compact);
 }
 
 /// Feeds the bottom-left preview panel with the pane's current selection.
@@ -1027,6 +1241,9 @@ fn setRoot(pane: *Pane, path: []const u8) void {
     pane.tree.setDragEnabled(!trash_view);
     pane.tree.setAcceptDrops(!trash_view);
     pane.tree.setDropIndicatorShown(!trash_view);
+    pane.list.setDragEnabled(!trash_view);
+    pane.list.setAcceptDrops(!trash_view);
+    pane.list.setDropIndicatorShown(!trash_view);
     if (trash_view != pane.trash_view) {
         pane.trash_view = trash_view;
         if (trash_view) {
@@ -1042,7 +1259,7 @@ fn setRoot(pane: *Pane, path: []const u8) void {
         }
     }
 
-    pane.tree.clearSelection();
+    pane.selection.clear();
     pane.model.load(path);
 
     if (pane.current_path) |old| app.gpa.free(old);
@@ -1132,7 +1349,7 @@ fn restorePendingSelection(pane: *Pane) void {
 fn refreshRoot(pane: *Pane) void {
     if (pane.current_path == null) return;
     captureSelection(pane);
-    pane.pending_scroll = pane.tree.verticalScrollBar().value();
+    pane.pending_scroll = currentViewScroll(pane);
     pane.has_pending_scroll = true;
     pane.model.reload();
     if (isActivePane(pane)) refreshCount(pane);
@@ -1147,7 +1364,7 @@ fn onModelTimer(_: QTimer) callconv(.c) void {
                 // clears the selection model without emitting any signal.
                 restorePendingSelection(pane);
                 if (pane.has_pending_scroll) {
-                    pane.tree.verticalScrollBar().setValue(pane.pending_scroll);
+                    setCurrentViewScroll(pane, pane.pending_scroll);
                     pane.has_pending_scroll = false;
                 }
                 if (isActivePane(pane)) {
@@ -1617,13 +1834,32 @@ fn onRestoreSelected(_: QAction) callconv(.c) void {
     restoreSelected(pane);
 }
 
-fn onEmptyTrash(_: QAction) callconv(.c) void {
-    const pane = activePane() orelse return;
-    if (!pane.model.isTrash()) {
-        showStatus("Open Trash first", 3000);
+fn countTrashEntries() ?usize {
+    var entries = file_ops.listTrash(app.gpa, app.io) catch return null;
+    defer {
+        for (entries.items) |*entry| entry.deinit(app.gpa);
+        entries.deinit(app.gpa);
+    }
+    return entries.items.len;
+}
+
+fn emptyTrashWithConfirmation() void {
+    if (app.file_job != null) {
+        showStatus("Finish or cancel the current operation first", 3500);
         return;
     }
-    if (pane.model.count() == 0) {
+
+    var count: usize = 0;
+    if (activePane()) |pane| {
+        if (pane.model.isTrash()) count = pane.model.count();
+    }
+    if (count == 0) {
+        count = countTrashEntries() orelse {
+            showStatus("Could not read Trash", 3500);
+            return;
+        };
+    }
+    if (count == 0) {
         showStatus("Trash is already empty", 2500);
         return;
     }
@@ -1632,10 +1868,7 @@ fn onEmptyTrash(_: QAction) callconv(.c) void {
     const message = std.fmt.bufPrint(
         &buffer,
         "Permanently delete {d} item{s} from Trash? This cannot be undone.",
-        .{
-            pane.model.count(),
-            if (pane.model.count() == 1) "" else "s",
-        },
+        .{ count, if (count == 1) "" else "s" },
     ) catch "Permanently empty Trash? This cannot be undone.";
 
     const answer = QMessageBox.question2(
@@ -1652,6 +1885,20 @@ fn onEmptyTrash(_: QAction) callconv(.c) void {
         return;
     };
     _ = startFileJob(job, false);
+}
+
+fn onEmptyTrash(_: QAction) callconv(.c) void {
+    const pane = activePane() orelse return;
+    if (!pane.model.isTrash()) {
+        showStatus("Open Trash first", 3000);
+        return;
+    }
+    emptyTrashWithConfirmation();
+}
+
+fn onCtxEmptyPlaceTrash(_: QAction) callconv(.c) void {
+    app.context_place_row = -1;
+    emptyTrashWithConfirmation();
 }
 
 fn onFileMenuAboutToShow(_: QMenu) callconv(.c) void {
@@ -1864,7 +2111,7 @@ fn onNewFolder(_: QAction) callconv(.c) void {
     );
     defer app.gpa.free(raw);
     if (!ok) {
-        pane.tree.setFocus();
+        focusPane(pane);
         return;
     }
 
@@ -1909,7 +2156,7 @@ fn onRename(_: QAction) callconv(.c) void {
     );
     defer app.gpa.free(raw);
     if (!ok) {
-        pane.tree.setFocus();
+        focusPane(pane);
         return;
     }
 
@@ -2719,7 +2966,7 @@ fn onPathEntered(edit: QLineEdit) callconv(.c) void {
     const text = edit.text(app.gpa);
     defer app.gpa.free(text);
     navigateTo(pane, text, true);
-    pane.tree.setFocus();
+    focusPane(pane);
 }
 
 fn onFilterChanged(edit: QLineEdit, text: [*:0]const u8) callconv(.c) void {
@@ -2728,8 +2975,9 @@ fn onFilterChanged(edit: QLineEdit, text: [*:0]const u8) callconv(.c) void {
     applyFilter(pane, std.mem.span(text));
 }
 
-fn onPlaceSelected(_: QListWidget, row: i32) callconv(.c) void {
+fn onPlaceItemClicked(list: QListWidget, item: QListWidgetItem) callconv(.c) void {
     if (app.places_updating) return;
+    const row = list.row(item);
     if (row < 0) return;
     const index: usize = @intCast(row);
     if (index >= app.place_paths.items.len) return;
@@ -2739,7 +2987,7 @@ fn onPlaceSelected(_: QListWidget, row: i32) callconv(.c) void {
     app.drives.setCurrentRow(-1);
     app.drives_updating = false;
     navigateTo(pane, app.place_paths.items[index], true);
-    pane.tree.setFocus();
+    focusPane(pane);
 }
 
 // ---- Mounted drives and sidebar sizing -----------------------------------
@@ -2775,8 +3023,13 @@ fn refreshMountedPlaces() void {
     };
 
     if (sameMounts(app.mount_places.items, next.items)) {
+        for (app.mount_places.items, next.items) |*current, fresh| {
+            current.bytes_total = fresh.bytes_total;
+            current.bytes_free = fresh.bytes_free;
+        }
         for (next.items) |*volume| volume.deinit(app.gpa);
         next.deinit(app.gpa);
+        updateDriveWidgets();
         updateSidebarHeights();
         return;
     }
@@ -2793,6 +3046,9 @@ fn refreshMountedPlaces() void {
 
     app.drives_updating = true;
     defer app.drives_updating = false;
+    app.mount_generation +%= 1;
+    app.drive_bars.clearRetainingCapacity();
+    app.drive_labels.clearRetainingCapacity();
     app.drives.clear();
 
     for (app.mount_places.items) |*volume| volume.deinit(app.gpa);
@@ -2800,7 +3056,82 @@ fn refreshMountedPlaces() void {
     app.mount_places = next;
 
     for (app.mount_places.items, 0..) |volume, index| {
-        app.drives.addItem(volume.label);
+        app.drives.addItem("");
+        const item = app.drives.item(@intCast(index));
+        if (item.ptr == null) continue;
+
+        const item_size = QSize.new4(0, 48);
+        defer item_size.delete();
+        item.setSizeHint(item_size);
+
+        const item_widget = QWidget.new2();
+        item_widget.setAttribute2(
+            qnamespace_enums.WidgetAttribute.WA_TransparentForMouseEvents,
+            true,
+        );
+        const item_layout = QVBoxLayout.new(item_widget);
+        item_layout.setContentsMargins(4, 3, 4, 3);
+        item_layout.setSpacing(3);
+
+        const label = QLabel.new3(volume.label);
+        label.setStyleSheet("font-weight: 600;");
+        item_layout.addWidget(label);
+
+        const bar = QProgressBar.new2();
+        bar.setRange(0, 100);
+        bar.setTextVisible(false);
+        bar.setFixedHeight(8);
+        bar.setStyleSheet(
+            "QProgressBar { border: 0; border-radius: 3px; " ++
+                "background: rgba(128, 128, 128, 0.28); } " ++
+                "QProgressBar::chunk { border-radius: 3px; background-color: #3b82f6; }",
+        );
+        item_layout.addWidget(bar);
+
+        app.drives.setItemWidget(item, item_widget);
+        app.drive_labels.append(app.gpa, label) catch {};
+        app.drive_bars.append(app.gpa, bar) catch {};
+    }
+
+    const has_drives = app.mount_places.items.len > 0;
+    app.drives_label.setVisible(has_drives);
+    app.drives.setVisible(has_drives);
+
+    if (selected_path) |path| {
+        for (app.mount_places.items, 0..) |volume, index| {
+            if (std.mem.eql(u8, volume.path, path)) {
+                app.drives.setCurrentRow(@intCast(index));
+                break;
+            }
+        }
+    }
+    updateDriveWidgets();
+    updateSidebarHeights();
+}
+
+fn usedPercent(volume: mounts.Volume) i32 {
+    if (volume.bytes_total == 0) return 0;
+    const used = volume.bytes_total -
+        @min(volume.bytes_free, volume.bytes_total);
+    return @intCast(@min(used * 100 / volume.bytes_total, 100));
+}
+
+fn updateDriveWidgets() void {
+    for (app.mount_places.items, 0..) |volume, index| {
+        if (index < app.drive_bars.items.len) {
+            app.drive_bars.items[index].setValue(usedPercent(volume));
+        }
+        if (index < app.drive_labels.items.len) {
+            var amount_buffer: [32]u8 = undefined;
+            var label_buffer: [512]u8 = undefined;
+            const text = std.fmt.bufPrint(
+                &label_buffer,
+                "{s}  ·  {s} free",
+                .{ volume.label, formatBytes(&amount_buffer, volume.bytes_free) },
+            ) catch volume.label;
+            app.drive_labels.items[index].setText(text);
+        }
+
         var free_buffer: [32]u8 = undefined;
         var total_buffer: [32]u8 = undefined;
         var tooltip_buffer: [1024]u8 = undefined;
@@ -2819,20 +3150,6 @@ fn refreshMountedPlaces() void {
         const item = app.drives.item(@intCast(index));
         if (item.ptr != null) item.setToolTip(tooltip);
     }
-
-    const has_drives = app.mount_places.items.len > 0;
-    app.drives_label.setVisible(has_drives);
-    app.drives.setVisible(has_drives);
-
-    if (selected_path) |path| {
-        for (app.mount_places.items, 0..) |volume, index| {
-            if (std.mem.eql(u8, volume.path, path)) {
-                app.drives.setCurrentRow(@intCast(index));
-                break;
-            }
-        }
-    }
-    updateSidebarHeights();
 }
 
 fn sameMounts(a: []const mounts.Volume, b: []const mounts.Volume) bool {
@@ -2851,8 +3168,9 @@ fn onMountTimer(_: QTimer) callconv(.c) void {
     refreshWatchPaths();
 }
 
-fn onDriveSelected(_: QListWidget, row: i32) callconv(.c) void {
+fn onDriveItemClicked(list: QListWidget, item: QListWidgetItem) callconv(.c) void {
     if (app.drives_updating) return;
+    const row = list.row(item);
     if (row < 0) return;
     const index: usize = @intCast(row);
     if (index >= app.mount_places.items.len) return;
@@ -2862,16 +3180,211 @@ fn onDriveSelected(_: QListWidget, row: i32) callconv(.c) void {
     app.places.setCurrentRow(-1);
     app.places_updating = false;
     navigateTo(pane, app.mount_places.items[index].path, true);
-    pane.tree.setFocus();
+    focusPane(pane);
+}
+
+fn onDrivesContextMenu(list: QListWidget, pos: QPoint) callconv(.c) void {
+    const item = list.itemAt(pos);
+    if (item.ptr == null) return;
+    const row = list.row(item);
+    if (row < 0) return;
+    const index: usize = @intCast(row);
+    if (index >= app.mount_places.items.len) return;
+
+    app.context_drive_row = row;
+    app.context_drive_generation = app.mount_generation;
+    list.setCurrentRow(row);
+    var label_buffer: [512]u8 = undefined;
+    const label = std.fmt.bufPrint(
+        &label_buffer,
+        "&Unmount “{s}”",
+        .{app.mount_places.items[index].label},
+    ) catch "&Unmount";
+    app.ctx_unmount_action.setText(label);
+    app.ctx_unmount_action.setEnabled(!app.unmount_active);
+
+    const global = list.mapToGlobal2(pos);
+    defer global.delete();
+    app.drive_menu.popup(global);
+}
+
+fn onCtxUnmountDrive(_: QAction) callconv(.c) void {
+    const row = app.context_drive_row;
+    app.context_drive_row = -1;
+    if (row < 0) return;
+    if (app.context_drive_generation != app.mount_generation) {
+        showStatus("The drive list changed — try again", 3000);
+        return;
+    }
+    const index: usize = @intCast(row);
+    if (index >= app.mount_places.items.len) return;
+
+    // Mount polling can run while the confirmation dialog is open. Copy the
+    // description first so the dialog cannot leave us with stale slices.
+    const volume = app.mount_places.items[index];
+    const path = app.gpa.dupe(u8, volume.path) catch return;
+    defer app.gpa.free(path);
+    const device = app.gpa.dupe(u8, volume.device) catch return;
+    defer app.gpa.free(device);
+    const label = app.gpa.dupe(u8, volume.label) catch return;
+    defer app.gpa.free(label);
+
+    var message_buffer: [512]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &message_buffer,
+        "Unmount “{s}” from {s}? Open files may prevent this.",
+        .{ label, path },
+    ) catch "Unmount this drive?";
+    const answer = QMessageBox.question2(
+        app.window,
+        "Unmount Drive",
+        message,
+        qmessagebox_enums.StandardButton.Yes,
+        qmessagebox_enums.StandardButton.No,
+    );
+    if (answer != qmessagebox_enums.StandardButton.Yes) return;
+
+    startUnmount(label, path, device);
+}
+
+fn startUnmount(label: []const u8, path: []const u8, device: []const u8) void {
+    if (app.unmount_active) {
+        showStatus("An unmount is already in progress", 3000);
+        return;
+    }
+
+    clearUnmountState();
+    app.unmount_path = app.gpa.dupe(u8, path) catch null;
+    if (app.unmount_path == null) {
+        showStatus("Could not prepare the unmount operation", 3500);
+        return;
+    }
+    app.unmount_device = app.gpa.dupe(u8, device) catch null;
+    app.unmount_label_len = @min(label.len, app.unmount_label.len);
+    @memcpy(app.unmount_label[0..app.unmount_label_len], label[0..app.unmount_label_len]);
+    app.unmount_active = true;
+    app.unmount_tried_pkexec = false;
+
+    if (std.mem.startsWith(u8, device, "/dev/")) {
+        showStatus("Unmounting drive…", 0);
+        app.unmount_process.start3(
+            app.gpa,
+            "udisksctl",
+            &.{ "unmount", "-b", device },
+            qiodevicebase_enums.OpenModeFlag.ReadOnly,
+        );
+    } else {
+        startPkexecUnmount();
+    }
+}
+
+fn startPkexecUnmount() void {
+    const path = app.unmount_path orelse {
+        clearUnmountState();
+        return;
+    };
+    app.unmount_tried_pkexec = true;
+    showStatus("Unmounting drive — authorization may be required…", 0);
+    app.unmount_process.start3(
+        app.gpa,
+        "pkexec",
+        &.{ "umount", "--", path },
+        qiodevicebase_enums.OpenModeFlag.ReadOnly,
+    );
+}
+
+fn clearUnmountState() void {
+    if (app.unmount_path) |path| app.gpa.free(path);
+    app.unmount_path = null;
+    if (app.unmount_device) |device| app.gpa.free(device);
+    app.unmount_device = null;
+    app.unmount_active = false;
+    app.unmount_tried_pkexec = false;
+}
+
+fn onUnmountFinished(_: QProcess, exit_code: i32) callconv(.c) void {
+    if (!app.unmount_active) return;
+
+    if (exit_code != 0 and !app.unmount_tried_pkexec) {
+        if (app.unmount_path != null) {
+            startPkexecUnmount();
+            return;
+        }
+    }
+
+    const label = app.unmount_label[0..app.unmount_label_len];
+    if (exit_code == 0) {
+        clearUnmountState();
+        refreshMountedPlaces();
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, "Unmounted “{s}”", .{label}) catch "Drive unmounted";
+        showStatus(message, 4500);
+        return;
+    }
+
+    const stderr = app.unmount_process.readAllStandardError(app.gpa);
+    defer app.gpa.free(stderr);
+    clearUnmountState();
+    refreshMountedPlaces();
+
+    const detail = std.mem.trim(u8, stderr, " \t\r\n");
+    showStatus("Unmount failed", 4000);
+    var buffer: [2048]u8 = undefined;
+    const message = if (detail.len > 0)
+        std.fmt.bufPrint(
+            &buffer,
+            "Could not unmount “{s}”.\n\n{s}",
+            .{ label, detail },
+        ) catch "Could not unmount the drive."
+    else
+        std.fmt.bufPrint(
+            &buffer,
+            "Could not unmount “{s}”. Check that no files are open on it.",
+            .{label},
+        ) catch "Could not unmount the drive.";
+    _ = QMessageBox.warning(app.window, "Unmount Failed", message);
+}
+
+fn onUnmountError(_: QProcess, error_code: i32) callconv(.c) void {
+    if (!app.unmount_active) return;
+    if (error_code != qprocess_enums.ProcessError.FailedToStart) return;
+
+    if (!app.unmount_tried_pkexec and app.unmount_path != null) {
+        startPkexecUnmount();
+        return;
+    }
+
+    const label = app.unmount_label[0..app.unmount_label_len];
+    clearUnmountState();
+    refreshMountedPlaces();
+    showStatus("Unmount failed", 4000);
+    var buffer: [1024]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "Could not start the unmount helper for “{s}”.",
+        .{label},
+    ) catch "Could not start the unmount helper.";
+    _ = QMessageBox.warning(app.window, "Unmount Failed", message);
 }
 
 // ---- Context menus -------------------------------------------------------
 
 fn onTreeContextMenu(tree: QTreeView, pos: QPoint) callconv(.c) void {
     const pane = activateFromWidget(tree) orelse return;
-    app.context_pane = pane;
+    const global = tree.mapToGlobal2(pos);
+    defer global.delete();
+    openViewContextMenu(pane, tree.indexAt(pos), global);
+}
 
-    const index = tree.indexAt(pos);
+fn onListContextMenu(list: QListView, pos: QPoint) callconv(.c) void {
+    const pane = activateFromWidget(list) orelse return;
+    const global = list.mapToGlobal2(pos);
+    defer global.delete();
+    openViewContextMenu(pane, list.indexAt(pos), global);
+}
+
+fn openViewContextMenu(pane: *Pane, index: QModelIndex, global: QPoint) void {
+    app.context_pane = pane;
 
     // File actions operate on the clicked row, like every mainstream file
     // manager: right-clicking an unselected row selects it, while clicking a
@@ -2886,9 +3399,6 @@ fn onTreeContextMenu(tree: QTreeView, pos: QPoint) callconv(.c) void {
     setContextTerminalDir(pane, index);
 
     updateContextMenuState(pane, index);
-
-    const global = tree.mapToGlobal2(pos);
-    defer global.delete();
     app.tree_menu.popup(global);
 }
 
@@ -3083,9 +3593,17 @@ fn onPlacesContextMenu(list: QListWidget, pos: QPoint) callconv(.c) void {
     if (item.ptr == null) return;
     const row = list.row(item);
     if (row < 0) return;
-    // Built-in places are fixed; only user-added entries can be removed.
-    if (@as(usize, @intCast(row)) < app.place_builtin_count) return;
+    const index: usize = @intCast(row);
+    if (index >= app.place_paths.items.len) return;
+
+    const path = app.place_paths.items[index];
+    const trash_place = file_ops.isTrashLocation(path);
+    const custom_place = index >= app.place_builtin_count;
+    if (!trash_place and !custom_place) return;
+
     app.context_place_row = row;
+    app.ctx_empty_place_trash_action.setVisible(trash_place);
+    app.ctx_remove_place_action.setVisible(custom_place);
 
     const global = list.mapToGlobal2(pos);
     defer global.delete();
@@ -3268,19 +3786,35 @@ fn onTreeClicked(tree: QTreeView, _: QModelIndex) callconv(.c) void {
     _ = activateFromWidget(tree);
 }
 
+fn onListClicked(list: QListView, _: QModelIndex) callconv(.c) void {
+    _ = activateFromWidget(list);
+}
+
+fn setDragCopyHintFromEvent(pane: *Pane, event: QMouseEvent) void {
+    const ctrl = qnamespace_enums.KeyboardModifier.ControlModifier;
+    pane.model.setDragCopyHint((event.modifiers() & ctrl) != 0);
+}
+
 /// Modifier state is not reliably available inside Qt's drag loop on every
 /// platform, so remember whether Ctrl was held when the gesture started and
 /// let the model put that intent in the MIME payload.
 fn onTreeMousePress(tree: QTreeView, event: QMouseEvent) callconv(.c) void {
-    if (findPaneContaining(tree)) |pane| {
-        const ctrl = qnamespace_enums.KeyboardModifier.ControlModifier;
-        pane.model.setDragCopyHint((event.modifiers() & ctrl) != 0);
-    }
+    if (findPaneContaining(tree)) |pane| setDragCopyHintFromEvent(pane, event);
     tree.superMousePressEvent(event);
 }
 
-fn onItemActivated(tree: QTreeView, index: QModelIndex) callconv(.c) void {
+fn onListMousePress(list: QListView, event: QMouseEvent) callconv(.c) void {
+    if (findPaneContaining(list)) |pane| setDragCopyHintFromEvent(pane, event);
+    list.superMousePressEvent(event);
+}
+
+fn onTreeActivated(tree: QTreeView, index: QModelIndex) callconv(.c) void {
     const pane = activateFromWidget(tree) orelse return;
+    openSelected(pane, index);
+}
+
+fn onListActivated(list: QListView, index: QModelIndex) callconv(.c) void {
+    const pane = activateFromWidget(list) orelse return;
     openSelected(pane, index);
 }
 
@@ -3419,8 +3953,12 @@ fn onQuit(_: QAction) callconv(.c) void {
 
 fn onSelectAll(_: QAction) callconv(.c) void {
     if (activePane()) |pane| {
-        pane.tree.selectAll();
-        pane.tree.setFocus();
+        if (pane.view_mode == .details) {
+            pane.tree.selectAll();
+        } else {
+            pane.list.selectAll();
+        }
+        focusPane(pane);
     }
 }
 
@@ -3483,7 +4021,7 @@ fn onTerminalVisibilityChanged(_: QDockWidget, visible: bool) callconv(.c) void 
 fn onTogglePlayer(_: QAction) callconv(.c) void {
     if (app.player_dock.isVisible()) {
         app.player_dock.hide();
-        if (activePane()) |pane| pane.tree.setFocus();
+        if (activePane()) |pane| focusPane(pane);
         return;
     }
     showPlayer();
@@ -3496,7 +4034,7 @@ fn onPlayerVisibilityChanged(_: QDockWidget, visible: bool) callconv(.c) void {
 fn toggleTerminal() void {
     if (app.terminal_dock.isVisible()) {
         app.terminal_dock.hide();
-        if (activePane()) |pane| pane.tree.setFocus();
+        if (activePane()) |pane| focusPane(pane);
         return;
     }
     openTerminalAt(terminalWorkingDirectory());
@@ -3563,7 +4101,8 @@ fn onAbout(_: QAction) callconv(.c) void {
             "Built with Zig and Qt 6. This build adds a custom asynchronous " ++
             "item model, tabs, split view, recursive filename search, " ++
             "undoable file operations, a browsable freedesktop.org Trash, " ++
-            "live folder refresh, and mounted-drive shortcuts.\n\n" ++
+            "live folder refresh, mounted-drive shortcuts, and multiple " ++
+            "view modes.\n\n" ++
             "The roadmap adds metadata, remote locations, and an extension API.",
     );
 }
