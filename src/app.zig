@@ -134,6 +134,7 @@ const App = struct {
     tree_menu: QMenu,
     places_menu: QMenu,
     drive_menu: QMenu,
+    ctx_mount_action: QAction,
     ctx_unmount_action: QAction,
     ctx_empty_place_trash_action: QAction,
     context_drive_row: i32 = -1,
@@ -190,6 +191,12 @@ const App = struct {
     unmount_label_len: usize = 0,
     unmount_tried_pkexec: bool = false,
     unmount_active: bool = false,
+
+    mount_process: QProcess,
+    mount_device: ?[]u8 = null,
+    mount_label: [256]u8 = undefined,
+    mount_label_len: usize = 0,
+    mount_active: bool = false,
 
     model_timer: QTimer,
 
@@ -398,6 +405,10 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     unmount_process.onFinished(onUnmountFinished);
     unmount_process.onErrorOccurred(onUnmountError);
 
+    const mount_process = QProcess.new2(window);
+    mount_process.onFinished(onMountFinished);
+    mount_process.onErrorOccurred(onMountError);
+
     const status = window.statusBar();
     const count_label = QLabel.new3("");
     status.addPermanentWidget(count_label);
@@ -565,6 +576,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const ctx_remove_place_action = places_menu.addAction2("Remove from Places");
     ctx_remove_place_action.onTriggered(onCtxRemovePlace);
     const drive_menu = QMenu.new(window);
+    const ctx_mount_action = drive_menu.addAction2("&Mount");
+    ctx_mount_action.onTriggered(onCtxMountDrive);
     const ctx_unmount_action = drive_menu.addAction2("&Unmount");
     ctx_unmount_action.onTriggered(onCtxUnmountDrive);
 
@@ -594,6 +607,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .tree_menu = tree_menu,
         .places_menu = places_menu,
         .drive_menu = drive_menu,
+        .ctx_mount_action = ctx_mount_action,
         .ctx_unmount_action = ctx_unmount_action,
         .ctx_empty_place_trash_action = ctx_empty_place_trash_action,
         .view_details_action = details_view_action,
@@ -627,6 +641,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .file_timer = file_timer,
         .model_timer = model_timer,
         .unmount_process = unmount_process,
+        .mount_process = mount_process,
         .back_action = back_action,
         .forward_action = forward_action,
         .split_action = split_action,
@@ -706,6 +721,12 @@ fn shutdown() void {
         _ = app.unmount_process.waitForFinished();
     }
     clearUnmountState();
+    app.mount_active = false;
+    if (app.mount_process.state() != qprocess_enums.ProcessState.NotRunning) {
+        _ = app.mount_process.kill();
+        _ = app.mount_process.waitForFinished();
+    }
+    clearMountState();
     for (app.fs_watch_paths.items) |path| app.gpa.free(path);
     app.fs_watch_paths.deinit(app.gpa);
     app.drive_bars.deinit(app.gpa);
@@ -3110,7 +3131,7 @@ fn refreshMountedPlaces() void {
 }
 
 fn usedPercent(volume: mounts.Volume) i32 {
-    if (volume.bytes_total == 0) return 0;
+    if (!volume.mounted or volume.bytes_total == 0) return 0;
     const used = volume.bytes_total -
         @min(volume.bytes_free, volume.bytes_total);
     return @intCast(@min(used * 100 / volume.bytes_total, 100));
@@ -3124,29 +3145,66 @@ fn updateDriveWidgets() void {
         if (index < app.drive_labels.items.len) {
             var amount_buffer: [32]u8 = undefined;
             var label_buffer: [512]u8 = undefined;
-            const text = std.fmt.bufPrint(
-                &label_buffer,
-                "{s}  ·  {s} free",
-                .{ volume.label, formatBytes(&amount_buffer, volume.bytes_free) },
-            ) catch volume.label;
+            const text = if (!volume.mounted)
+                std.fmt.bufPrint(
+                    &label_buffer,
+                    "{s}  ·  not mounted",
+                    .{volume.label},
+                ) catch volume.label
+            else if (volume.read_only)
+                std.fmt.bufPrint(
+                    &label_buffer,
+                    "{s}  ·  read-only",
+                    .{volume.label},
+                ) catch volume.label
+            else
+                std.fmt.bufPrint(
+                    &label_buffer,
+                    "{s}  ·  {s} free",
+                    .{ volume.label, formatBytes(&amount_buffer, volume.bytes_free) },
+                ) catch volume.label;
             app.drive_labels.items[index].setText(text);
         }
 
         var free_buffer: [32]u8 = undefined;
         var total_buffer: [32]u8 = undefined;
         var tooltip_buffer: [1024]u8 = undefined;
-        const tooltip = std.fmt.bufPrint(
-            &tooltip_buffer,
-            "{s}\nMount point: {s}\nDevice: {s}\nFilesystem: {s}\nFree: {s} of {s}",
-            .{
-                volume.label,
-                volume.path,
-                volume.device,
-                volume.fs_type,
-                formatBytes(&free_buffer, volume.bytes_free),
-                formatBytes(&total_buffer, volume.bytes_total),
-            },
-        ) catch volume.path;
+        const tooltip = if (volume.mounted and volume.read_only)
+            std.fmt.bufPrint(
+                &tooltip_buffer,
+                "{s}\nMount point: {s}\nDevice: {s}\nFilesystem: {s}\nRead-only; size: {s}",
+                .{
+                    volume.label,
+                    volume.path,
+                    volume.device,
+                    volume.fs_type,
+                    formatBytes(&total_buffer, volume.bytes_total),
+                },
+            ) catch volume.label
+        else if (volume.mounted)
+            std.fmt.bufPrint(
+                &tooltip_buffer,
+                "{s}\nMount point: {s}\nDevice: {s}\nFilesystem: {s}\nFree: {s} of {s}",
+                .{
+                    volume.label,
+                    volume.path,
+                    volume.device,
+                    volume.fs_type,
+                    formatBytes(&free_buffer, volume.bytes_free),
+                    formatBytes(&total_buffer, volume.bytes_total),
+                },
+            ) catch volume.label
+        else
+            std.fmt.bufPrint(
+                &tooltip_buffer,
+                "{s}\nNot mounted\nDevice: {s}\nFilesystem: {s}\nSize: {s}\nClick to mount",
+                .{
+                    volume.label,
+                    volume.device,
+                    volume.fs_type,
+                    formatBytes(&total_buffer, volume.bytes_total),
+                },
+            ) catch volume.label;
         const item = app.drives.item(@intCast(index));
         if (item.ptr != null) item.setToolTip(tooltip);
     }
@@ -3159,6 +3217,8 @@ fn sameMounts(a: []const mounts.Volume, b: []const mounts.Volume) bool {
         if (!std.mem.eql(u8, left.label, right.label)) return false;
         if (!std.mem.eql(u8, left.device, right.device)) return false;
         if (!std.mem.eql(u8, left.fs_type, right.fs_type)) return false;
+        if (left.mounted != right.mounted) return false;
+        if (left.read_only != right.read_only) return false;
     }
     return true;
 }
@@ -3175,11 +3235,17 @@ fn onDriveItemClicked(list: QListWidget, item: QListWidgetItem) callconv(.c) voi
     const index: usize = @intCast(row);
     if (index >= app.mount_places.items.len) return;
 
+    const volume = app.mount_places.items[index];
+    if (!volume.mounted) {
+        startMount(volume.label, volume.device);
+        return;
+    }
+
     const pane = activePane() orelse return;
     app.places_updating = true;
     app.places.setCurrentRow(-1);
     app.places_updating = false;
-    navigateTo(pane, app.mount_places.items[index].path, true);
+    navigateTo(pane, volume.path, true);
     focusPane(pane);
 }
 
@@ -3194,24 +3260,171 @@ fn onDrivesContextMenu(list: QListWidget, pos: QPoint) callconv(.c) void {
     app.context_drive_row = row;
     app.context_drive_generation = app.mount_generation;
     list.setCurrentRow(row);
+
+    const volume = app.mount_places.items[index];
     var label_buffer: [512]u8 = undefined;
-    const label = std.fmt.bufPrint(
-        &label_buffer,
-        "&Unmount “{s}”",
-        .{app.mount_places.items[index].label},
-    ) catch "&Unmount";
-    app.ctx_unmount_action.setText(label);
-    app.ctx_unmount_action.setEnabled(!app.unmount_active);
+    if (volume.mounted) {
+        const label = std.fmt.bufPrint(
+            &label_buffer,
+            "&Unmount “{s}”",
+            .{volume.label},
+        ) catch "&Unmount";
+        app.ctx_unmount_action.setText(label);
+        app.ctx_unmount_action.setVisible(true);
+        app.ctx_unmount_action.setEnabled(!app.unmount_active and !app.mount_active);
+        app.ctx_mount_action.setVisible(false);
+    } else {
+        const label = std.fmt.bufPrint(
+            &label_buffer,
+            "&Mount “{s}”",
+            .{volume.label},
+        ) catch "&Mount";
+        app.ctx_mount_action.setText(label);
+        app.ctx_mount_action.setVisible(true);
+        app.ctx_mount_action.setEnabled(!app.mount_active and !app.unmount_active);
+        app.ctx_unmount_action.setVisible(false);
+    }
 
     const global = list.mapToGlobal2(pos);
     defer global.delete();
     app.drive_menu.popup(global);
 }
 
+fn onCtxMountDrive(_: QAction) callconv(.c) void {
+    const row = app.context_drive_row;
+    app.context_drive_row = -1;
+    if (row < 0) return;
+    if (app.context_drive_generation != app.mount_generation) {
+        showStatus("The drive list changed — try again", 3000);
+        return;
+    }
+    const index: usize = @intCast(row);
+    if (index >= app.mount_places.items.len) return;
+
+    const volume = app.mount_places.items[index];
+    if (volume.mounted) return;
+    const label = app.gpa.dupe(u8, volume.label) catch return;
+    defer app.gpa.free(label);
+    const device = app.gpa.dupe(u8, volume.device) catch return;
+    defer app.gpa.free(device);
+    startMount(label, device);
+}
+
+fn startMount(label: []const u8, device: []const u8) void {
+    if (app.mount_active or app.unmount_active) {
+        showStatus("A drive operation is already in progress", 3000);
+        return;
+    }
+
+    clearMountState();
+    app.mount_device = app.gpa.dupe(u8, device) catch null;
+    if (app.mount_device == null) {
+        showStatus("Could not prepare the mount operation", 3500);
+        return;
+    }
+    app.mount_label_len = @min(label.len, app.mount_label.len);
+    @memcpy(app.mount_label[0..app.mount_label_len], label[0..app.mount_label_len]);
+    app.mount_active = true;
+    showStatus("Mounting drive…", 0);
+    app.mount_process.start3(
+        app.gpa,
+        "udisksctl",
+        &.{ "mount", "-b", device },
+        qiodevicebase_enums.OpenModeFlag.ReadOnly,
+    );
+}
+
+fn clearMountState() void {
+    if (app.mount_device) |device| app.gpa.free(device);
+    app.mount_device = null;
+    app.mount_active = false;
+}
+
+fn onMountFinished(_: QProcess, exit_code: i32) callconv(.c) void {
+    if (!app.mount_active) return;
+
+    const label = app.mount_label[0..app.mount_label_len];
+    const stdout = app.mount_process.readAllStandardOutput(app.gpa);
+    defer app.gpa.free(stdout);
+    const stderr = app.mount_process.readAllStandardError(app.gpa);
+    defer app.gpa.free(stderr);
+
+    if (exit_code == 0) {
+        const mount_path = parseUdisksMountPath(stdout);
+        clearMountState();
+        refreshMountedPlaces();
+        if (mount_path) |path| {
+            if (activePane()) |pane| {
+                navigateTo(pane, path, true);
+                focusPane(pane);
+            }
+        }
+        var buffer: [512]u8 = undefined;
+        const message = std.fmt.bufPrint(&buffer, "Mounted “{s}”", .{label}) catch "Drive mounted";
+        showStatus(message, 4500);
+        return;
+    }
+
+    clearMountState();
+    refreshMountedPlaces();
+    showStatus("Mount failed", 4000);
+    const detail = std.mem.trim(u8, stderr, " \t\r\n");
+    var buffer: [2048]u8 = undefined;
+    const message = if (detail.len > 0)
+        std.fmt.bufPrint(
+            &buffer,
+            "Could not mount “{s}”.\n\n{s}",
+            .{ label, detail },
+        ) catch "Could not mount the drive."
+    else
+        std.fmt.bufPrint(
+            &buffer,
+            "Could not mount “{s}”. The drive may need a filesystem or authorization.",
+            .{label},
+        ) catch "Could not mount the drive.";
+    _ = QMessageBox.warning(app.window, "Mount Failed", message);
+}
+
+fn onMountError(_: QProcess, error_code: i32) callconv(.c) void {
+    if (!app.mount_active) return;
+    if (error_code != qprocess_enums.ProcessError.FailedToStart) return;
+
+    const label = app.mount_label[0..app.mount_label_len];
+    clearMountState();
+    refreshMountedPlaces();
+    showStatus("Mount failed", 4000);
+    var buffer: [1024]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "Could not start the mount helper for “{s}”.",
+        .{label},
+    ) catch "Could not start the mount helper.";
+    _ = QMessageBox.warning(app.window, "Mount Failed", message);
+}
+
+fn parseUdisksMountPath(output: []const u8) ?[]const u8 {
+    const marker = " at ";
+    const start = std.mem.indexOf(u8, output, marker) orelse return null;
+    var path = output[start + marker.len ..];
+    path = std.mem.trim(u8, path, " \t\r\n");
+    while (path.len > 1 and (path[path.len - 1] == '.' or path[path.len - 1] == '\n' or
+        path[path.len - 1] == '\r'))
+    {
+        path = path[0 .. path.len - 1];
+    }
+    path = std.mem.trim(u8, path, " \t\r\n");
+    if (path.len == 0) return null;
+    return path;
+}
+
 fn onCtxUnmountDrive(_: QAction) callconv(.c) void {
     const row = app.context_drive_row;
     app.context_drive_row = -1;
     if (row < 0) return;
+    if (app.mount_active) {
+        showStatus("A drive operation is already in progress", 3000);
+        return;
+    }
     if (app.context_drive_generation != app.mount_generation) {
         showStatus("The drive list changed — try again", 3000);
         return;
@@ -3248,8 +3461,8 @@ fn onCtxUnmountDrive(_: QAction) callconv(.c) void {
 }
 
 fn startUnmount(label: []const u8, path: []const u8, device: []const u8) void {
-    if (app.unmount_active) {
-        showStatus("An unmount is already in progress", 3000);
+    if (app.unmount_active or app.mount_active) {
+        showStatus("A drive operation is already in progress", 3000);
         return;
     }
 

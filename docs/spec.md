@@ -408,7 +408,7 @@ src/
     player.zig             music player UI, repeat/shuffle, playlist, Discord
     music_engine.cpp       GStreamer C ABI engine (PipeWire/ALSA, DSP)
     music_engine.zig       Zig bridge for the GStreamer engine
-    mounts.zig             mounted-volume discovery for the Drives list
+    mounts.zig             QStorageInfo/lsblk discovery for the Drives list
     qt_bridge.cpp           QVariant-from-QIcon bridge for view icons
     status_bar.zig
   platform/
@@ -851,7 +851,7 @@ These need a product decision before the relevant phase:
 Implemented in the v0.5 prototype:
 
 - Zig 0.17 + Qt 6.12 window using `libqt6zig`, split into `main.zig`, `app.zig`, `ui/`, and `core/`.
-- Places sidebar (Home, XDG folders, Trash, Filesystem) plus a **Drives** section populated from `QStorageInfo`. Each drive row shows free space and a used-capacity progress bar; right-clicking a drive offers **Unmount** and falls back from `udisksctl` to `pkexec`.
+- Places sidebar (Home, XDG folders, Trash, Filesystem) plus a **Drives** section populated from `QStorageInfo` and `lsblk`. Mounted rows show free space and a used-capacity progress bar; unmounted USB/removable partitions show **not mounted** and mount on click. Right-clicking a drive offers **Mount** or **Unmount**, with unmount falling back from `udisksctl` to `pkexec`.
 - Compact Places and Drives lists that size to their content and scroll after a window-relative height cap.
 - Automatic directory refresh through `QFileSystemWatcher` for every open pane and for `Trash/files`/`Trash/info`; events are coalesced and selection plus scroll position are restored after the snapshot reset.
 - Back/forward/up/home/reload navigation with independent per-pane history.
@@ -882,7 +882,7 @@ Known prototype limitations (addressed in later phases):
 
 - The model is a flat single-folder snapshot: no tree expansion, thumbnails, or per-folder view state yet. View mode is per-pane and resets to Details for new panes.
 - Directory watchers cover entry creates, deletes, renames, and moves. In-place edits that only change an existing file's contents may still need a manual reload (`F5`).
-- Mounted drives are polled every 2 seconds through `QStorageInfo`. Unmount uses the `udisksctl`/`pkexec` helpers; mounting, formatting, and full UDisks2 integration are not implemented yet.
+- Drives are polled every 2 seconds through `QStorageInfo`, with unmounted USB/removable partitions discovered through `lsblk`. Mounting uses `udisksctl mount`; unmounting uses `udisksctl`/`pkexec`. Formatting, filesystem repair, and full UDisks2 device management are not implemented yet.
 - Trash browsing uses the home Trash directory only; per-mount `.Trash-$uid` locations are not implemented yet.
 - Restore, permanent delete, and empty Trash are not undoable. Undo only reverses the original move-to-Trash batch.
 - Executables run detached without a terminal, allow-list, or remembered confirmation, so command-line tools with no GUI produce no visible output.

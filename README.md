@@ -34,7 +34,7 @@ This repository contains a working **v0.5 prototype**:
 - Places and Drives sidebar, Details/Icons/Compact views, item count, and window title
 - **Custom item model** — `src/ui/local_model.zig` lists folders and Trash on a worker thread, polls snapshots from the UI, and renders folder or trash-specific columns
 - **Live folder refresh** — watches every open pane and the Trash directory, coalesces filesystem events, reloads the affected snapshots, and restores the selection
-- **Mounted drives** — a **Drives** section under Places lists real mounted volumes with labels, an inline free-space label, and a used-capacity progress bar. Tooltips include the mount path, device, filesystem, and free/total space. Right-click a drive to **Unmount** it (UDisks2 first, then `pkexec`), and the list updates automatically when drives appear or disappear
+- **Drives** — the sidebar lists mounted volumes plus unmounted USB/removable partitions. Mounted rows show a free-space label and a used-capacity progress bar; unmounted rows show **not mounted** and mount when clicked. Tooltips include the mount path, device, filesystem, and free/total space. Right-click for **Mount** or **Unmount** (UDisks2 first, then `pkexec`), and the list updates automatically when devices appear, mount, unmount, or disappear
 - **Compact sidebar** — the Places and Drives lists size themselves to their contents and scroll once they reach a height cap, instead of leaving a large empty box
 - Back / forward / up / home / reload navigation with per-pane history
 - Editable path bar with `~`, relative-path, and `file://` resolution
@@ -168,8 +168,9 @@ The schema uses SQLite FTS5 external-content tables (`files`, `files_fts`, and a
 - `QFileSystemWatcher` watches every open pane's current folder plus `Trash/files` and `Trash/info`. Events are coalesced for 180 ms, then the relevant snapshots reload.
 - Creates, deletes, renames, moves between folders, and Trash changes update counts and rows without a manual reload. Selected paths and the scroll position are captured before the snapshot reset and restored afterward when they still exist.
 - Directory watches report directory-entry changes. An in-place save that only changes an existing file's contents may still need `F5`.
-- Mounted volumes are refreshed every 2 seconds with `QStorageInfo`. The **Drives** list excludes pseudo-filesystems and snap loop devices, sorts by label, and shows a free-space label plus a used-capacity progress bar for each volume. Each row's tooltip includes the mount path, device, filesystem, and free/total space.
-- Right-click a drive and choose **Unmount**. Ligma tries `udisksctl unmount` first so user-mounted media can unmount without a password, then falls back to `pkexec umount` for authorization. Failures such as a busy device are reported without removing the drive from the list.
+- Mounted volumes are refreshed every 2 seconds with `QStorageInfo`. The **Drives** list excludes pseudo-filesystems and snap loop devices, sorts by label, and shows a free-space label plus a used-capacity progress bar for each mounted volume. Read-only media is labelled **read-only** instead of showing a misleading zero free space.
+- Unmounted USB and removable partitions are discovered with `lsblk` and shown as **not mounted**. Clicking one runs `udisksctl mount -b <device>`, then opens the resulting mount point. The context menu also offers **Mount**.
+- Right-click a mounted drive and choose **Unmount**. Ligma tries `udisksctl unmount` first so user-mounted media can unmount without a password, then falls back to `pkexec umount` for authorization. Failures such as a busy device are reported without removing the drive from the list.
 - The Places and Drives lists collapse to their content height. When they exceed a fraction of the window height they get scrollbars, leaving the remaining sidebar space outside the boxes.
 
 ## Drag and drop
@@ -192,6 +193,7 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 - GStreamer **1.x** development files and the base/good/bad/ugly plugin sets, plus a PipeWire or ALSA sink
 - QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`; Debian: `libqtermwidget-dev`; newer Ubuntu: `libqtermwidget6-2-dev`)
 - SQLite 3 development files with FTS5 and the trigram tokenizer (tested with 3.54.1)
+- `util-linux` (`lsblk`, `umount`) and **UDisks2** (`udisksctl`) for USB/removable-drive detection and mounting
 - A C/C++ toolchain (`g++`) and `pkg-config`
 
 On Debian/Ubuntu-style systems:
@@ -202,7 +204,7 @@ sudo apt install build-essential pkg-config qt6-base-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-  gstreamer1.0-pipewire gstreamer1.0-alsa
+  gstreamer1.0-pipewire gstreamer1.0-alsa udisks2 util-linux
 # Debian names the Qt 6 widget development package libqtermwidget-dev.
 # Newer Ubuntu releases use libqtermwidget6-2-dev instead.
 # libutf8proc-dev is required by qtermwidget6.pc but is not pulled in by
@@ -214,7 +216,7 @@ On Arch Linux:
 ```bash
 sudo pacman -S qt6-base sqlite qtermwidget utf8proc \
   gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
-  gst-plugins-ugly gst-plugin-pipewire
+  gst-plugins-ugly gst-plugin-pipewire udisks2 util-linux
 ```
 
 The build fetches the pinned `libqt6zig` dependency automatically. The first build compiles only the Qt wrappers the app uses, so it is much faster than building the entire binding repository.
@@ -314,7 +316,7 @@ build.zig.zon          pinned libqt6zig dependency and package metadata
 src/main.zig           Qt entrypoint
 src/app.zig            window, tabs, panes, navigation, search and file-operation UI
 src/ui/local_model.zig  async flat directory model with filter and sort
-src/ui/mounts.zig       QStorageInfo-backed mounted-drive discovery
+src/ui/mounts.zig       QStorageInfo/lsblk drive discovery and mount metadata
 src/ui/qt_bridge.cpp    QVariant-from-QIcon bridge for view decorations
 src/ui/terminal.zig     Zig wrapper for the embedded terminal panel
 src/ui/terminal_widget.cpp  QTermWidget C ABI shim (compiled with g++)

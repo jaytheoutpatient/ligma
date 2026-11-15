@@ -99,6 +99,8 @@ zig_version_ok() {
 system_deps_ready() {
     command -v g++ >/dev/null 2>&1 || return 1
     command -v pkg-config >/dev/null 2>&1 || return 1
+    command -v lsblk >/dev/null 2>&1 || return 1
+    command -v udisksctl >/dev/null 2>&1 || return 1
     pkg-config --exists qtermwidget6 gstreamer-1.0 sqlite3
 }
 
@@ -296,7 +298,8 @@ install_deps() {
     if command -v pacman >/dev/null 2>&1; then
         local packages=(base-devel pkgconf qt6-base sqlite qtermwidget
             utf8proc gstreamer gst-plugins-base gst-plugins-good
-            gst-plugins-bad gst-plugins-ugly gst-plugin-pipewire zig)
+            gst-plugins-bad gst-plugins-ugly gst-plugin-pipewire
+            udisks2 util-linux zig)
         printf 'Detected pacman. Installing: %s\n' "${packages[*]}"
         confirm_install pacman
         run_priv pacman -S --needed --noconfirm "${packages[@]}"
@@ -306,7 +309,7 @@ install_deps() {
             libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
             gstreamer1.0-plugins-ugly gstreamer1.0-pipewire
-            gstreamer1.0-alsa)
+            gstreamer1.0-alsa udisks2 util-linux)
         run_priv apt-get update
         local candidate=""
         local qterm_package=""
@@ -332,7 +335,7 @@ install_deps() {
             gstreamer1-devel gstreamer1-plugins-base-devel
             gstreamer1-plugins-base gstreamer1-plugins-good
             gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free
-            pipewire-gstreamer)
+            pipewire-gstreamer udisks2 util-linux)
         printf 'Detected dnf. Installing: %s\n' "${packages[*]}"
         confirm_install dnf
         run_priv dnf install -y "${packages[@]}"

@@ -7,15 +7,21 @@
 const std = @import("std");
 const qt6 = @import("libqt6zig");
 
+const QProcess = qt6.QProcess;
 const QStorageInfo = qt6.QStorageInfo;
+const qiodevicebase_enums = qt6.qiodevicebase_enums;
 
 pub const Volume = struct {
     label: []u8,
+    /// Mount point for mounted volumes; empty for an unmounted device.
     path: []u8,
     device: []u8,
     fs_type: []u8,
     bytes_total: u64,
     bytes_free: u64,
+    mounted: bool,
+    removable: bool,
+    read_only: bool,
 
     pub fn deinit(self: *Volume, gpa: std.mem.Allocator) void {
         gpa.free(self.label);
@@ -81,10 +87,155 @@ pub fn list(gpa: std.mem.Allocator) !std.ArrayList(Volume) {
             .fs_type = fs_copy,
             .bytes_total = @intCast(@max(storage.bytesTotal(), 0)),
             .bytes_free = @intCast(@max(storage.bytesAvailable(), 0)),
+            .mounted = true,
+            .removable = false,
+            .read_only = storage.isReadOnly(),
         });
     }
+
+    listUnmountedUsb(gpa, &result) catch {};
     std.mem.sortUnstable(Volume, result.items, {}, volumeLessThan);
     return result;
+}
+
+fn listUnmountedUsb(gpa: std.mem.Allocator, result: *std.ArrayList(Volume)) !void {
+    const process = QProcess.new();
+    defer process.delete();
+    process.start3(
+        gpa,
+        "lsblk",
+        &.{ "-J", "-b", "-o", "NAME,PATH,TYPE,FSTYPE,LABEL,SIZE,MOUNTPOINTS,TRAN,RM,MODEL" },
+        qiodevicebase_enums.OpenModeFlag.ReadOnly,
+    );
+    if (!process.waitForFinished()) return;
+    if (process.exitCode() != 0) return;
+
+    const output = process.readAllStandardOutput(gpa);
+    defer gpa.free(output);
+    if (output.len == 0) return;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, output, .{}) catch return;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+    const devices_value = root.get("blockdevices") orelse return;
+    const devices = switch (devices_value) {
+        .array => |array| array,
+        else => return,
+    };
+
+    for (devices.items) |device_value| {
+        if (device_value != .object) continue;
+        const device = device_value.object;
+        if (!isUsbDevice(device)) continue;
+
+        const model = jsonString(device.get("model")) orelse "";
+        const children_value = device.get("children");
+        if (children_value != null and children_value.? == .array and
+            children_value.?.array.items.len > 0)
+        {
+            const children = children_value.?.array.items;
+            for (children) |child_value| {
+                if (child_value != .object) continue;
+                try appendUnmounted(gpa, result, child_value.object, model, children.len);
+            }
+        } else {
+            try appendUnmounted(gpa, result, device, model, 1);
+        }
+    }
+}
+
+fn isUsbDevice(device: std.json.ObjectMap) bool {
+    if (jsonBool(device.get("rm"))) return true;
+    if (jsonString(device.get("tran"))) |transport| {
+        return std.mem.eql(u8, transport, "usb");
+    }
+    return false;
+}
+
+fn appendUnmounted(
+    gpa: std.mem.Allocator,
+    result: *std.ArrayList(Volume),
+    device: std.json.ObjectMap,
+    model: []const u8,
+    child_count: usize,
+) !void {
+    const fs_type = jsonString(device.get("fstype")) orelse return;
+    if (std.mem.eql(u8, fs_type, "swap")) return;
+    const device_path = jsonString(device.get("path")) orelse return;
+    if (hasDevice(result.items, device_path)) return;
+    if (!isUnmounted(device)) return;
+
+    const size = jsonU64(device.get("size")) orelse 0;
+    const raw_label = jsonString(device.get("label")) orelse "";
+    const name = jsonString(device.get("name")) orelse std.fs.path.basename(device_path);
+
+    const label = if (raw_label.len > 0)
+        try gpa.dupe(u8, raw_label)
+    else if (model.len > 0 and child_count == 1)
+        try gpa.dupe(u8, model)
+    else if (model.len > 0)
+        try std.fmt.allocPrint(gpa, "{s} ({s})", .{ model, name })
+    else if (name.len > 0)
+        try gpa.dupe(u8, name)
+    else
+        try gpa.dupe(u8, device_path);
+    errdefer gpa.free(label);
+
+    const path_copy = try gpa.dupe(u8, "");
+    errdefer gpa.free(path_copy);
+    const device_copy = try gpa.dupe(u8, device_path);
+    errdefer gpa.free(device_copy);
+    const fs_copy = try gpa.dupe(u8, fs_type);
+
+    try result.append(gpa, .{
+        .label = label,
+        .path = path_copy,
+        .device = device_copy,
+        .fs_type = fs_copy,
+        .bytes_total = size,
+        .bytes_free = 0,
+        .mounted = false,
+        .removable = true,
+        .read_only = false,
+    });
+}
+
+fn isUnmounted(device: std.json.ObjectMap) bool {
+    const value = device.get("mountpoints") orelse return true;
+    if (value != .array) return true;
+    for (value.array.items) |item| {
+        if (item == .string and item.string.len > 0) return false;
+    }
+    return true;
+}
+
+fn jsonString(value: ?std.json.Value) ?[]const u8 {
+    const item = value orelse return null;
+    if (item != .string or item.string.len == 0) return null;
+    return item.string;
+}
+
+fn jsonBool(value: ?std.json.Value) bool {
+    const item = value orelse return false;
+    return item == .bool and item.bool;
+}
+
+fn jsonU64(value: ?std.json.Value) ?u64 {
+    const item = value orelse return null;
+    return switch (item) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
+    };
+}
+
+fn hasDevice(volumes: []const Volume, device: []const u8) bool {
+    for (volumes) |volume| {
+        if (std.mem.eql(u8, volume.device, device)) return true;
+    }
+    return false;
 }
 
 fn volumeLessThan(_: void, left: Volume, right: Volume) bool {
