@@ -137,6 +137,7 @@ const App = struct {
     ctx_mount_action: QAction,
     ctx_unmount_action: QAction,
     ctx_empty_place_trash_action: QAction,
+    ctx_play_place_music_action: QAction,
     context_drive_row: i32 = -1,
     mount_generation: u64 = 0,
     context_drive_generation: u64 = 0,
@@ -234,6 +235,22 @@ var app: App = undefined;
 /// other sizes for launchers and panels.
 const window_icon_png = @embedFile("assets/org.ligma.FileManager-256.png");
 
+const sidebar_list_style =
+    "QListWidget { background: transparent; border: none; outline: none; padding: 2px; }" ++
+    "QListWidget::item { border: none; border-radius: 6px; padding: 4px 6px; margin: 1px 0; }" ++
+    "QListWidget::item:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
+    "stop:0 rgba(96, 165, 250, 0.34), stop:1 rgba(96, 165, 250, 0.0)); }" ++
+    "QListWidget::item:selected { color: white; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
+    "stop:0 rgba(59, 130, 246, 0.88), stop:0.6 rgba(99, 102, 241, 0.50), " ++
+    "stop:1 rgba(99, 102, 241, 0.0)); }" ++
+    "QListWidget QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }" ++
+    "QListWidget QScrollBar::handle:vertical { background: rgba(148, 163, 184, 0.5); " ++
+    "border-radius: 4px; min-height: 18px; }" ++
+    "QListWidget QScrollBar::add-line:vertical, QListWidget QScrollBar::sub-line:vertical " ++
+    "{ height: 0; background: none; }" ++
+    "QListWidget QScrollBar::add-page:vertical, QListWidget QScrollBar::sub-page:vertical " ++
+    "{ background: transparent; }";
+
 fn loadApplicationIcon() QIcon {
     const pixmap = QPixmap.new();
     defer pixmap.delete();
@@ -281,6 +298,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     places.setUniformItemSizes(true);
     places.setSpacing(1);
     places.setVerticalScrollBarPolicy(qnamespace_enums.ScrollBarPolicy.ScrollBarAsNeeded);
+    places.setMouseTracking(true);
+    places.setAttribute2(qnamespace_enums.WidgetAttribute.WA_Hover, true);
+    places.setStyleSheet(sidebar_list_style);
     sidebar_layout.addWidget(places);
 
     const drives_label = QLabel.new3("Drives");
@@ -291,6 +311,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     drives.setUniformItemSizes(true);
     drives.setSpacing(1);
     drives.setVerticalScrollBarPolicy(qnamespace_enums.ScrollBarPolicy.ScrollBarAsNeeded);
+    drives.setMouseTracking(true);
+    drives.setAttribute2(qnamespace_enums.WidgetAttribute.WA_Hover, true);
+    drives.setStyleSheet(sidebar_list_style);
     drives.hide();
     sidebar_layout.addWidget(drives);
 
@@ -571,6 +594,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const ctx_add_places_action = tree_menu.addAction2("&Add to Places");
     ctx_add_places_action.onTriggered(onCtxAddToPlaces);
     const places_menu = QMenu.new(window);
+    const ctx_play_place_music_action = places_menu.addAction2("&Play All Music");
+    ctx_play_place_music_action.onTriggered(onCtxPlayPlaceMusic);
     const ctx_empty_place_trash_action = places_menu.addAction2("&Empty Trash…");
     ctx_empty_place_trash_action.onTriggered(onCtxEmptyPlaceTrash);
     const ctx_remove_place_action = places_menu.addAction2("Remove from Places");
@@ -610,6 +635,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .ctx_mount_action = ctx_mount_action,
         .ctx_unmount_action = ctx_unmount_action,
         .ctx_empty_place_trash_action = ctx_empty_place_trash_action,
+        .ctx_play_place_music_action = ctx_play_place_music_action,
         .view_details_action = details_view_action,
         .view_icons_action = icons_view_action,
         .view_compact_action = compact_view_action,
@@ -1922,6 +1948,95 @@ fn onCtxEmptyPlaceTrash(_: QAction) callconv(.c) void {
     emptyTrashWithConfirmation();
 }
 
+fn isMusicPlace(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.fs.path.basename(path), "Music");
+}
+
+fn onCtxPlayPlaceMusic(_: QAction) callconv(.c) void {
+    const row = app.context_place_row;
+    app.context_place_row = -1;
+    if (row < 0) return;
+    const index: usize = @intCast(row);
+    if (index >= app.place_paths.items.len) return;
+    const path = app.place_paths.items[index];
+    if (!isMusicPlace(path)) return;
+    playMusicDirectory(path);
+}
+
+fn playMusicDirectory(path: []const u8) void {
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |file| app.gpa.free(file);
+        files.deinit(app.gpa);
+    }
+
+    collectMusicFiles(app.gpa, app.io, path, &files) catch {
+        showStatus("Could not read the Music folder", 3500);
+        return;
+    };
+    if (files.items.len == 0) {
+        showStatus("No music files found in this folder", 3000);
+        return;
+    }
+
+    std.mem.sortUnstable([]u8, files.items, {}, musicPathLessThan);
+    app.player.playAll(files.items);
+    showPlayer();
+
+    var buffer: [512]u8 = undefined;
+    const name = std.fs.path.basename(path);
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "Playing {d} track{s} from {s}",
+        .{
+            files.items.len,
+            if (files.items.len == 1) "" else "s",
+            if (name.len > 0) name else path,
+        },
+    ) catch "Playing music";
+    showStatus(message, 4000);
+}
+
+fn collectMusicFiles(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    out: *std.ArrayList([]u8),
+) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (true) {
+        const maybe_entry = try iterator.next(io);
+        const item = maybe_entry orelse break;
+        if (std.mem.eql(u8, item.name, ".") or std.mem.eql(u8, item.name, "..")) continue;
+
+        const child = try std.fs.path.join(gpa, &.{ dir_path, item.name });
+        if (item.kind == .directory) {
+            collectMusicFiles(gpa, io, child, out) catch {};
+            gpa.free(child);
+            continue;
+        }
+        if (item.kind != .file) {
+            gpa.free(child);
+            continue;
+        }
+        if (player_mod.isAudioFile(gpa, child)) {
+            out.append(gpa, child) catch |err| {
+                gpa.free(child);
+                return err;
+            };
+        } else {
+            gpa.free(child);
+        }
+    }
+}
+
+fn musicPathLessThan(_: void, left: []u8, right: []u8) bool {
+    return std.mem.lessThan(u8, left, right);
+}
+
 fn onFileMenuAboutToShow(_: QMenu) callconv(.c) void {
     const pane = activePane();
     const trash_view = if (pane) |value| value.model.isTrash() else false;
@@ -3090,6 +3205,7 @@ fn refreshMountedPlaces() void {
             qnamespace_enums.WidgetAttribute.WA_TransparentForMouseEvents,
             true,
         );
+        item_widget.setStyleSheet("background: transparent;");
         const item_layout = QVBoxLayout.new(item_widget);
         item_layout.setContentsMargins(4, 3, 4, 3);
         item_layout.setSpacing(3);
@@ -3104,8 +3220,11 @@ fn refreshMountedPlaces() void {
         bar.setFixedHeight(8);
         bar.setStyleSheet(
             "QProgressBar { border: 0; border-radius: 3px; " ++
-                "background: rgba(128, 128, 128, 0.28); } " ++
-                "QProgressBar::chunk { border-radius: 3px; background-color: #3b82f6; }",
+                "background: rgba(128, 128, 128, 0.22); } " ++
+                "QProgressBar::chunk { border-radius: 3px; background: " ++
+                "qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
+                "stop:0 #3b82f6, stop:0.58 #6366f1, " ++
+                "stop:1 rgba(99, 102, 241, 0.0)); }",
         );
         item_layout.addWidget(bar);
 
@@ -3812,9 +3931,11 @@ fn onPlacesContextMenu(list: QListWidget, pos: QPoint) callconv(.c) void {
     const path = app.place_paths.items[index];
     const trash_place = file_ops.isTrashLocation(path);
     const custom_place = index >= app.place_builtin_count;
-    if (!trash_place and !custom_place) return;
+    const music_place = isMusicPlace(path);
+    if (!trash_place and !custom_place and !music_place) return;
 
     app.context_place_row = row;
+    app.ctx_play_place_music_action.setVisible(music_place);
     app.ctx_empty_place_trash_action.setVisible(trash_place);
     app.ctx_remove_place_action.setVisible(custom_place);
 

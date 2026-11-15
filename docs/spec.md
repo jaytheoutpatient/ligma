@@ -852,7 +852,8 @@ Implemented in the v0.5 prototype:
 
 - Zig 0.17 + Qt 6.12 window using `libqt6zig`, split into `main.zig`, `app.zig`, `ui/`, and `core/`.
 - Places sidebar (Home, XDG folders, Trash, Filesystem) plus a **Drives** section populated from `QStorageInfo` and `lsblk`. Mounted rows show free space and a used-capacity progress bar; unmounted USB/removable partitions show **not mounted** and mount on click. Right-clicking a drive offers **Mount** or **Unmount**, with unmount falling back from `udisksctl` to `pkexec`.
-- Compact Places and Drives lists that size to their content and scroll after a window-relative height cap.
+- Compact Places and Drives lists that size to their content and scroll after a window-relative height cap. The lists are borderless; selected and hovered rows use solid-to-transparent gradients, and drive progress bars fade to transparent.
+- Right-clicking the Music place offers **Play All Music**, which recursively scans the folder and replaces the player queue with its audio files.
 - Automatic directory refresh through `QFileSystemWatcher` for every open pane and for `Trash/files`/`Trash/info`; events are coalesced and selection plus scroll position are restored after the snapshot reset.
 - Back/forward/up/home/reload navigation with independent per-pane history.
 - Editable path bar with `~`, relative-path, and `file://` resolution.
