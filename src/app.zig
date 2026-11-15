@@ -65,6 +65,7 @@ pub const Pane = struct {
     history: std.ArrayList([]u8) = .empty,
     history_index: usize = 0,
     current_path: ?[]u8 = null,
+    trash_view: bool = false,
 };
 
 pub const Tab = struct {
@@ -105,8 +106,11 @@ const App = struct {
     tree_menu: QMenu,
     places_menu: QMenu,
     ctx_open_action: QAction,
+    ctx_restore_action: QAction,
+    ctx_empty_trash_action: QAction,
     ctx_play_action: QAction,
     ctx_playlist_action: QAction,
+    ctx_terminal_action: QAction,
     ctx_cut_action: QAction,
     ctx_copy_action: QAction,
     ctx_paste_action: QAction,
@@ -116,6 +120,10 @@ const App = struct {
     ctx_delete_action: QAction,
     ctx_add_places_action: QAction,
     ctx_remove_place_action: QAction,
+    file_trash_action: QAction,
+    file_restore_action: QAction,
+    file_empty_trash_action: QAction,
+    file_delete_action: QAction,
     context_pane: ?*Pane = null,
     context_place_row: i32 = -1,
     // Folder for the "Open in Terminal" action, captured when the context
@@ -340,8 +348,13 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     _ = file_menu.addSeparator();
     const trash_action = makeAction(file_menu, "Move to Trash", "Delete", onTrashSelected);
     file_menu.addAction(trash_action);
+    const restore_action = makeAction(file_menu, "Restore from Trash", null, onRestoreSelected);
+    file_menu.addAction(restore_action);
+    const empty_trash_action = makeAction(file_menu, "Empty Trash…", null, onEmptyTrash);
+    file_menu.addAction(empty_trash_action);
     const delete_action = makeAction(file_menu, "Delete Permanently", "Shift+Delete", onDeleteSelected);
     file_menu.addAction(delete_action);
+    file_menu.onAboutToShow(onFileMenuAboutToShow);
     _ = file_menu.addSeparator();
     const new_tab_action = makeAction(file_menu, "New Tab", "Ctrl+T", onNewTab);
     file_menu.addAction(new_tab_action);
@@ -428,6 +441,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const tree_menu = QMenu.new(window);
     const ctx_open_action = tree_menu.addAction2("&Open");
     ctx_open_action.onTriggered(onCtxOpen);
+    const ctx_restore_action = tree_menu.addAction2("&Restore");
+    ctx_restore_action.onTriggered(onRestoreSelected);
     const ctx_play_action = tree_menu.addAction2("&Play");
     ctx_play_action.onTriggered(onCtxPlay);
     const ctx_playlist_action = tree_menu.addAction2("Add to &Playlist");
@@ -453,6 +468,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     ctx_trash_action.onTriggered(onTrashSelected);
     const ctx_delete_action = tree_menu.addAction2("&Delete Permanently");
     ctx_delete_action.onTriggered(onDeleteSelected);
+    const ctx_empty_trash_action = tree_menu.addAction2("&Empty Trash…");
+    ctx_empty_trash_action.onTriggered(onEmptyTrash);
     _ = tree_menu.addSeparator();
     const ctx_add_places_action = tree_menu.addAction2("&Add to Places");
     ctx_add_places_action.onTriggered(onCtxAddToPlaces);
@@ -481,8 +498,11 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .tree_menu = tree_menu,
         .places_menu = places_menu,
         .ctx_open_action = ctx_open_action,
+        .ctx_restore_action = ctx_restore_action,
+        .ctx_empty_trash_action = ctx_empty_trash_action,
         .ctx_play_action = ctx_play_action,
         .ctx_playlist_action = ctx_playlist_action,
+        .ctx_terminal_action = ctx_terminal_action,
         .ctx_cut_action = ctx_cut_action,
         .ctx_copy_action = ctx_copy_action,
         .ctx_paste_action = ctx_paste_action,
@@ -492,6 +512,10 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .ctx_delete_action = ctx_delete_action,
         .ctx_add_places_action = ctx_add_places_action,
         .ctx_remove_place_action = ctx_remove_place_action,
+        .file_trash_action = trash_action,
+        .file_restore_action = restore_action,
+        .file_empty_trash_action = empty_trash_action,
+        .file_delete_action = delete_action,
         .global_search = global_search,
         .search_dock = search_dock,
         .search_list = search_list,
@@ -514,6 +538,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     addChildPlace(home, "Music");
     addChildPlace(home, "Pictures");
     addChildPlace(home, "Videos");
+    addPlace("Trash", file_ops.trash_uri);
     addPlace("Filesystem", "/");
     app.place_builtin_count = app.place_paths.items.len;
     loadCustomPlaces();
@@ -830,10 +855,16 @@ fn setActivePane(pane: *Pane) void {
 
     pane.tab.active = if (pane.tab.panes[1] == pane) 1 else 0;
     updateHistoryActions();
+    updateFileActionState();
     refreshCount(pane);
     refreshPreview(pane);
     updateWindowTitle();
     updateTabTitle(pane.tab);
+}
+
+fn updateFileActionState() void {
+    const trash_view = if (activePane()) |pane| pane.model.isTrash() else false;
+    app.file_trash_action.setEnabled(!trash_view);
 }
 
 /// Feeds the bottom-left preview panel with the pane's current selection.
@@ -841,6 +872,10 @@ fn setActivePane(pane: *Pane) void {
 /// video file. The item is the selected row — not currentIndex(), which Qt
 /// may move ahead of the selection (Shift+arrow extension).
 fn refreshPreview(pane: *Pane) void {
+    if (pane.model.isTrash()) {
+        app.preview.hide();
+        return;
+    }
     const rows = pane.selection.selectedRows(app.gpa);
     defer app.gpa.free(rows);
     if (rows.len == 1 and rows[0].isValid()) {
@@ -866,7 +901,12 @@ fn updateTabTitle(tab: *Tab) void {
 
     const pane = tab.panes[tab.active] orelse tab.panes[0] orelse return;
     const path = pane.current_path orelse return;
-    const name = if (std.mem.eql(u8, path, "/")) "/" else std.fs.path.basename(path);
+    const name = if (file_ops.isTrashLocation(path))
+        "Trash"
+    else if (std.mem.eql(u8, path, "/"))
+        "/"
+    else
+        std.fs.path.basename(path);
 
     if (tab.split_visible) {
         const title = std.fmt.allocPrint(app.gpa, "◧ {s}", .{name}) catch name;
@@ -881,7 +921,20 @@ fn updateTabTitle(tab: *Tab) void {
 // ---- Navigation ----------------------------------------------------------
 
 fn navigateTo(pane: *Pane, raw: []const u8, record_history: bool) void {
-    const cwd = pane.current_path orelse "/";
+    if (file_ops.isTrashLocation(raw)) {
+        const trash_path = app.gpa.dupe(u8, file_ops.trash_uri) catch return;
+        defer app.gpa.free(trash_path);
+        setRoot(pane, trash_path);
+        if (record_history) pushHistory(pane, trash_path);
+        return;
+    }
+
+    // Relative paths typed while viewing Trash resolve from the home folder
+    // rather than treating the pseudo-URI as a directory.
+    const cwd = if (pane.current_path) |path|
+        if (file_ops.isTrashLocation(path)) homePath() else path
+    else
+        "/";
     const resolved = paths.resolve(app.gpa, cwd, raw) catch {
         showStatus("Cannot resolve that location", 2500);
         return;
@@ -907,6 +960,25 @@ fn setRoot(pane: *Pane, path: []const u8) void {
     app.suppress_filter = false;
     pane.model.setFilter("");
 
+    const trash_view = file_ops.isTrashLocation(path);
+    pane.tree.setDragEnabled(!trash_view);
+    pane.tree.setAcceptDrops(!trash_view);
+    pane.tree.setDropIndicatorShown(!trash_view);
+    if (trash_view != pane.trash_view) {
+        pane.trash_view = trash_view;
+        if (trash_view) {
+            pane.tree.setColumnWidth(0, 360);
+            pane.tree.setColumnWidth(1, 420);
+            pane.tree.setColumnWidth(2, 170);
+            pane.tree.setColumnWidth(3, 100);
+        } else {
+            pane.tree.setColumnWidth(0, 460);
+            pane.tree.setColumnWidth(1, 110);
+            pane.tree.setColumnWidth(2, 170);
+            pane.tree.setColumnWidth(3, 190);
+        }
+    }
+
     pane.tree.clearSelection();
     pane.model.load(path);
 
@@ -921,6 +993,7 @@ fn setRoot(pane: *Pane, path: []const u8) void {
     }
     updateTabTitle(pane.tab);
     updateHistoryActions();
+    updateFileActionState();
 }
 
 fn refreshRoot(pane: *Pane) void {
@@ -995,15 +1068,22 @@ fn goForward(pane: *Pane) void {
 
 fn goUp(pane: *Pane) void {
     const current = pane.current_path orelse return;
+    if (file_ops.isTrashLocation(current)) {
+        goHome(pane);
+        return;
+    }
     if (std.mem.eql(u8, current, "/")) return;
     const parent = std.fs.path.dirname(current) orelse "/";
     navigateTo(pane, parent, true);
 }
 
+fn homePath() []const u8 {
+    const home = std.c.getenv("HOME") orelse return "/";
+    return std.mem.span(home);
+}
+
 fn goHome(pane: *Pane) void {
-    const home = QDir.homePath(app.gpa);
-    defer app.gpa.free(home);
-    navigateTo(pane, home, true);
+    navigateTo(pane, homePath(), true);
 }
 
 fn reloadPane(pane: *Pane) void {
@@ -1021,11 +1101,18 @@ fn applyFilter(pane: *Pane, text: []const u8) void {
 fn refreshCount(pane: *Pane) void {
     const count = pane.model.count();
     var buffer: [256]u8 = undefined;
-    const message = std.fmt.bufPrint(
-        &buffer,
-        "{d} item{s}",
-        .{ count, if (count == 1) "" else "s" },
-    ) catch "Items";
+    const message = if (pane.model.isTrash())
+        std.fmt.bufPrint(
+            &buffer,
+            "{d} item{s} in Trash",
+            .{ count, if (count == 1) "" else "s" },
+        ) catch "Trash"
+    else
+        std.fmt.bufPrint(
+            &buffer,
+            "{d} item{s}",
+            .{ count, if (count == 1) "" else "s" },
+        ) catch "Items";
     app.count_label.setText(message);
 }
 
@@ -1040,7 +1127,10 @@ fn updateWindowTitle() void {
     };
 
     var buffer: [8192]u8 = undefined;
-    const title = std.fmt.bufPrint(&buffer, "{s} — Ligma", .{path}) catch "Ligma";
+    const title = if (file_ops.isTrashLocation(path))
+        "Trash — Ligma"
+    else
+        std.fmt.bufPrint(&buffer, "{s} — Ligma", .{path}) catch "Ligma";
     app.window.setWindowTitle(title);
 }
 
@@ -1066,6 +1156,11 @@ fn selectedPath(pane: *Pane, index: QModelIndex) ?[]const u8 {
 }
 
 fn openSelected(pane: *Pane, index: QModelIndex) void {
+    if (pane.model.isTrash()) {
+        restoreSelected(pane);
+        return;
+    }
+
     const path = selectedPath(pane, index) orelse return;
     defer app.gpa.free(path);
 
@@ -1141,6 +1236,10 @@ fn runExecutable(path: []const u8) void {
 
 fn onRunSelected(_: QAction) callconv(.c) void {
     const pane = activePane() orelse return;
+    if (pane.model.isTrash()) {
+        showStatus("Restore the item before running it", 3000);
+        return;
+    }
     const index = pane.selection.currentIndex();
     if (!index.isValid()) {
         showStatus("Select an executable file first", 2500);
@@ -1202,6 +1301,120 @@ fn collectSelectedPaths(pane: *Pane) !std.ArrayList([]const u8) {
 fn freePathList(list: *std.ArrayList([]const u8)) void {
     for (list.items) |path| app.gpa.free(path);
     list.deinit(app.gpa);
+}
+
+/// Selected Trash rows as borrowed descriptions. The model owns the strings;
+/// file_ops clones them before its worker starts.
+fn collectSelectedTrashSpecs(pane: *Pane) !std.ArrayList(file_ops.TrashSpec) {
+    var result: std.ArrayList(file_ops.TrashSpec) = .empty;
+    errdefer result.deinit(app.gpa);
+
+    const rows = pane.selection.selectedRows(app.gpa);
+    defer app.gpa.free(rows);
+
+    if (rows.len > 0) {
+        for (rows) |index| {
+            const entry = pane.model.entryAt(index) orelse continue;
+            try result.append(app.gpa, .{
+                .trash_path = entry.path,
+                .original_path = entry.original_path orelse "",
+                .info_path = entry.info_path,
+            });
+        }
+    } else {
+        // Keyboard-only navigation can leave a valid current row unselected.
+        const current = pane.selection.currentIndex();
+        if (current.isValid()) {
+            if (pane.model.entryAt(current)) |entry| {
+                try result.append(app.gpa, .{
+                    .trash_path = entry.path,
+                    .original_path = entry.original_path orelse "",
+                    .info_path = entry.info_path,
+                });
+            }
+        }
+    }
+    return result;
+}
+
+fn restoreSelected(pane: *Pane) void {
+    if (!pane.model.isTrash()) {
+        showStatus("Open Trash to restore items", 3000);
+        return;
+    }
+
+    var items = collectSelectedTrashSpecs(pane) catch {
+        showStatus("Could not read the Trash selection", 3500);
+        return;
+    };
+    defer items.deinit(app.gpa);
+    if (items.items.len == 0) {
+        showStatus("Select items to restore", 2500);
+        return;
+    }
+
+    const job = file_ops.Job.createRestore(app.gpa, app.io, items.items) catch {
+        showStatus("Could not start the restore operation", 3500);
+        return;
+    };
+    _ = startFileJob(job, false);
+}
+
+fn onRestoreSelected(_: QAction) callconv(.c) void {
+    const pane = activePane() orelse return;
+    restoreSelected(pane);
+}
+
+fn onEmptyTrash(_: QAction) callconv(.c) void {
+    const pane = activePane() orelse return;
+    if (!pane.model.isTrash()) {
+        showStatus("Open Trash first", 3000);
+        return;
+    }
+    if (pane.model.count() == 0) {
+        showStatus("Trash is already empty", 2500);
+        return;
+    }
+
+    var buffer: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "Permanently delete {d} item{s} from Trash? This cannot be undone.",
+        .{
+            pane.model.count(),
+            if (pane.model.count() == 1) "" else "s",
+        },
+    ) catch "Permanently empty Trash? This cannot be undone.";
+
+    const answer = QMessageBox.question2(
+        app.window,
+        "Empty Trash",
+        message,
+        qmessagebox_enums.StandardButton.Yes,
+        qmessagebox_enums.StandardButton.No,
+    );
+    if (answer != qmessagebox_enums.StandardButton.Yes) return;
+
+    const job = file_ops.Job.createEmptyTrash(app.gpa, app.io) catch {
+        showStatus("Could not start the empty-trash operation", 3500);
+        return;
+    };
+    _ = startFileJob(job, false);
+}
+
+fn onFileMenuAboutToShow(_: QMenu) callconv(.c) void {
+    const pane = activePane();
+    const trash_view = if (pane) |value| value.model.isTrash() else false;
+
+    app.file_trash_action.setVisible(!trash_view);
+    app.file_trash_action.setEnabled(!trash_view);
+    app.file_restore_action.setVisible(trash_view);
+    app.file_restore_action.setEnabled(trash_view);
+    app.file_empty_trash_action.setVisible(trash_view);
+    app.file_empty_trash_action.setEnabled(
+        trash_view and pane.?.model.count() > 0 and app.file_job == null,
+    );
+    app.file_delete_action.setVisible(true);
 }
 
 fn freeUndoBatch(batch: *UndoBatch) void {
@@ -1381,6 +1594,10 @@ fn formatBytes(buffer: []u8, bytes: u64) []const u8 {
 
 fn onNewFolder(_: QAction) callconv(.c) void {
     const pane = activePane() orelse return;
+    if (pane.model.isTrash()) {
+        showStatus("New folders cannot be created in Trash", 3000);
+        return;
+    }
     const parent = pane.current_path orelse return;
 
     var ok = false;
@@ -1414,6 +1631,10 @@ fn onNewFolder(_: QAction) callconv(.c) void {
 
 fn onRename(_: QAction) callconv(.c) void {
     const pane = activePane() orelse return;
+    if (pane.model.isTrash()) {
+        showStatus("Restore the item before renaming it", 3000);
+        return;
+    }
     const index = pane.selection.currentIndex();
     if (!index.isValid()) {
         showStatus("Select an item to rename", 2500);
@@ -1456,6 +1677,10 @@ fn onRename(_: QAction) callconv(.c) void {
 
 fn onTrashSelected(_: QAction) callconv(.c) void {
     const pane = activePane() orelse return;
+    if (pane.model.isTrash()) {
+        showStatus("These items are already in Trash", 2500);
+        return;
+    }
     var selected = collectSelectedPaths(pane) catch {
         showStatus("Could not read the selection", 3500);
         return;
@@ -1476,6 +1701,52 @@ fn onTrashSelected(_: QAction) callconv(.c) void {
 
 fn onDeleteSelected(_: QAction) callconv(.c) void {
     const pane = activePane() orelse return;
+
+    if (pane.model.isTrash()) {
+        var items = collectSelectedTrashSpecs(pane) catch {
+            showStatus("Could not read the Trash selection", 3500);
+            return;
+        };
+        defer items.deinit(app.gpa);
+        if (items.items.len == 0) {
+            showStatus("Select items to delete", 2500);
+            return;
+        }
+
+        const forced_message = if (items.items.len == 1)
+            std.fmt.allocPrint(
+                app.gpa,
+                "Permanently delete “{s}” from Trash? This cannot be undone.",
+                .{std.fs.path.basename(if (items.items[0].original_path.len > 0)
+                    items.items[0].original_path
+                else
+                    items.items[0].trash_path)},
+            ) catch "Permanently delete the selected item from Trash? This cannot be undone."
+        else
+            std.fmt.allocPrint(
+                app.gpa,
+                "Permanently delete {d} items from Trash? This cannot be undone.",
+                .{items.items.len},
+            ) catch "Permanently delete the selected items from Trash? This cannot be undone.";
+        defer app.gpa.free(forced_message);
+
+        const forced_answer = QMessageBox.question2(
+            app.window,
+            "Delete from Trash",
+            forced_message,
+            qmessagebox_enums.StandardButton.Yes,
+            qmessagebox_enums.StandardButton.No,
+        );
+        if (forced_answer != qmessagebox_enums.StandardButton.Yes) return;
+
+        const purge_job = file_ops.Job.createPurge(app.gpa, app.io, items.items) catch {
+            showStatus("Could not start the delete operation", 3500);
+            return;
+        };
+        _ = startFileJob(purge_job, false);
+        return;
+    }
+
     var selected = collectSelectedPaths(pane) catch {
         showStatus("Could not read the selection", 3500);
         return;
@@ -1593,7 +1864,20 @@ fn appendSingleProperties(list: *std.ArrayList(u8), pane: *Pane, index: QModelIn
     try appendProperties(list, "Name: {s}\n", .{name});
     try appendProperties(list, "Kind: {s}\n", .{kind});
     try appendProperties(list, "Size: {s}\n", .{size_text});
-    try appendProperties(list, "Location: {s}\n", .{location});
+    if (pane.model.isTrash()) {
+        if (entry.original_path) |original| {
+            const original_parent = std.fs.path.dirname(original) orelse "/";
+            try appendProperties(list, "Original location: {s}\n", .{original_parent});
+            try appendProperties(list, "Original path: {s}\n", .{original});
+        } else {
+            try appendProperties(list, "Original location: unknown\n", .{});
+        }
+        var deleted_buffer: [32]u8 = undefined;
+        try appendProperties(list, "Deleted: {s}\n", .{entry.deletedLabel(&deleted_buffer)});
+        try appendProperties(list, "Trash location: {s}\n", .{location});
+    } else {
+        try appendProperties(list, "Location: {s}\n", .{location});
+    }
     try appendProperties(list, "Modified: {s}\n", .{local_model.formatModified(entry.mtime)});
     try appendProperties(list, "Permissions: {s}\n", .{permissions[0..]});
 
@@ -1663,6 +1947,10 @@ fn permissionsString(permissions: i32) [9]u8 {
 
 fn copyOrCut(mode: ClipMode) void {
     const pane = activePane() orelse return;
+    if (pane.model.isTrash()) {
+        showStatus("Restore items before copying or cutting them", 3000);
+        return;
+    }
     var selected = collectSelectedPaths(pane) catch {
         showStatus("Could not read the selection", 3500);
         return;
@@ -1702,6 +1990,11 @@ fn onCut(_: QAction) callconv(.c) void {
 }
 
 fn onPaste(_: QAction) callconv(.c) void {
+    const pane = activePane() orelse return;
+    if (pane.model.isTrash()) {
+        showStatus("Restore items out of Trash instead of pasting into it", 3500);
+        return;
+    }
     if (app.clip_mode == .none or app.clip_paths.items.len == 0) {
         showStatus("The clipboard is empty", 2500);
         return;
@@ -1711,7 +2004,6 @@ fn onPaste(_: QAction) callconv(.c) void {
         return;
     }
 
-    const pane = activePane() orelse return;
     const dest = pane.current_path orelse return;
     const cutting = app.clip_mode == .cut;
 
@@ -2103,9 +2395,11 @@ fn makeAction(parent: anytype, label: []const u8, shortcut: ?[]const u8, callbac
 }
 
 fn addPlace(label: []const u8, path: []const u8) void {
-    const dir = QDir.new4(path);
-    defer dir.delete();
-    if (!dir.exists()) return;
+    if (!file_ops.isTrashLocation(path)) {
+        const dir = QDir.new4(path);
+        defer dir.delete();
+        if (!dir.exists()) return;
+    }
 
     const copy = app.gpa.dupe(u8, path) catch return;
     app.place_paths.append(app.gpa, copy) catch {
@@ -2242,24 +2536,43 @@ fn setContextSelection(pane: *Pane, index: QModelIndex) void {
 
 fn updateContextMenuState(pane: *Pane, index: QModelIndex) void {
     const has_item = index.isValid();
-    const has_audio = has_item and selectionHasAudio(pane);
+    const trash_view = pane.model.isTrash();
+    const has_audio = has_item and !trash_view and selectionHasAudio(pane);
+
+    app.ctx_open_action.setVisible(!trash_view and has_item);
     app.ctx_open_action.setEnabled(has_item);
+    app.ctx_restore_action.setVisible(trash_view and has_item);
+    app.ctx_restore_action.setEnabled(has_item);
+    app.ctx_empty_trash_action.setVisible(trash_view);
+    app.ctx_empty_trash_action.setEnabled(
+        trash_view and pane.model.count() > 0 and app.file_job == null,
+    );
     app.ctx_play_action.setVisible(has_audio);
     app.ctx_play_action.setEnabled(has_audio);
     app.ctx_playlist_action.setVisible(has_audio);
     app.ctx_playlist_action.setEnabled(has_audio);
+    app.ctx_terminal_action.setVisible(!trash_view);
+    app.ctx_terminal_action.setEnabled(!trash_view);
+    app.ctx_cut_action.setVisible(!trash_view and has_item);
     app.ctx_cut_action.setEnabled(has_item);
+    app.ctx_copy_action.setVisible(!trash_view and has_item);
     app.ctx_copy_action.setEnabled(has_item);
+    app.ctx_properties_action.setVisible(has_item);
     app.ctx_properties_action.setEnabled(has_item);
+    app.ctx_trash_action.setVisible(!trash_view and has_item);
     app.ctx_trash_action.setEnabled(has_item);
+    app.ctx_delete_action.setVisible(has_item);
     app.ctx_delete_action.setEnabled(has_item);
+    app.ctx_new_folder_action.setVisible(!trash_view);
     app.ctx_new_folder_action.setEnabled(pane.current_path != null);
+    app.ctx_paste_action.setVisible(!trash_view);
     app.ctx_paste_action.setEnabled(
-        app.file_job == null and app.clip_mode != .none and app.clip_paths.items.len > 0,
+        !trash_view and app.file_job == null and app.clip_mode != .none and
+            app.clip_paths.items.len > 0,
     );
 
-    // "Add to Places" only makes sense when the selection has a folder.
-    app.ctx_add_places_action.setVisible(selectionHasFolder(pane));
+    // "Add to Places" only makes sense in a real folder.
+    app.ctx_add_places_action.setVisible(!trash_view and selectionHasFolder(pane));
 }
 
 fn setContextTerminalDir(pane: *Pane, index: QModelIndex) void {
@@ -2604,6 +2917,20 @@ fn onSelectionChanged(selection: QItemSelectionModel, current: QModelIndex, _: Q
     const name = pane.model.nameAt(app.gpa, current);
     defer app.gpa.free(name);
 
+    if (pane.model.isTrash()) {
+        const entry = pane.model.entryAt(current) orelse return;
+        var deleted_buffer: [32]u8 = undefined;
+        var buffer: [8192]u8 = undefined;
+        const original = entry.original_path orelse "unknown location";
+        const message = std.fmt.bufPrint(
+            &buffer,
+            "{s} — {s} — deleted {s}",
+            .{ name, original, entry.deletedLabel(&deleted_buffer) },
+        ) catch name;
+        app.status.showMessage(message);
+        return;
+    }
+
     var buffer: [8192]u8 = undefined;
     if (pane.model.isDir(current)) {
         const message = std.fmt.bufPrint(&buffer, "{s} — Folder", .{name}) catch name;
@@ -2845,11 +3172,12 @@ fn onAbout(_: QAction) callconv(.c) void {
     QMessageBox.about(
         app.window,
         "About Ligma",
-        "Ligma 0.4 — a fast, keyboard-friendly file manager for Linux.\n\n" ++
+        "Ligma 0.5 — a fast, keyboard-friendly file manager for Linux.\n\n" ++
             "Built with Zig and Qt 6. This build adds a custom asynchronous " ++
-            "item model, tabs, split view, recursive filename search, and " ++
-            "undoable file operations including freedesktop.org trash.\n\n" ++
-            "The roadmap adds trash browsing, drag and drop, file watching, " ++
-            "metadata, previews, remote locations, and an extension API.",
+            "item model, tabs, split view, recursive filename search, " ++
+            "undoable file operations, and a browsable freedesktop.org " ++
+            "Trash with restore and empty actions.\n\n" ++
+            "The roadmap adds file watching, metadata, remote locations, " ++
+            "and an extension API.",
     );
 }

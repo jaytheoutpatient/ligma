@@ -191,7 +191,7 @@ Per-folder state remembers view mode, sort column/order, grouping, zoom, hidden-
 - `~`, relative paths, and `file://` URIs accepted in the location bar.
 - Places sidebar with Home, XDG directories, Starred, Recent, Trash, Filesystem, devices, network.
 - **Implemented (v0.4):** right-click a folder → *Add to Places* pins it to the sidebar; right-click a user-added entry → *Remove from Places*. Custom entries persist in `$XDG_CONFIG_HOME/ligma/places`, one absolute path per line, and load at startup after the built-ins. Built-in entries cannot be removed. The file-list menu also offers *Open in Terminal*.
-- **Implemented (v0.4):** the file-list context menu exposes *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, *Delete Permanently*, and *Add to Places* (shown only when the selection contains a folder). Right-clicking an unselected row selects it first, right-clicking a row that is already selected preserves a multi-selection, and right-clicking empty space clears the selection so only folder-wide actions (*Paste*, *New Folder…*) remain enabled. *Paste* is enabled only while the clipboard holds items and no file operation is running. *Properties* shows name, kind, size, location, modified time, permissions, and the symlink target for one item, and the item count, folder/file breakdown, total size, and location for a multi-selection.
+- **Implemented (v0.4):** the file-list context menu exposes *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, *Delete Permanently*, and *Add to Places* (shown only when the selection contains a folder). Right-clicking an unselected row selects it first, right-clicking a row that is already selected preserves a multi-selection, and right-clicking empty space clears the selection so only folder-wide actions (*Paste*, *New Folder…*) remain enabled. *Paste* is enabled only while the clipboard holds items and no file operation is running. *Properties* shows name, kind, size, location, modified time, permissions, and the symlink target for one item, and the item count, folder/file breakdown, total size, and location for a multi-selection. In Trash the menu becomes *Restore*, *Properties*, *Delete Permanently*, and *Empty Trash…*.
 - Drag a folder to the sidebar to bookmark it.
 - Middle-click a folder to open it in a new tab.
 - Enter opens; Ctrl+Enter opens in the other pane; Shift+Enter opens in a new tab.
@@ -467,7 +467,7 @@ Capabilities tell the UI what is possible: rename, delete, trash, watch, random 
 - Filtering and sorting behavior is not under our control.
 - It does not expose operation progress or custom roles.
 
-**Implemented in the v0.5 prototype:** `src/ui/local_model.zig` provides `LocalModel`, a `QAbstractItemModel` subclass backed by a flat, immutable snapshot of one folder. A worker thread enumerates the directory with `std.Io.Dir` and records name, path, kind, size, and mtime; the completed snapshot is published through an atomic flag, and the UI applies it with a model reset from a 50 ms timer. Filtering (case-insensitive substring over file names; directories stay visible) and sorting (name, size, kind, modified; folders always first) run in memory on the UI thread. Qt's `index`, `parent`, `rowCount`, `columnCount`, `hasChildren`, `data`, `headerData`, `flags`, and `sort` virtuals are bridged through `libqt6zig` callbacks, with a pointer registry mapping each C++ model to its Zig state. Navigation, reload, hidden-file toggling, selection status, and post-operation refresh all go through this model.
+**Implemented in the v0.5 prototype:** `src/ui/local_model.zig` provides `LocalModel`, a `QAbstractItemModel` subclass backed by a flat, immutable snapshot of one folder or the home Trash directory. A worker thread enumerates the directory with `std.Io.Dir` and records name, path, kind, size, and mtime; for Trash it also parses `.trashinfo` metadata into original-path and deletion-date fields. The completed snapshot is published through an atomic flag, and the UI applies it with a model reset from a 50 ms timer. Filtering (case-insensitive substring over file names; directories stay visible) and sorting (name, size, kind, modified; folders always first) run in memory on the UI thread. Trash uses Name, Original Location, Deleted, and Size columns and keeps hidden entries visible. Qt's `index`, `parent`, `rowCount`, `columnCount`, `hasChildren`, `data`, `headerData`, `flags`, `sort`, and drag/drop virtuals are bridged through `libqt6zig` callbacks, with a pointer registry mapping each C++ model to its Zig state. Navigation, reload, hidden-file toggling, selection status, and post-operation refresh all go through this model.
 
 The planned `LigmaModel` extends this snapshot API into the VFS layer. Each snapshot will contain mode, owner, group, MIME type, icon key, tags, rating, and extension columns, and the model will support:
 
@@ -495,7 +495,7 @@ Requirements:
 
 Conflict resolution is a first-class dialog with per-file and bulk choices. A "dry run" preview is available for batch rename and complex moves.
 
-**Implemented in the v0.3 prototype:** `src/core/file_ops.zig` provides an asynchronous `Job` with copy, move, trash, permanent delete, rename, mkdir, and undo workers. Each job owns its inputs, reports progress through atomics, supports cooperative cancellation, and returns owned undo records. Copy is recursive over files, directories, and symlinks; moves use `rename` with a copy-plus-delete fallback across devices; collisions produce `name (n).ext` rather than overwriting. Trash follows the freedesktop.org layout under `$XDG_DATA_HOME/Trash` with percent-encoded `Path=` metadata, UTC deletion dates, and restore support. The UI runs one job at a time, prompts for names with `QInputDialog`, confirms permanent deletion, and keeps an in-memory undo stack. Not yet implemented: the operation queue, pause/resume, conflict dialogs, batch rename preview, metadata/ACL preservation, persistent history, and redo.
+**Implemented in the v0.3 prototype:** `src/core/file_ops.zig` provides an asynchronous `Job` with copy, move, trash, restore, purge, empty-trash, permanent delete, rename, mkdir, and undo workers. Each job owns its inputs, reports progress through atomics, supports cooperative cancellation, and returns owned undo records. Copy is recursive over files, directories, and symlinks; moves use `rename` with a copy-plus-delete fallback across devices; collisions produce `name (n).ext` rather than overwriting. Trash follows the freedesktop.org layout under `$XDG_DATA_HOME/Trash` with percent-encoded `Path=` metadata, UTC deletion dates, restore support, and a browsable Trash model that shows original locations and deletion dates. The UI runs one job at a time, prompts for names with `QInputDialog`, confirms permanent deletion and emptying Trash, and keeps an in-memory undo stack. Not yet implemented: per-mount trash, the operation queue, pause/resume, conflict dialogs, batch rename preview, metadata/ACL preservation, persistent history, and redo.
 
 ### 5.6 Search and index
 
@@ -848,7 +848,7 @@ These need a product decision before the relevant phase:
 Implemented in the v0.5 prototype:
 
 - Zig 0.17 + Qt 6.12 window using `libqt6zig`, split into `main.zig`, `app.zig`, `ui/`, and `core/`.
-- Places sidebar (Home, XDG folders, Filesystem).
+- Places sidebar (Home, XDG folders, Trash, Filesystem).
 - Back/forward/up/home/reload navigation with independent per-pane history.
 - Editable path bar with `~`, relative-path, and `file://` resolution.
 - Custom `LocalModel` (`src/ui/local_model.zig`) replacing `QFileSystemModel`: worker-thread folder enumeration, UI-timer polling, and a flat details snapshot.
@@ -864,9 +864,9 @@ Implemented in the v0.5 prototype:
 - Global filename search with streamed results in a dock.
 - SQLite FTS5 index (`files`, `files_fts`, `files_fts_trigram`) with WAL, background home-directory crawler, status-bar health, and a rebuild action.
 - Live breadth-first scanner fallback while indexing, outside the indexed root, or when indexing is disabled.
-- Asynchronous file operations (`src/core/file_ops.zig`): copy, cut, paste, rename, new folder, trash, permanent delete, and undo.
+- Asynchronous file operations (`src/core/file_ops.zig`): copy, cut, paste, rename, new folder, trash, restore, purge, empty Trash, permanent delete, and undo.
 - Drag and drop between panes/folders via `text/uri-list`: internal move by default, Ctrl-copy, folder-row targeting, external copy-only drops, and collision-safe naming.
-- Freedesktop.org trash with percent-encoded `Path=` metadata, UTC `DeletionDate=`, collision-safe names, and restore through undo.
+- Freedesktop.org Trash with a dedicated **Trash** place, percent-encoded `Path=` metadata, UTC `DeletionDate=`, collision-safe storage names, original-location and deletion-date columns, restore, permanent delete, and empty Trash. Restoring a just-trashed batch also works through undo.
 - In-memory undo journal for the last completed batch; progress and cancellation in the status bar; `Escape` cancels.
 - Blue-and-purple floppy application icon (`assets/`): scalable SVG, nine PNG sizes in the hicolor theme, a desktop entry, and an embedded window icon.
 - Menus, keyboard shortcuts, item count, window title, and clean shutdown.
@@ -876,7 +876,8 @@ Known prototype limitations (addressed in later phases):
 
 - The model is a flat single-folder snapshot: no tree expansion, icons, thumbnails, or per-folder view state yet.
 - No filesystem watcher yet; external changes appear after a manual reload (`F5`) or the next file operation.
-- No trash browsing or VFS abstraction yet.
+- Trash browsing uses the home Trash directory only; per-mount `.Trash-$uid` locations are not implemented yet.
+- Restore, permanent delete, and empty Trash are not undoable. Undo only reverses the original move-to-Trash batch.
 - Executables run detached without a terminal, allow-list, or remembered confirmation, so command-line tools with no GUI produce no visible output.
 - One file operation at a time; no queue, pause/resume, conflict dialog, or redo.
 - Undo history is in memory, holds only the last completed batch, and is not persisted across restarts.
@@ -891,4 +892,4 @@ Known prototype limitations (addressed in later phases):
 - Place selection does not follow path-bar navigation.
 - Filter is a case-insensitive substring over file names; wildcards and regex are not supported yet, and directories remain visible.
 
-The next engineering step is adding a local/trash VFS behind `LocalModel`, followed by per-folder view state and incremental file watching. After that come incremental file watching and search indexing. New features should continue moving into `src/core/` and `src/ui/` rather than accumulating in `app.zig`.
+The next engineering step is adding per-mount `.Trash-$uid` support and per-folder view state, followed by incremental file watching and search indexing. New features should continue moving into `src/core/` and `src/ui/` rather than accumulating in `app.zig`.

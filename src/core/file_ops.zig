@@ -11,6 +11,9 @@ pub const Kind = enum {
     copy,
     move,
     trash,
+    restore,
+    purge,
+    empty_trash,
     delete,
     rename,
     mkdir,
@@ -21,6 +24,9 @@ pub const Kind = enum {
             .copy => "Copying",
             .move => "Moving",
             .trash => "Moving to Trash",
+            .restore => "Restoring",
+            .purge => "Deleting from Trash",
+            .empty_trash => "Emptying Trash",
             .delete => "Deleting",
             .rename => "Renaming",
             .mkdir => "Creating folder",
@@ -33,6 +39,9 @@ pub const Kind = enum {
             .copy => "Copied",
             .move => "Moved",
             .trash => "Moved to Trash",
+            .restore => "Restored",
+            .purge => "Deleted from Trash",
+            .empty_trash => "Emptied Trash",
             .delete => "Deleted",
             .rename => "Renamed",
             .mkdir => "Created folder",
@@ -40,6 +49,17 @@ pub const Kind = enum {
         };
     }
 };
+
+/// Pseudo-location used by the Places sidebar and the path bar.
+pub const trash_uri = "trash:///";
+
+/// Accept the canonical trash URI plus the two common shorthand forms.
+pub fn isTrashLocation(path: []const u8) bool {
+    const text = std.mem.trim(u8, path, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(text, trash_uri) or
+        std.ascii.eqlIgnoreCase(text, "trash://") or
+        std.ascii.eqlIgnoreCase(text, "trash:");
+}
 
 pub const State = enum(u8) {
     pending,
@@ -97,6 +117,68 @@ pub const UndoItem = union(enum) {
     }
 };
 
+/// A trashed item described by borrowed slices. Restore and purge jobs clone
+/// this data before their worker starts.
+pub const TrashSpec = struct {
+    trash_path: []const u8,
+    original_path: []const u8,
+    info_path: ?[]const u8 = null,
+};
+
+/// One item found in the freedesktop.org Trash directory.
+pub const TrashEntry = struct {
+    name: []u8,
+    trash_path: []u8,
+    /// Empty when the matching `.trashinfo` file is missing or unreadable.
+    original_path: []u8,
+    info_path: []u8,
+    deletion_text: [19]u8 = std.mem.zeroes([19]u8),
+    deletion_len: usize = 0,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
+    mtime: i64,
+
+    pub fn deinit(self: *TrashEntry, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.trash_path);
+        gpa.free(self.original_path);
+        gpa.free(self.info_path);
+        self.* = undefined;
+    }
+
+    pub fn spec(self: *const TrashEntry) TrashSpec {
+        return .{
+            .trash_path = self.trash_path,
+            .original_path = self.original_path,
+            .info_path = self.info_path,
+        };
+    }
+
+    pub fn deletionSlice(self: *const TrashEntry) []const u8 {
+        return self.deletion_text[0..self.deletion_len];
+    }
+};
+
+pub const ParsedTrashInfo = struct {
+    original_path: []u8,
+    deletion_text: [19]u8 = std.mem.zeroes([19]u8),
+    deletion_len: usize = 0,
+};
+
+const JobTrashItem = struct {
+    trash_path: []u8,
+    original_path: []u8,
+    info_path: ?[]u8,
+
+    fn deinit(self: *JobTrashItem, gpa: std.mem.Allocator) void {
+        gpa.free(self.trash_path);
+        gpa.free(self.original_path);
+        if (self.info_path) |path| gpa.free(path);
+        self.* = undefined;
+    }
+};
+
 pub const Progress = struct {
     state: State,
     items: usize,
@@ -116,6 +198,8 @@ pub const Job = struct {
     dest: ?[]u8 = null,
     /// Owned input actions for an undo job.
     undo_input: std.ArrayList(UndoItem) = .empty,
+    /// Owned inputs for restore/purge/empty-trash jobs.
+    trash_items: std.ArrayList(JobTrashItem) = .empty,
     /// Produced by copy/move/trash/rename/mkdir, taken by the UI.
     undo_output: std.ArrayList(UndoItem) = .empty,
 
@@ -166,6 +250,26 @@ pub const Job = struct {
         errdefer self.deinit();
         try self.addSources(sources);
         return self;
+    }
+
+    pub fn createRestore(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        items: []const TrashSpec,
+    ) !*Job {
+        return createTrashJob(gpa, io, .restore, items);
+    }
+
+    pub fn createPurge(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        items: []const TrashSpec,
+    ) !*Job {
+        return createTrashJob(gpa, io, .purge, items);
+    }
+
+    pub fn createEmptyTrash(gpa: std.mem.Allocator, io: std.Io) !*Job {
+        return initJob(gpa, io, .empty_trash);
     }
 
     pub fn createDelete(
@@ -233,6 +337,25 @@ pub const Job = struct {
         return self;
     }
 
+    fn createTrashJob(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        kind: Kind,
+        items: []const TrashSpec,
+    ) !*Job {
+        const self = try initJob(gpa, io, kind);
+        errdefer self.deinit();
+        for (items) |item| {
+            const owned = try cloneTrashItem(gpa, item);
+            self.trash_items.append(gpa, owned) catch |err| {
+                var discard = owned;
+                discard.deinit(gpa);
+                return err;
+            };
+        }
+        return self;
+    }
+
     fn initJob(gpa: std.mem.Allocator, io: std.Io, kind: Kind) !*Job {
         const self = try gpa.create(Job);
         self.* = .{ .gpa = gpa, .io = io, .kind = kind };
@@ -276,6 +399,8 @@ pub const Job = struct {
         if (self.dest) |dest| self.gpa.free(dest);
         for (self.undo_input.items) |*item| item.deinit(self.gpa);
         self.undo_input.deinit(self.gpa);
+        for (self.trash_items.items) |*item| item.deinit(self.gpa);
+        self.trash_items.deinit(self.gpa);
         for (self.undo_output.items) |*item| item.deinit(self.gpa);
         self.undo_output.deinit(self.gpa);
         self.gpa.destroy(self);
@@ -322,6 +447,9 @@ pub const Job = struct {
             .copy => try self.runCopy(),
             .move => try self.runMove(),
             .trash => try self.runTrash(),
+            .restore => try self.runRestore(),
+            .purge => try self.runPurge(),
+            .empty_trash => try self.runEmptyTrash(),
             .delete => try self.runDelete(),
             .rename => try self.runRename(),
             .mkdir => try self.runMkdir(),
@@ -502,6 +630,103 @@ pub const Job = struct {
         });
     }
 
+    fn runRestore(self: *Job) !void {
+        for (self.trash_items.items) |item| {
+            try self.checkCancel();
+            self.restoreOne(item) catch |err| {
+                if (err == error.Cancelled) return err;
+                const subject = if (item.original_path.len > 0)
+                    item.original_path
+                else
+                    item.trash_path;
+                self.recordError(subject, err);
+            };
+        }
+    }
+
+    fn restoreOne(self: *Job, item: JobTrashItem) !void {
+        if (item.original_path.len == 0) return error.MissingOriginalPath;
+        const st = try statPath(self.io, item.trash_path);
+        const parent = std.fs.path.dirname(item.original_path) orelse "/";
+        _ = std.Io.Dir.cwd().statFile(self.io, parent, .{ .follow_symlinks = true }) catch |err| switch (err) {
+            error.FileNotFound => return error.OriginalFolderMissing,
+            else => return err,
+        };
+
+        const base = std.fs.path.basename(item.original_path);
+        const target = if (pathExists(self.io, item.original_path))
+            try uniqueNameInDir(
+                self.gpa,
+                self.io,
+                parent,
+                base,
+                st.kind == .directory,
+            )
+        else
+            try self.gpa.dupe(u8, item.original_path);
+        defer self.gpa.free(target);
+
+        try self.movePath(item.trash_path, target);
+        if (item.info_path) |info_path| {
+            std.Io.Dir.deleteFileAbsolute(self.io, info_path) catch {};
+        }
+        _ = self.items_done.fetchAdd(1, .monotonic);
+    }
+
+    fn runPurge(self: *Job) !void {
+        for (self.trash_items.items) |item| {
+            try self.checkCancel();
+            if (pathExists(self.io, item.trash_path)) {
+                deletePath(self.io, item.trash_path) catch |err| {
+                    self.recordError(item.trash_path, err);
+                    continue;
+                };
+            }
+            if (item.info_path) |info_path| {
+                std.Io.Dir.deleteFileAbsolute(self.io, info_path) catch {};
+            }
+            _ = self.items_done.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn runEmptyTrash(self: *Job) !void {
+        const root = try trashDir(self.gpa);
+        defer self.gpa.free(root);
+
+        const subdirectories = [_]struct { name: []const u8, count: bool }{
+            .{ .name = "files", .count = true },
+            .{ .name = "info", .count = false },
+            .{ .name = "expunged", .count = false },
+        };
+        for (subdirectories) |subdirectory| {
+            const path = try std.fs.path.join(self.gpa, &.{ root, subdirectory.name });
+            defer self.gpa.free(path);
+            try self.emptyDirectory(path, subdirectory.count);
+        }
+    }
+
+    fn emptyDirectory(self: *Job, path: []const u8, count_items: bool) !void {
+        var dir = std.Io.Dir.openDirAbsolute(self.io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(self.io);
+
+        var iterator = dir.iterate();
+        while (true) {
+            try self.checkCancel();
+            const maybe_entry = try iterator.next(self.io);
+            const item = maybe_entry orelse break;
+            if (std.mem.eql(u8, item.name, ".") or std.mem.eql(u8, item.name, "..")) continue;
+
+            const child = try std.fs.path.join(self.gpa, &.{ path, item.name });
+            defer self.gpa.free(child);
+            try deletePath(self.io, child);
+            if (count_items) _ = self.items_done.fetchAdd(1, .monotonic);
+            _ = self.entries_done.fetchAdd(1, .monotonic);
+        }
+    }
+
     fn runDelete(self: *Job) !void {
         for (self.sources.items) |source| {
             try self.checkCancel();
@@ -680,6 +905,22 @@ pub const Job = struct {
     }
 };
 
+fn cloneTrashItem(gpa: std.mem.Allocator, item: TrashSpec) !JobTrashItem {
+    const trash_path = try gpa.dupe(u8, item.trash_path);
+    errdefer gpa.free(trash_path);
+    const original_path = try gpa.dupe(u8, item.original_path);
+    errdefer gpa.free(original_path);
+    const info_path = if (item.info_path) |path|
+        try gpa.dupe(u8, path)
+    else
+        null;
+    return .{
+        .trash_path = trash_path,
+        .original_path = original_path,
+        .info_path = info_path,
+    };
+}
+
 // ---- Pure helpers ---------------------------------------------------------
 
 /// Reject empty names, dot entries, path separators, and NUL bytes.
@@ -806,6 +1047,157 @@ pub fn uniqueNameInDir(
     return error.TooManyCollisions;
 }
 
+/// Decode the percent-encoded `Path=` value stored in a `.trashinfo` file.
+/// Invalid escapes are preserved literally so a damaged file can still be
+/// listed and removed from Trash.
+pub fn percentDecodePath(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(gpa);
+
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '%' and index + 2 < text.len) {
+            if (hexDigit(text[index + 1])) |high| {
+                if (hexDigit(text[index + 2])) |low| {
+                    try result.append(gpa, (high << 4) | low);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+        try result.append(gpa, text[index]);
+        index += 1;
+    }
+    return result.toOwnedSlice(gpa);
+}
+
+/// Parse the two fields the Trash view needs from `.trashinfo` content.
+pub fn parseTrashInfo(gpa: std.mem.Allocator, data: []const u8) !ParsedTrashInfo {
+    var encoded_path: ?[]const u8 = null;
+    var deletion_date: ?[]const u8 = null;
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.startsWith(u8, line, "Path=")) {
+            encoded_path = line["Path=".len..];
+        } else if (std.mem.startsWith(u8, line, "DeletionDate=")) {
+            deletion_date = std.mem.trim(u8, line["DeletionDate=".len..], " \t\r");
+        }
+    }
+
+    const encoded = encoded_path orelse return error.InvalidTrashInfo;
+    if (encoded.len == 0) return error.InvalidTrashInfo;
+
+    var parsed: ParsedTrashInfo = .{
+        .original_path = try percentDecodePath(gpa, encoded),
+    };
+    if (deletion_date) |date| {
+        parsed.deletion_len = @min(date.len, parsed.deletion_text.len);
+        @memcpy(parsed.deletion_text[0..parsed.deletion_len], date[0..parsed.deletion_len]);
+    }
+    return parsed;
+}
+
+/// List the entries in `$XDG_DATA_HOME/Trash/files`. Missing info files are
+/// tolerated, but such entries cannot be restored.
+pub fn listTrash(gpa: std.mem.Allocator, io: std.Io) !std.ArrayList(TrashEntry) {
+    var result: std.ArrayList(TrashEntry) = .empty;
+    errdefer {
+        for (result.items) |*entry| entry.deinit(gpa);
+        result.deinit(gpa);
+    }
+
+    const root = try trashDir(gpa);
+    defer gpa.free(root);
+    const files_dir = try std.fs.path.join(gpa, &.{ root, "files" });
+    defer gpa.free(files_dir);
+    const info_dir = try std.fs.path.join(gpa, &.{ root, "info" });
+    defer gpa.free(info_dir);
+
+    var dir = std.Io.Dir.openDirAbsolute(io, files_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return result,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (true) {
+        const maybe_entry = try iterator.next(io);
+        const item = maybe_entry orelse break;
+        if (std.mem.eql(u8, item.name, ".") or std.mem.eql(u8, item.name, "..")) continue;
+
+        const entry = readTrashEntry(gpa, io, files_dir, info_dir, item.name) catch continue;
+        result.append(gpa, entry) catch |err| {
+            var discard = entry;
+            discard.deinit(gpa);
+            return err;
+        };
+    }
+    return result;
+}
+
+fn readTrashEntry(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    files_dir: []const u8,
+    info_dir: []const u8,
+    stored_name: []const u8,
+) !TrashEntry {
+    const trash_path = try std.fs.path.join(gpa, &.{ files_dir, stored_name });
+    errdefer gpa.free(trash_path);
+    const stat = try std.Io.Dir.cwd().statFile(io, trash_path, .{ .follow_symlinks = false });
+
+    const info_name = try std.fmt.allocPrint(gpa, "{s}.trashinfo", .{stored_name});
+    defer gpa.free(info_name);
+    const info_path = try std.fs.path.join(gpa, &.{ info_dir, info_name });
+    errdefer gpa.free(info_path);
+
+    var original_path = try gpa.dupe(u8, "");
+    errdefer gpa.free(original_path);
+    var deletion_text: [19]u8 = std.mem.zeroes([19]u8);
+    var deletion_len: usize = 0;
+
+    if (std.Io.Dir.cwd().readFileAlloc(io, info_path, gpa, std.Io.Limit.limited(64 * 1024))) |data| {
+        defer gpa.free(data);
+        if (parseTrashInfo(gpa, data)) |info| {
+            gpa.free(original_path);
+            original_path = info.original_path;
+            deletion_text = info.deletion_text;
+            deletion_len = info.deletion_len;
+        } else |_| {}
+    } else |_| {}
+
+    const display_name = if (original_path.len > 0)
+        std.fs.path.basename(original_path)
+    else
+        stored_name;
+    const name = try gpa.dupe(u8, if (display_name.len > 0) display_name else stored_name);
+    errdefer gpa.free(name);
+
+    return .{
+        .name = name,
+        .trash_path = trash_path,
+        .original_path = original_path,
+        .info_path = info_path,
+        .deletion_text = deletion_text,
+        .deletion_len = deletion_len,
+        .is_dir = stat.kind == .directory,
+        .is_symlink = stat.kind == .sym_link,
+        .size = stat.size,
+        .mtime = stat.mtime.toSeconds(),
+    };
+}
+
+fn hexDigit(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
 pub fn dataHome(gpa: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("XDG_DATA_HOME")) |raw| {
         const xdg = std.mem.span(raw);
@@ -858,6 +1250,9 @@ pub fn describeError(err: anyerror) []const u8 {
         error.DestinationInsideSource => "cannot copy or move a folder into itself",
         error.UnsupportedFileType => "unsupported file type",
         error.InvalidName => "invalid name",
+        error.InvalidTrashInfo => "invalid trash metadata",
+        error.MissingOriginalPath => "the original location is unknown",
+        error.OriginalFolderMissing => "the original folder no longer exists",
         error.TooManyCollisions => "too many files with that name",
         error.NoHomeDirectory => "cannot determine the home folder",
         error.MissingSource => "missing source",
@@ -922,6 +1317,36 @@ test "trash info paths are percent encoded" {
         "/home/user/My%20Files/100%25%20done.txt",
         encoded,
     );
+}
+
+test "trash info paths are percent decoded" {
+    const gpa = std.testing.allocator;
+    const decoded = try percentDecodePath(gpa, "/home/user/My%20Files/100%25%20done.txt");
+    defer gpa.free(decoded);
+    try std.testing.expectEqualStrings("/home/user/My Files/100% done.txt", decoded);
+
+    const invalid = try percentDecodePath(gpa, "/tmp/100%ZZ");
+    defer gpa.free(invalid);
+    try std.testing.expectEqualStrings("/tmp/100%ZZ", invalid);
+}
+
+test "trash info parser reads path and deletion date" {
+    const gpa = std.testing.allocator;
+    const parsed = try parseTrashInfo(
+        gpa,
+        "[Trash Info]\nPath=/home/user/My%20Files/song.flac\nDeletionDate=2026-11-15T09:30:00\n",
+    );
+    defer gpa.free(parsed.original_path);
+    try std.testing.expectEqualStrings("/home/user/My Files/song.flac", parsed.original_path);
+    try std.testing.expectEqualStrings("2026-11-15T09:30:00", parsed.deletion_text[0..parsed.deletion_len]);
+    try std.testing.expectError(error.InvalidTrashInfo, parseTrashInfo(gpa, "[Trash Info]\n"));
+}
+
+test "trash location detection" {
+    try std.testing.expect(isTrashLocation("trash:///"));
+    try std.testing.expect(isTrashLocation(" TRASH:// "));
+    try std.testing.expect(isTrashLocation("trash:"));
+    try std.testing.expect(!isTrashLocation("/home/user/Trash"));
 }
 
 test "trash info deletion date is UTC" {

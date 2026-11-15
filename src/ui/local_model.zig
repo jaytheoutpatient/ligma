@@ -1,6 +1,8 @@
 const std = @import("std");
 const qt6 = @import("libqt6zig");
 
+const file_ops = @import("../core/file_ops.zig");
+
 const QAbstractItemModel = qt6.QAbstractItemModel;
 const QMimeData = qt6.QMimeData;
 const QModelIndex = qt6.QModelIndex;
@@ -8,6 +10,8 @@ const QUrl = qt6.QUrl;
 const QVariant = qt6.QVariant;
 
 const qnamespace_enums = qt6.qnamespace_enums;
+
+pub const Location = enum { directory, trash };
 
 /// A flat, single-folder item model backed by a directory snapshot.
 ///
@@ -26,6 +30,7 @@ pub const LocalModel = struct {
     qt: QAbstractItemModel,
 
     root_path: ?[]u8 = null,
+    location: Location = .directory,
     entries: std.ArrayList(Entry) = .empty,
     visible: std.ArrayList(usize) = .empty,
 
@@ -55,16 +60,34 @@ pub const LocalModel = struct {
 
     pub const Entry = struct {
         name: []u8,
+        /// Real path on disk. In Trash this is the file inside `Trash/files`.
         path: []u8,
         is_dir: bool,
         is_symlink: bool,
         size: u64,
         mtime: i64,
+        /// Set only for Trash entries.
+        original_path: ?[]u8 = null,
+        info_path: ?[]u8 = null,
+        deletion_text: [19]u8 = std.mem.zeroes([19]u8),
+        deletion_len: usize = 0,
 
         fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
             gpa.free(self.name);
             gpa.free(self.path);
+            if (self.original_path) |path| gpa.free(path);
+            if (self.info_path) |path| gpa.free(path);
             self.* = undefined;
+        }
+
+        pub fn deletedLabel(self: *const Entry, buffer: []u8) []const u8 {
+            if (self.deletion_len == 0) return "—";
+            const text = self.deletion_text[0..self.deletion_len];
+            const length = @min(text.len, buffer.len);
+            @memcpy(buffer[0..length], text[0..length]);
+            if (length > 10 and buffer[10] == 'T') buffer[10] = ' ';
+            if (length > 16) return buffer[0..16];
+            return buffer[0..length];
         }
     };
 
@@ -147,6 +170,10 @@ pub const LocalModel = struct {
         return self.root_path;
     }
 
+    pub fn isTrash(self: *const LocalModel) bool {
+        return self.location == .trash;
+    }
+
     /// Start loading `path`, cancelling any previous snapshot request.
     pub fn load(self: *LocalModel, path: []const u8) void {
         const new_root = self.gpa.dupe(u8, path) catch {
@@ -157,6 +184,7 @@ pub const LocalModel = struct {
         self.cancelActive();
         self.freeRoot();
         self.root_path = new_root;
+        self.location = if (file_ops.isTrashLocation(new_root)) .trash else .directory;
         self.clearError();
         self.generation +%= 1;
 
@@ -314,10 +342,19 @@ pub const LocalModel = struct {
     fn rebuildVisible(self: *LocalModel) void {
         self.visible.clearRetainingCapacity();
         const filter = self.filter orelse "";
+        const trash = self.location == .trash;
 
         for (self.entries.items, 0..) |entry, index| {
-            if (!self.show_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
-            if (filter.len > 0 and !entry.is_dir and !containsIgnoreCase(entry.name, filter)) continue;
+            if (!trash and !self.show_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
+            if (filter.len > 0) {
+                if (trash) {
+                    const original = entry.original_path orelse "";
+                    if (!containsIgnoreCase(entry.name, filter) and
+                        !containsIgnoreCase(original, filter)) continue;
+                } else if (!entry.is_dir and !containsIgnoreCase(entry.name, filter)) {
+                    continue;
+                }
+            }
             self.visible.append(self.gpa, index) catch return;
         }
 
@@ -332,7 +369,22 @@ pub const LocalModel = struct {
         // users expect from a file manager even when sorting by size or date.
         if (a.is_dir != b.is_dir) return a.is_dir;
 
-        const order = switch (self.sort_column) {
+        const order = if (self.location == .trash)
+            switch (self.sort_column) {
+                0 => std.ascii.orderIgnoreCase(a.name, b.name),
+                1 => std.ascii.orderIgnoreCase(
+                    a.original_path orelse "",
+                    b.original_path orelse "",
+                ),
+                2 => std.mem.order(
+                    u8,
+                    a.deletion_text[0..a.deletion_len],
+                    b.deletion_text[0..b.deletion_len],
+                ),
+                3 => std.math.order(a.size, b.size),
+                else => std.ascii.orderIgnoreCase(a.name, b.name),
+            }
+        else switch (self.sort_column) {
             0 => std.ascii.orderIgnoreCase(a.name, b.name),
             1 => std.math.order(a.size, b.size),
             2 => std.math.order(kindRank(a), kindRank(b)),
@@ -468,6 +520,8 @@ const LoadJob = struct {
     }
 
     fn scan(self: *LoadJob) !void {
+        if (file_ops.isTrashLocation(self.path)) return self.scanTrash();
+
         var dir = try std.Io.Dir.openDirAbsolute(self.io, self.path, .{ .iterate = true });
         defer dir.close(self.io);
 
@@ -510,7 +564,53 @@ const LoadJob = struct {
             });
         }
     }
+
+    fn scanTrash(self: *LoadJob) !void {
+        var trash_entries = try file_ops.listTrash(self.gpa, self.io);
+        defer {
+            for (trash_entries.items) |*entry| entry.deinit(self.gpa);
+            trash_entries.deinit(self.gpa);
+        }
+
+        for (trash_entries.items) |entry| {
+            if (self.cancel.load(.acquire)) return error.Cancelled;
+
+            const copy = try copyTrashEntry(self.gpa, entry);
+            self.entries.append(self.gpa, copy) catch |err| {
+                var discard = copy;
+                discard.deinit(self.gpa);
+                return err;
+            };
+        }
+    }
 };
+
+fn copyTrashEntry(gpa: std.mem.Allocator, entry: file_ops.TrashEntry) !LocalModel.Entry {
+    const name = try gpa.dupe(u8, entry.name);
+    errdefer gpa.free(name);
+    const path = try gpa.dupe(u8, entry.trash_path);
+    errdefer gpa.free(path);
+    const original_path = if (entry.original_path.len > 0)
+        try gpa.dupe(u8, entry.original_path)
+    else
+        null;
+    errdefer if (original_path) |value| gpa.free(value);
+    const info_path = try gpa.dupe(u8, entry.info_path);
+    errdefer gpa.free(info_path);
+
+    return .{
+        .name = name,
+        .path = path,
+        .is_dir = entry.is_dir,
+        .is_symlink = entry.is_symlink,
+        .size = entry.size,
+        .mtime = entry.mtime,
+        .original_path = original_path,
+        .info_path = info_path,
+        .deletion_text = entry.deletion_text,
+        .deletion_len = entry.deletion_len,
+    };
+}
 
 // ---- Qt virtual callbacks -------------------------------------------------
 
@@ -581,6 +681,16 @@ fn onData(
     const entry = self.entryAt(index) orelse return emptyVariant();
 
     if (role == qnamespace_enums.ItemDataRole.DisplayRole) {
+        if (self.location == .trash) {
+            var deleted_buffer: [32]u8 = undefined;
+            return switch (index.column()) {
+                0 => stringVariant(entry.name),
+                1 => stringVariant(entry.original_path orelse "—"),
+                2 => stringVariant(entry.deletedLabel(&deleted_buffer)),
+                3 => if (entry.is_dir) emptyVariant() else stringVariant(formatSize(entry.size)),
+                else => emptyVariant(),
+            };
+        }
         return switch (index.column()) {
             0 => stringVariant(entry.name),
             1 => if (entry.is_dir) emptyVariant() else stringVariant(formatSize(entry.size)),
@@ -591,10 +701,22 @@ fn onData(
     }
 
     if (role == qnamespace_enums.ItemDataRole.ToolTipRole) {
+        if (self.location == .trash) {
+            var deleted_buffer: [32]u8 = undefined;
+            var buffer: [4096]u8 = undefined;
+            const original = entry.original_path orelse "Unknown original location";
+            const text = std.fmt.bufPrint(
+                &buffer,
+                "Original location: {s}\nDeleted: {s}\nTrash file: {s}",
+                .{ original, entry.deletedLabel(&deleted_buffer), entry.path },
+            ) catch entry.path;
+            return stringVariant(text);
+        }
         return stringVariant(entry.path);
     }
 
-    if (role == qnamespace_enums.ItemDataRole.TextAlignmentRole and index.column() == 1) {
+    const size_column: i32 = if (self.location == .trash) 3 else 1;
+    if (role == qnamespace_enums.ItemDataRole.TextAlignmentRole and index.column() == size_column) {
         return QVariant.new4(text_align_right | text_align_vcenter);
     }
 
@@ -607,9 +729,19 @@ fn onHeaderData(
     orientation: i32,
     role: i32,
 ) callconv(.c) QVariant {
-    if (findModel(model) == null) return emptyVariant();
+    const self = findModel(model) orelse return emptyVariant();
     if (orientation != qnamespace_enums.Orientation.Horizontal) return emptyVariant();
     if (role != qnamespace_enums.ItemDataRole.DisplayRole) return emptyVariant();
+
+    if (self.location == .trash) {
+        return switch (section) {
+            0 => stringVariant("Name"),
+            1 => stringVariant("Original Location"),
+            2 => stringVariant("Deleted"),
+            3 => stringVariant("Size"),
+            else => emptyVariant(),
+        };
+    }
 
     return switch (section) {
         0 => stringVariant("Name"),
@@ -622,11 +754,14 @@ fn onHeaderData(
 
 fn onFlags(model: QAbstractItemModel, index: QModelIndex) callconv(.c) i32 {
     const self = findModel(model) orelse return 0;
-    if (!index.isValid()) return qnamespace_enums.ItemFlag.ItemIsDropEnabled;
+    if (!index.isValid()) {
+        return if (self.location == .trash) 0 else qnamespace_enums.ItemFlag.ItemIsDropEnabled;
+    }
 
     var flags = qnamespace_enums.ItemFlag.ItemIsEnabled |
         qnamespace_enums.ItemFlag.ItemIsSelectable |
         qnamespace_enums.ItemFlag.ItemIsDragEnabled;
+    if (self.location == .trash) return flags & ~qnamespace_enums.ItemFlag.ItemIsDragEnabled;
     if (self.entryAt(index)) |entry| {
         if (entry.is_dir) flags |= qnamespace_enums.ItemFlag.ItemIsDropEnabled;
     }
@@ -666,6 +801,7 @@ fn onMimeTypes(_: QAbstractItemModel) callconv(.c) ?[*:null]?[*:0]const u8 {
 fn onMimeData(model: QAbstractItemModel, indexes: qt6.C.libqt_list) callconv(.c) QMimeData {
     const mime = QMimeData.new();
     const self = findModel(model) orelse return mime;
+    if (self.location == .trash) return mime;
     if (indexes.len == 0 or indexes.data == null) return mime;
 
     var urls: std.ArrayList(QUrl) = .empty;
@@ -717,6 +853,7 @@ fn onCanDropMimeData(
     parent: QModelIndex,
 ) callconv(.c) bool {
     const self = findModel(model) orelse return false;
+    if (self.location == .trash) return false;
     if (action != qnamespace_enums.DropAction.CopyAction and
         action != qnamespace_enums.DropAction.MoveAction) return false;
     const dest = dropDestination(self, parent) orelse return false;
@@ -736,6 +873,7 @@ fn onDropMimeData(
     parent: QModelIndex,
 ) callconv(.c) bool {
     const self = findModel(model) orelse return false;
+    if (self.location == .trash) return false;
     if (action != qnamespace_enums.DropAction.CopyAction and
         action != qnamespace_enums.DropAction.MoveAction) return false;
     const dest = dropDestination(self, parent) orelse return false;
@@ -763,6 +901,7 @@ fn freeSourceList(gpa: std.mem.Allocator, sources: *std.ArrayList([]const u8)) v
 /// Resolve the folder that receives a drop. Qt passes the folder row as the
 /// parent when dropping onto it, and an invalid index over empty space.
 fn dropDestination(self: *LocalModel, parent: QModelIndex) ?[]const u8 {
+    if (self.location == .trash) return null;
     if (parent.isValid()) {
         if (self.entryAt(parent)) |entry| {
             if (entry.is_dir) return entry.path;

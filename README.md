@@ -32,7 +32,7 @@ This repository contains a working **v0.5 prototype**:
 
 - Zig 0.17 + Qt 6.12 via [`libqt6zig`](https://github.com/rcalixte/libqt6zig)
 - Places sidebar, details view, item count, and window title
-- **Custom item model** — `src/ui/local_model.zig` lists folders on a worker thread, polls snapshots from the UI, and renders Name/Size/Kind/Modified columns
+- **Custom item model** — `src/ui/local_model.zig` lists folders and Trash on a worker thread, polls snapshots from the UI, and renders folder or trash-specific columns
 - Back / forward / up / home / reload navigation with per-pane history
 - Editable path bar with `~`, relative-path, and `file://` resolution
 - In-memory current-folder filter and folder-first sorting by any column
@@ -42,10 +42,10 @@ This repository contains a working **v0.5 prototype**:
 - **Split view** — `F3` toggles, `F6` focuses the other pane; panes keep independent history and filters
 - **Global filename search** — `Ctrl+Shift+F`, streamed results in a search dock
 - **SQLite FTS5 search index** — automatic background build, trigram substring matching, status-bar health, and `View > Rebuild Search Index`
-- **Async file operations** — copy, cut, paste, rename, new folder, trash, permanent delete, and undo, all on a worker thread with progress and cancellation
-- **Context menu file actions** — right-click any row for *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, and *Delete Permanently*. Right-clicking an unselected row targets it first, right-clicking a selected row keeps a multi-selection, and right-clicking empty space clears the selection while leaving *Paste* and *New Folder* available. *Properties* reports name, kind, size, location, modified time, and permissions, or the count and total size of a multi-selection
+- **Async file operations** — copy, cut, paste, rename, new folder, trash, restore, permanent delete, empty Trash, and undo, all on a worker thread with progress and cancellation
+- **Context menu file actions** — right-click any row for *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, and *Delete Permanently*. In Trash, the same menu offers *Restore*, *Properties*, *Delete Permanently*, and *Empty Trash…*. Right-clicking an unselected row targets it first, right-clicking a selected row keeps a multi-selection, and right-clicking empty space clears the selection while leaving folder-wide actions available. *Properties* reports name, kind, size, location, modified time, and permissions, or the count and total size of a multi-selection
 - **Drag and drop** — drag selected rows to move them, or hold Ctrl to copy. Drop onto a folder row or into a pane's empty space. Drags from other applications always copy, same-folder drops are no-ops, and collisions use the same `name (1).ext` naming as paste
-- **Freedesktop.org trash** — `Path=`/`DeletionDate=` `.trashinfo` files, collision-safe names, and restore via undo
+- **Freedesktop.org Trash** — a dedicated **Trash** place browses `Trash/files`, shows each item's original location and deletion date, and supports **Restore**, **Delete Permanently**, and **Empty Trash**. Trash contents use `Path=`/`DeletionDate=` `.trashinfo` files, collision-safe storage names, and restore conflicts use `name (1).ext`; restoring is also available through undo for a just-trashed batch
 - **Undo journal** — the last completed batch can be reversed with `Ctrl+Z`, including copies, moves, renames, new folders, and trashed items
 - **Custom Places bookmarks** — right-click a folder and choose *Add to Places* to pin it to the sidebar; right-click a user-added entry to remove it. Bookmarks persist in `$XDG_CONFIG_HOME/ligma/places` (or `~/.config/ligma/places`)
 - **Embedded terminal** — `F12` toggles a terminal panel docked on the right; the first open starts the user's shell in the active folder, and the session survives hiding and reopening
@@ -57,7 +57,7 @@ This repository contains a working **v0.5 prototype**:
 
 Search falls back to a cancellable breadth-first filename scan while the index is building, when no index exists, or when the active folder is outside the indexed root.
 
-Not implemented yet: trash browsing, file watching, metadata, remote locations, archives, and extensions. See the roadmap in the spec.
+Not implemented yet: file watching, metadata, remote locations, archives, and extensions. See the roadmap in the spec.
 
 ## Preview panel
 
@@ -149,11 +149,13 @@ The schema uses SQLite FTS5 external-content tables (`files`, `files_fts`, and a
 
 ## File operations
 
-- Copy, cut, paste, rename, new folder, move to trash, and permanent delete run on a background worker thread. The UI stays responsive and shows progress in the status bar.
+- Copy, cut, paste, rename, new folder, move to trash, restore, permanent delete, and empty Trash run on a background worker thread. The UI stays responsive and shows progress in the status bar.
 - `Escape` cancels the running operation. Partial output from the current item is removed; items that already finished remain and are still undoable.
 - Copy and move never overwrite an existing name. Collisions become `name (1).ext`, `name (2).ext`, and so on.
 - Moves use `rename(2)` when possible and fall back to copy-plus-delete across devices.
-- Trash uses `$XDG_DATA_HOME/Trash`, falling back to `~/.local/share/Trash`, and writes freedesktop.org `.trashinfo` metadata. `Ctrl+Z` restores a trashed item and removes its metadata.
+- Trash uses `$XDG_DATA_HOME/Trash`, falling back to `~/.local/share/Trash`, and writes freedesktop.org `.trashinfo` metadata. `Ctrl+Z` restores a just-trashed item and removes its metadata.
+- The **Trash** place lists items from `Trash/files` with their original location and deletion date. Double-click or press Enter to restore the selection; right-click for *Restore*, *Delete Permanently*, or *Empty Trash…*. Restore recreates the original path, uses `name (1).ext` when something already exists there, and fails without deleting the item when the original parent folder is gone.
+- *Delete Permanently* and *Empty Trash…* remove both the stored item and its `.trashinfo` metadata, and both require confirmation. These actions are not undoable.
 - Undo covers the most recent completed batch. The journal is in memory, is not persisted across restarts, and undo jobs cannot themselves be undone.
 - Only one file operation runs at a time. Starting another while one is active is rejected with a status message.
 
@@ -280,12 +282,14 @@ sudo update-desktop-database /usr/share/applications
 | `Ctrl+Shift+N` | New folder |
 | `F2` | Rename |
 | `Ctrl+Return` | Run the selected executable (with confirmation) |
-| `Delete` | Move to Trash |
-| `Shift+Delete` | Delete permanently |
+| `Delete` | Move to Trash (disabled while browsing Trash) |
+| `Shift+Delete` | Delete permanently, including from Trash |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / cut / paste |
 | `Ctrl+Z` | Undo last completed file operation |
 | `Escape` | Cancel the running file operation |
 | `Ctrl+Q` | Quit |
+
+In Trash, **Enter** or double-click restores the selected items; **Shift+Delete** deletes them permanently.
 
 ## Project layout
 
@@ -303,7 +307,7 @@ src/ui/music_engine.cpp GStreamer C ABI engine (Output/DSP/ALSA)
 src/ui/music_engine.zig Zig bridge for the GStreamer engine
 src/core/musicbrainz.zig optional MusicBrainz metadata enrichment
 assets/                 .desktop entry and hicolor icon set
-src/core/file_ops.zig  async copy/move/trash/delete/rename/mkdir/undo engine
+src/core/file_ops.zig  async copy/move/trash/restore/purge/delete/rename/mkdir/undo engine
 src/core/paths.zig     path and file:// resolution
 src/core/search_scan.zig  cancellable live filename scanner
 src/core/search_index.zig SQLite FTS5 index, reader, background builder
@@ -320,7 +324,7 @@ The binding is MIT-licensed. Qt itself is LGPL-licensed; distribution must meet 
 
 ## Near-term plan
 
-1. Add trash browsing through the model's VFS layer and per-folder view state.
+1. Add per-mount `.Trash-$uid` support and per-folder view state.
 2. Add file watching so views refresh without a manual reload.
 3. Add incremental search indexing with inotify and a query language.
 4. Then move to metadata, previews, remote locations, and extensions.
