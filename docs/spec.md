@@ -407,6 +407,7 @@ src/
     player.zig             music player UI, repeat/shuffle, playlist, Discord
     music_engine.cpp       GStreamer C ABI engine (PipeWire/ALSA, DSP)
     music_engine.zig       Zig bridge for the GStreamer engine
+    mounts.zig             mounted-volume discovery for the Drives list
     status_bar.zig
   platform/
     linux/
@@ -848,7 +849,9 @@ These need a product decision before the relevant phase:
 Implemented in the v0.5 prototype:
 
 - Zig 0.17 + Qt 6.12 window using `libqt6zig`, split into `main.zig`, `app.zig`, `ui/`, and `core/`.
-- Places sidebar (Home, XDG folders, Trash, Filesystem).
+- Places sidebar (Home, XDG folders, Trash, Filesystem) plus a **Drives** section populated from `QStorageInfo`.
+- Compact Places and Drives lists that size to their content and scroll after a window-relative height cap.
+- Automatic directory refresh through `QFileSystemWatcher` for every open pane and for `Trash/files`/`Trash/info`; events are coalesced and selection plus scroll position are restored after the snapshot reset.
 - Back/forward/up/home/reload navigation with independent per-pane history.
 - Editable path bar with `~`, relative-path, and `file://` resolution.
 - Custom `LocalModel` (`src/ui/local_model.zig`) replacing `QFileSystemModel`: worker-thread folder enumeration, UI-timer polling, and a flat details snapshot.
@@ -875,7 +878,8 @@ Implemented in the v0.5 prototype:
 Known prototype limitations (addressed in later phases):
 
 - The model is a flat single-folder snapshot: no tree expansion, icons, thumbnails, or per-folder view state yet.
-- No filesystem watcher yet; external changes appear after a manual reload (`F5`) or the next file operation.
+- Directory watchers cover entry creates, deletes, renames, and moves. In-place edits that only change an existing file's contents may still need a manual reload (`F5`).
+- Mounted drives are polled every 2 seconds through `QStorageInfo`; mount/unmount actions and UDisks2 integration are not implemented yet.
 - Trash browsing uses the home Trash directory only; per-mount `.Trash-$uid` locations are not implemented yet.
 - Restore, permanent delete, and empty Trash are not undoable. Undo only reverses the original move-to-Trash batch.
 - Executables run detached without a terminal, allow-list, or remembered confirmation, so command-line tools with no GUI produce no visible output.
@@ -892,4 +896,4 @@ Known prototype limitations (addressed in later phases):
 - Place selection does not follow path-bar navigation.
 - Filter is a case-insensitive substring over file names; wildcards and regex are not supported yet, and directories remain visible.
 
-The next engineering step is adding per-mount `.Trash-$uid` support and per-folder view state, followed by incremental file watching and search indexing. New features should continue moving into `src/core/` and `src/ui/` rather than accumulating in `app.zig`.
+The next engineering step is adding per-mount `.Trash-$uid` support and per-folder view state, followed by incremental search indexing. New features should continue moving into `src/core/` and `src/ui/` rather than accumulating in `app.zig`.

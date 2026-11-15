@@ -31,8 +31,11 @@ Read the full product and technical specification in [`docs/spec.md`](docs/spec.
 This repository contains a working **v0.5 prototype**:
 
 - Zig 0.17 + Qt 6.12 via [`libqt6zig`](https://github.com/rcalixte/libqt6zig)
-- Places sidebar, details view, item count, and window title
+- Places and Drives sidebar, details view, item count, and window title
 - **Custom item model** — `src/ui/local_model.zig` lists folders and Trash on a worker thread, polls snapshots from the UI, and renders folder or trash-specific columns
+- **Live folder refresh** — watches every open pane and the Trash directory, coalesces filesystem events, reloads the affected snapshots, and restores the selection
+- **Mounted drives** — a **Drives** section under Places lists real mounted volumes with labels, mount paths, filesystem types, and free-space tooltips; it updates automatically when drives appear or disappear
+- **Compact sidebar** — the Places and Drives lists size themselves to their contents and scroll once they reach a height cap, instead of leaving a large empty box
 - Back / forward / up / home / reload navigation with per-pane history
 - Editable path bar with `~`, relative-path, and `file://` resolution
 - In-memory current-folder filter and folder-first sorting by any column
@@ -57,11 +60,11 @@ This repository contains a working **v0.5 prototype**:
 
 Search falls back to a cancellable breadth-first filename scan while the index is building, when no index exists, or when the active folder is outside the indexed root.
 
-Not implemented yet: file watching, metadata, remote locations, archives, and extensions. See the roadmap in the spec.
+Not implemented yet: metadata, remote locations, archives, and extensions. See the roadmap in the spec.
 
 ## Preview panel
 
-Selecting exactly one file whose MIME type is `image/` or `video/*` shows a thumbnail in a small panel at the bottom of the Places sidebar. The panel hides for folders, text files, multi-selections, and empty selections.
+Selecting exactly one file whose MIME type is `image/` or `video/*` shows a thumbnail in a small panel at the bottom of the sidebar, below Places and Drives. The panel hides for folders, text files, multi-selections, and empty selections.
 
 - Images are decoded with `QImageReader` straight into the display size, so opening a large photo never allocates the full image.
 - Video thumbnails are extracted by an asynchronous `ffmpeg -ss 1 -frames:v 1` job into a temporary PNG; videos shorter than the one-second seek are retried from frame 0.
@@ -143,7 +146,7 @@ While a track is playing, Ligma publishes the song title and artist/album to a r
 - The search dock and status bar show whether a query was served by the index or the live scanner.
 - Rebuild at any time with `View > Rebuild Search Index`.
 - Set `LIGMA_SKIP_INDEX=1` to disable automatic index builds. An existing completed index is still used.
-- There is no incremental watcher yet; rebuild after large filesystem changes.
+- The index has no incremental watcher yet; rebuild after large filesystem changes.
 
 The schema uses SQLite FTS5 external-content tables (`files`, `files_fts`, and a trigram table) in WAL mode. Queries of three or more characters use the trigram index; shorter queries use an escaped `LIKE` scan.
 
@@ -158,6 +161,14 @@ The schema uses SQLite FTS5 external-content tables (`files`, `files_fts`, and a
 - *Delete Permanently* and *Empty Trash…* remove both the stored item and its `.trashinfo` metadata, and both require confirmation. These actions are not undoable.
 - Undo covers the most recent completed batch. The journal is in memory, is not persisted across restarts, and undo jobs cannot themselves be undone.
 - Only one file operation runs at a time. Starting another while one is active is rejected with a status message.
+
+## Automatic refresh and drives
+
+- `QFileSystemWatcher` watches every open pane's current folder plus `Trash/files` and `Trash/info`. Events are coalesced for 180 ms, then the relevant snapshots reload.
+- Creates, deletes, renames, moves between folders, and Trash changes update counts and rows without a manual reload. Selected paths and the scroll position are captured before the snapshot reset and restored afterward when they still exist.
+- Directory watches report directory-entry changes. An in-place save that only changes an existing file's contents may still need `F5`.
+- Mounted volumes are refreshed every 2 seconds with `QStorageInfo`. The **Drives** list excludes pseudo-filesystems and snap loop devices, sorts by label, and shows the mount path, device, filesystem, and free space in each row's tooltip.
+- The Places and Drives lists collapse to their content height. When they exceed a fraction of the window height they get scrollbars, leaving the remaining sidebar space outside the boxes.
 
 ## Drag and drop
 
@@ -300,6 +311,7 @@ build.zig.zon          pinned libqt6zig dependency and package metadata
 src/main.zig           Qt entrypoint
 src/app.zig            window, tabs, panes, navigation, search and file-operation UI
 src/ui/local_model.zig  async flat directory model with filter and sort
+src/ui/mounts.zig       QStorageInfo-backed mounted-drive discovery
 src/ui/terminal.zig     Zig wrapper for the embedded terminal panel
 src/ui/terminal_widget.cpp  QTermWidget C ABI shim (compiled with g++)
 src/ui/player.zig       music player UI, playlist, repeat/shuffle, Discord
@@ -325,9 +337,8 @@ The binding is MIT-licensed. Qt itself is LGPL-licensed; distribution must meet 
 ## Near-term plan
 
 1. Add per-mount `.Trash-$uid` support and per-folder view state.
-2. Add file watching so views refresh without a manual reload.
-3. Add incremental search indexing with inotify and a query language.
-4. Then move to metadata, previews, remote locations, and extensions.
+2. Add incremental search indexing with inotify and a query language.
+3. Then move to metadata, previews, remote locations, and extensions.
 
 ## License
 

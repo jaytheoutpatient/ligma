@@ -6,6 +6,7 @@ const paths = @import("core/paths.zig");
 const search_index = @import("core/search_index.zig");
 const search_scan = @import("core/search_scan.zig");
 const local_model = @import("ui/local_model.zig");
+const mounts = @import("ui/mounts.zig");
 const player_mod = @import("ui/player.zig");
 const preview_mod = @import("ui/preview.zig");
 const terminal_mod = @import("ui/terminal.zig");
@@ -16,6 +17,7 @@ const QDesktopServices = qt6.QDesktopServices;
 const QDir = qt6.QDir;
 const QDockWidget = qt6.QDockWidget;
 const QFileInfo = qt6.QFileInfo;
+const QFileSystemWatcher = qt6.QFileSystemWatcher;
 const QHBoxLayout = qt6.QHBoxLayout;
 const QIcon = qt6.QIcon;
 const QInputDialog = qt6.QInputDialog;
@@ -66,6 +68,10 @@ pub const Pane = struct {
     history_index: usize = 0,
     current_path: ?[]u8 = null,
     trash_view: bool = false,
+    /// Paths to reselect after an automatic or manual snapshot refresh.
+    pending_selection: std.ArrayList([]u8) = .empty,
+    pending_scroll: i32 = 0,
+    has_pending_scroll: bool = false,
 };
 
 pub const Tab = struct {
@@ -89,6 +95,14 @@ const App = struct {
     tabs: QTabWidget,
     main_splitter: QSplitter,
     places: QListWidget,
+    drives_label: QLabel,
+    drives: QListWidget,
+    mount_places: std.ArrayList(mounts.Volume) = .empty,
+    drives_updating: bool = false,
+    mount_timer: QTimer,
+    fs_watcher: QFileSystemWatcher,
+    fs_watch_paths: std.ArrayList([]u8) = .empty,
+    fs_refresh_timer: QTimer,
     status: QStatusBar,
     count_label: QLabel,
 
@@ -161,6 +175,7 @@ const App = struct {
     show_hidden: bool = false,
     suppress_filter: bool = false,
     tabs_updating: bool = false,
+    status_hold_until_ms: i64 = 0,
 
     tabs_list: std.ArrayList(*Tab) = .empty,
     panes_list: std.ArrayList(*Pane) = .empty,
@@ -227,16 +242,26 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const places = QListWidget.new(sidebar);
     places.setUniformItemSizes(true);
     places.setSpacing(1);
+    places.setVerticalScrollBarPolicy(qnamespace_enums.ScrollBarPolicy.ScrollBarAsNeeded);
     sidebar_layout.addWidget(places);
+
+    const drives_label = QLabel.new3("Drives");
+    drives_label.hide();
+    sidebar_layout.addWidget(drives_label);
+
+    const drives = QListWidget.new(sidebar);
+    drives.setUniformItemSizes(true);
+    drives.setSpacing(1);
+    drives.setVerticalScrollBarPolicy(qnamespace_enums.ScrollBarPolicy.ScrollBarAsNeeded);
+    drives.hide();
+    sidebar_layout.addWidget(drives);
+
     sidebar_layout.addStretch();
 
     // Bottom-left preview: selecting a single image or video shows a larger
-    // thumbnail here, under the Places sidebar.
+    // thumbnail here, under the Places and Drives lists.
     const preview_panel = preview_mod.PreviewPanel.create(init.gpa, init.io);
     sidebar_layout.addWidget(preview_panel.container);
-    // The Places list keeps the spare vertical space; the preview panel sits
-    // at the bottom with its natural height.
-    sidebar_layout.setStretch(1, 1);
 
     main_splitter.addWidget(sidebar);
 
@@ -327,6 +352,16 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
 
     const model_timer = QTimer.new2(window);
     model_timer.setInterval(50);
+
+    // Directory watches are coalesced into one snapshot refresh so a batch
+    // move or delete does not restart the loader once per inotify event.
+    const fs_watcher = QFileSystemWatcher.new3(window);
+    const fs_refresh_timer = QTimer.new2(window);
+    fs_refresh_timer.setSingleShot(true);
+    fs_refresh_timer.setInterval(180);
+
+    const mount_timer = QTimer.new2(window);
+    mount_timer.setInterval(2000);
 
     const status = window.statusBar();
     const count_label = QLabel.new3("");
@@ -486,6 +521,11 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .tabs = tabs,
         .main_splitter = main_splitter,
         .places = places,
+        .drives_label = drives_label,
+        .drives = drives,
+        .mount_timer = mount_timer,
+        .fs_watcher = fs_watcher,
+        .fs_refresh_timer = fs_refresh_timer,
         .status = status,
         .count_label = count_label,
         .preview = preview_panel,
@@ -531,6 +571,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .undo_action = undo_action,
     };
 
+    file_ops.ensureTrashDirs(init.gpa, init.io) catch {};
+
     addPlace("Home", home);
     addChildPlace(home, "Desktop");
     addChildPlace(home, "Documents");
@@ -542,10 +584,16 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     addPlace("Filesystem", "/");
     app.place_builtin_count = app.place_paths.items.len;
     loadCustomPlaces();
+    refreshMountedPlaces();
+    updateSidebarHeights();
 
     places.setContextMenuPolicy(qnamespace_enums.ContextMenuPolicy.CustomContextMenu);
     places.onCustomContextMenuRequested(onPlacesContextMenu);
     places.onCurrentRowChanged(onPlaceSelected);
+    drives.onCurrentRowChanged(onDriveSelected);
+    fs_watcher.onDirectoryChanged(onFsDirectoryChanged);
+    fs_refresh_timer.onTimeout(onFsRefreshTimer);
+    mount_timer.onTimeout(onMountTimer);
     terminal_dock.onVisibilityChanged(onTerminalVisibilityChanged);
     player_dock.onVisibilityChanged(onPlayerVisibilityChanged);
     tabs.onCurrentChanged(onTabChanged);
@@ -561,6 +609,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const first_tab = createTab(home);
     window.show();
     model_timer.start(50);
+    mount_timer.start(2000);
     initSearchIndex(home);
     if (first_tab.panes[0]) |pane| pane.tree.setFocus();
 
@@ -584,6 +633,12 @@ fn shutdown() void {
 
     app.model_timer.stop();
     app.file_timer.stop();
+    app.fs_refresh_timer.stop();
+    app.mount_timer.stop();
+    for (app.fs_watch_paths.items) |path| app.gpa.free(path);
+    app.fs_watch_paths.deinit(app.gpa);
+    for (app.mount_places.items) |*volume| volume.deinit(app.gpa);
+    app.mount_places.deinit(app.gpa);
     if (app.file_job) |job| {
         job.requestCancel();
         job.deinit();
@@ -617,6 +672,8 @@ fn shutdown() void {
         pane.model.destroy();
         for (pane.history.items) |path| app.gpa.free(path);
         pane.history.deinit(app.gpa);
+        for (pane.pending_selection.items) |path| app.gpa.free(path);
+        pane.pending_selection.deinit(app.gpa);
         if (pane.current_path) |path| app.gpa.free(path);
         app.gpa.destroy(pane);
     }
@@ -736,6 +793,8 @@ fn destroyPaneData(pane: *Pane) void {
     pane.model.destroy();
     for (pane.history.items) |path| app.gpa.free(path);
     pane.history.deinit(app.gpa);
+    for (pane.pending_selection.items) |path| app.gpa.free(path);
+    pane.pending_selection.deinit(app.gpa);
     if (pane.current_path) |path| app.gpa.free(path);
 
     for (app.panes_list.items, 0..) |item, index| {
@@ -764,6 +823,7 @@ fn closeTab(index: i32) void {
     }
     tab.splitter.delete();
     app.gpa.destroy(tab);
+    refreshWatchPaths();
 
     if (app.tabs_list.items.len == 0) {
         _ = app.window.close();
@@ -858,6 +918,7 @@ fn setActivePane(pane: *Pane) void {
     updateFileActionState();
     refreshCount(pane);
     refreshPreview(pane);
+    updateSelectionStatus(pane, true);
     updateWindowTitle();
     updateTabTitle(pane.tab);
 }
@@ -953,6 +1014,8 @@ fn navigateTo(pane: *Pane, raw: []const u8, record_history: bool) void {
 }
 
 fn setRoot(pane: *Pane, path: []const u8) void {
+    clearPendingSelection(pane);
+    pane.has_pending_scroll = false;
     // Every navigation starts unfiltered. The flag prevents the textChanged
     // signal from re-entering through onFilterChanged.
     app.suppress_filter = true;
@@ -988,16 +1051,89 @@ fn setRoot(pane: *Pane, path: []const u8) void {
     pane.path_edit.setText(path);
     if (isActivePane(pane)) {
         app.status.clearMessage();
+        app.status_hold_until_ms = 0;
         refreshCount(pane);
         updateWindowTitle();
     }
     updateTabTitle(pane.tab);
     updateHistoryActions();
     updateFileActionState();
+    refreshWatchPaths();
+}
+
+fn clearPendingSelection(pane: *Pane) void {
+    for (pane.pending_selection.items) |path| app.gpa.free(path);
+    pane.pending_selection.clearRetainingCapacity();
+}
+
+fn addPendingSelectionPath(pane: *Pane, path: []u8) void {
+    for (pane.pending_selection.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) {
+            app.gpa.free(path);
+            return;
+        }
+    }
+    pane.pending_selection.append(app.gpa, path) catch app.gpa.free(path);
+}
+
+/// Remember the selected paths before replacing a model snapshot. The model
+/// reset clears Qt's selection model without emitting a signal.
+fn captureSelection(pane: *Pane) void {
+    clearPendingSelection(pane);
+
+    const rows = pane.selection.selectedRows(app.gpa);
+    defer app.gpa.free(rows);
+    for (rows) |index| {
+        if (!index.isValid()) continue;
+        const path = pane.model.pathAt(app.gpa, index);
+        if (path.len == 0) {
+            app.gpa.free(path);
+            continue;
+        }
+        addPendingSelectionPath(pane, path);
+    }
+
+    const current = pane.selection.currentIndex();
+    if (current.isValid()) {
+        const path = pane.model.pathAt(app.gpa, current);
+        if (path.len == 0) {
+            app.gpa.free(path);
+        } else {
+            addPendingSelectionPath(pane, path);
+        }
+    }
+}
+
+fn restorePendingSelection(pane: *Pane) void {
+    if (pane.pending_selection.items.len == 0) return;
+
+    var first = true;
+    for (pane.pending_selection.items) |path| {
+        const index = pane.model.indexForPath(path) orelse continue;
+        const flags = if (first)
+            qitemselectionmodel_enums.SelectionFlag.ClearAndSelect |
+                qitemselectionmodel_enums.SelectionFlag.Rows
+        else
+            qitemselectionmodel_enums.SelectionFlag.Select |
+                qitemselectionmodel_enums.SelectionFlag.Rows;
+        pane.selection.select(index, flags);
+        if (first) {
+            pane.selection.setCurrentIndex(
+                index,
+                qitemselectionmodel_enums.SelectionFlag.NoUpdate,
+            );
+            first = false;
+        }
+    }
+    if (first) pane.selection.clear();
+    clearPendingSelection(pane);
 }
 
 fn refreshRoot(pane: *Pane) void {
     if (pane.current_path == null) return;
+    captureSelection(pane);
+    pane.pending_scroll = pane.tree.verticalScrollBar().value();
+    pane.has_pending_scroll = true;
     pane.model.reload();
     if (isActivePane(pane)) refreshCount(pane);
 }
@@ -1009,11 +1145,22 @@ fn onModelTimer(_: QTimer) callconv(.c) void {
             .updated => {
                 // Applying a snapshot resets the model, and a model reset
                 // clears the selection model without emitting any signal.
-                if (isActivePane(pane)) refreshPreview(pane);
-                if (isActivePane(pane)) refreshCount(pane);
+                restorePendingSelection(pane);
+                if (pane.has_pending_scroll) {
+                    pane.tree.verticalScrollBar().setValue(pane.pending_scroll);
+                    pane.has_pending_scroll = false;
+                }
+                if (isActivePane(pane)) {
+                    refreshPreview(pane);
+                    refreshCount(pane);
+                    updateSelectionStatus(pane, false);
+                }
             },
             .failed => {
+                clearPendingSelection(pane);
+                pane.has_pending_scroll = false;
                 if (isActivePane(pane)) {
+                    updateSelectionStatus(pane, false);
                     var buffer: [1024]u8 = undefined;
                     const message = std.fmt.bufPrint(
                         &buffer,
@@ -1026,6 +1173,105 @@ fn onModelTimer(_: QTimer) callconv(.c) void {
             },
         }
     }
+}
+
+// ---- Directory watches ---------------------------------------------------
+
+fn appendDesiredPath(list: *std.ArrayList([]const u8), path: []const u8) void {
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    list.append(app.gpa, path) catch {};
+}
+
+fn containsWatchedPath(watched: []const []u8, path: []const u8) bool {
+    for (watched) |existing| {
+        if (std.mem.eql(u8, existing, path)) return true;
+    }
+    return false;
+}
+
+fn containsDesiredPath(desired: []const []const u8, path: []const u8) bool {
+    for (desired) |existing| {
+        if (std.mem.eql(u8, existing, path)) return true;
+    }
+    return false;
+}
+
+fn refreshWatchPaths() void {
+    file_ops.ensureTrashDirs(app.gpa, app.io) catch {};
+
+    var desired: std.ArrayList([]const u8) = .empty;
+    defer desired.deinit(app.gpa);
+
+    for (app.panes_list.items) |pane| {
+        const path = pane.current_path orelse continue;
+        if (file_ops.isTrashLocation(path)) continue;
+        appendDesiredPath(&desired, path);
+    }
+
+    const trash_root = file_ops.trashDir(app.gpa) catch return;
+    defer app.gpa.free(trash_root);
+    const trash_files = std.fs.path.join(app.gpa, &.{ trash_root, "files" }) catch return;
+    defer app.gpa.free(trash_files);
+    const trash_info = std.fs.path.join(app.gpa, &.{ trash_root, "info" }) catch return;
+    defer app.gpa.free(trash_info);
+    appendDesiredPath(&desired, trash_files);
+    appendDesiredPath(&desired, trash_info);
+
+    // The watcher drops a path when a directory is deleted or replaced. Sync
+    // our bookkeeping with what it actually reports so the path can be added
+    // again after it is recreated.
+    const actual = app.fs_watcher.directories(app.gpa);
+    defer {
+        for (actual) |path| app.gpa.free(path);
+        app.gpa.free(actual);
+    }
+    var actual_index: usize = 0;
+    while (actual_index < app.fs_watch_paths.items.len) {
+        const path = app.fs_watch_paths.items[actual_index];
+        if (containsDesiredPath(actual, path)) {
+            actual_index += 1;
+            continue;
+        }
+        app.gpa.free(path);
+        _ = app.fs_watch_paths.orderedRemove(actual_index);
+    }
+
+    var index: usize = 0;
+    while (index < app.fs_watch_paths.items.len) {
+        const path = app.fs_watch_paths.items[index];
+        if (containsDesiredPath(desired.items, path)) {
+            index += 1;
+            continue;
+        }
+        _ = app.fs_watcher.removePath(path);
+        app.gpa.free(path);
+        _ = app.fs_watch_paths.orderedRemove(index);
+    }
+
+    for (desired.items) |path| {
+        if (containsWatchedPath(app.fs_watch_paths.items, path)) continue;
+        if (!app.fs_watcher.addPath(path)) continue;
+        const copy = app.gpa.dupe(u8, path) catch continue;
+        app.fs_watch_paths.append(app.gpa, copy) catch app.gpa.free(copy);
+    }
+}
+
+fn onFsDirectoryChanged(_: QFileSystemWatcher, _: [*:0]const u8) callconv(.c) void {
+    app.fs_refresh_timer.start(180);
+}
+
+fn onFsRefreshTimer(_: QTimer) callconv(.c) void {
+    if (app.file_job != null) {
+        // The operation completion path refreshes panes once the worker
+        // finishes; retry shortly in case a long job is still running.
+        app.fs_refresh_timer.start(250);
+        return;
+    }
+
+    for (app.panes_list.items) |pane| refreshRoot(pane);
+    refreshWatchPaths();
 }
 
 fn pushHistory(pane: *Pane, path: []const u8) void {
@@ -1087,9 +1333,7 @@ fn goHome(pane: *Pane) void {
 }
 
 fn reloadPane(pane: *Pane) void {
-    if (pane.current_path == null) return;
-    pane.model.reload();
-    if (isActivePane(pane)) refreshCount(pane);
+    refreshRoot(pane);
 }
 
 fn applyFilter(pane: *Pane, text: []const u8) void {
@@ -1134,7 +1378,15 @@ fn updateWindowTitle() void {
     app.window.setWindowTitle(title);
 }
 
+fn nowMilliseconds() i64 {
+    return std.Io.Timestamp.now(app.io, .real).toMilliseconds();
+}
+
 fn showStatus(message: []const u8, timeout_ms: i32) void {
+    app.status_hold_until_ms = if (timeout_ms > 0)
+        nowMilliseconds() + timeout_ms
+    else
+        0;
     app.status.showMessage2(message, timeout_ms);
 }
 
@@ -2407,6 +2659,7 @@ fn addPlace(label: []const u8, path: []const u8) void {
         return;
     };
     app.places.addItem(label);
+    updateSidebarHeights();
 }
 
 fn addChildPlace(home: []const u8, name: []const u8) void {
@@ -2482,7 +2735,133 @@ fn onPlaceSelected(_: QListWidget, row: i32) callconv(.c) void {
     if (index >= app.place_paths.items.len) return;
 
     const pane = activePane() orelse return;
+    app.drives_updating = true;
+    app.drives.setCurrentRow(-1);
+    app.drives_updating = false;
     navigateTo(pane, app.place_paths.items[index], true);
+    pane.tree.setFocus();
+}
+
+// ---- Mounted drives and sidebar sizing -----------------------------------
+
+fn updateSidebarHeights() void {
+    const window_height = app.window.height();
+    const places_max = @max(120, @min(340, @divTrunc(window_height * 32, 100)));
+    const drives_max = @max(80, @min(220, @divTrunc(window_height * 20, 100)));
+    setSidebarListHeight(app.places, places_max);
+    setSidebarListHeight(app.drives, drives_max);
+}
+
+fn setSidebarListHeight(list: QListWidget, max_height: i32) void {
+    const count = list.count();
+    if (count <= 0) {
+        list.setFixedHeight(0);
+        return;
+    }
+    const row_height = @max(list.sizeHintForRow(0), 20);
+    const spacing = @max(list.spacing(), 0);
+    // QListWidget adds viewport margins and a frame around the rows; a small
+    // allowance avoids a scrollbar when every row already fits.
+    const chrome = list.frameWidth() * 2 + 12;
+    const content = count * row_height +
+        @max(count - 1, 0) * spacing + chrome;
+    list.setFixedHeight(@max(row_height + chrome, @min(content, max_height)));
+}
+
+fn refreshMountedPlaces() void {
+    var next = mounts.list(app.gpa) catch {
+        updateSidebarHeights();
+        return;
+    };
+
+    if (sameMounts(app.mount_places.items, next.items)) {
+        for (next.items) |*volume| volume.deinit(app.gpa);
+        next.deinit(app.gpa);
+        updateSidebarHeights();
+        return;
+    }
+
+    var selected_path: ?[]u8 = null;
+    const selected_row = app.drives.currentRow();
+    if (selected_row >= 0) {
+        const index: usize = @intCast(selected_row);
+        if (index < app.mount_places.items.len) {
+            selected_path = app.gpa.dupe(u8, app.mount_places.items[index].path) catch null;
+        }
+    }
+    defer if (selected_path) |path| app.gpa.free(path);
+
+    app.drives_updating = true;
+    defer app.drives_updating = false;
+    app.drives.clear();
+
+    for (app.mount_places.items) |*volume| volume.deinit(app.gpa);
+    app.mount_places.deinit(app.gpa);
+    app.mount_places = next;
+
+    for (app.mount_places.items, 0..) |volume, index| {
+        app.drives.addItem(volume.label);
+        var free_buffer: [32]u8 = undefined;
+        var total_buffer: [32]u8 = undefined;
+        var tooltip_buffer: [1024]u8 = undefined;
+        const tooltip = std.fmt.bufPrint(
+            &tooltip_buffer,
+            "{s}\nMount point: {s}\nDevice: {s}\nFilesystem: {s}\nFree: {s} of {s}",
+            .{
+                volume.label,
+                volume.path,
+                volume.device,
+                volume.fs_type,
+                formatBytes(&free_buffer, volume.bytes_free),
+                formatBytes(&total_buffer, volume.bytes_total),
+            },
+        ) catch volume.path;
+        const item = app.drives.item(@intCast(index));
+        if (item.ptr != null) item.setToolTip(tooltip);
+    }
+
+    const has_drives = app.mount_places.items.len > 0;
+    app.drives_label.setVisible(has_drives);
+    app.drives.setVisible(has_drives);
+
+    if (selected_path) |path| {
+        for (app.mount_places.items, 0..) |volume, index| {
+            if (std.mem.eql(u8, volume.path, path)) {
+                app.drives.setCurrentRow(@intCast(index));
+                break;
+            }
+        }
+    }
+    updateSidebarHeights();
+}
+
+fn sameMounts(a: []const mounts.Volume, b: []const mounts.Volume) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left.path, right.path)) return false;
+        if (!std.mem.eql(u8, left.label, right.label)) return false;
+        if (!std.mem.eql(u8, left.device, right.device)) return false;
+        if (!std.mem.eql(u8, left.fs_type, right.fs_type)) return false;
+    }
+    return true;
+}
+
+fn onMountTimer(_: QTimer) callconv(.c) void {
+    refreshMountedPlaces();
+    refreshWatchPaths();
+}
+
+fn onDriveSelected(_: QListWidget, row: i32) callconv(.c) void {
+    if (app.drives_updating) return;
+    if (row < 0) return;
+    const index: usize = @intCast(row);
+    if (index >= app.mount_places.items.len) return;
+
+    const pane = activePane() orelse return;
+    app.places_updating = true;
+    app.places.setCurrentRow(-1);
+    app.places_updating = false;
+    navigateTo(pane, app.mount_places.items[index].path, true);
     pane.tree.setFocus();
 }
 
@@ -2731,6 +3110,7 @@ fn onCtxRemovePlace(_: QAction) callconv(.c) void {
     if (item.ptr != null) item.delete();
     app.gpa.free(removed_path);
     _ = app.place_paths.orderedRemove(index);
+    updateSidebarHeights();
 
     savePlaces();
 
@@ -2904,10 +3284,11 @@ fn onItemActivated(tree: QTreeView, index: QModelIndex) callconv(.c) void {
     openSelected(pane, index);
 }
 
-fn onSelectionChanged(selection: QItemSelectionModel, current: QModelIndex, _: QModelIndex) callconv(.c) void {
-    const pane = findPaneBySelection(selection) orelse return;
-    if (!isActivePane(pane)) return;
+fn updateSelectionStatus(pane: *Pane, force: bool) void {
+    if (!force and nowMilliseconds() < app.status_hold_until_ms) return;
+    if (force) app.status_hold_until_ms = 0;
 
+    const current = pane.selection.currentIndex();
     if (!current.isValid()) {
         app.status.clearMessage();
         refreshCount(pane);
@@ -2940,6 +3321,12 @@ fn onSelectionChanged(selection: QItemSelectionModel, current: QModelIndex, _: Q
         const message = std.fmt.bufPrint(&buffer, "{s} — {d} bytes", .{ name, size }) catch name;
         app.status.showMessage(message);
     }
+}
+
+fn onSelectionChanged(selection: QItemSelectionModel, _: QModelIndex, _: QModelIndex) callconv(.c) void {
+    const pane = findPaneBySelection(selection) orelse return;
+    if (!isActivePane(pane)) return;
+    updateSelectionStatus(pane, true);
 }
 
 /// The selection ranges changed (select, shift-extend, Ctrl+A, clear).
@@ -3175,9 +3562,8 @@ fn onAbout(_: QAction) callconv(.c) void {
         "Ligma 0.5 — a fast, keyboard-friendly file manager for Linux.\n\n" ++
             "Built with Zig and Qt 6. This build adds a custom asynchronous " ++
             "item model, tabs, split view, recursive filename search, " ++
-            "undoable file operations, and a browsable freedesktop.org " ++
-            "Trash with restore and empty actions.\n\n" ++
-            "The roadmap adds file watching, metadata, remote locations, " ++
-            "and an extension API.",
+            "undoable file operations, a browsable freedesktop.org Trash, " ++
+            "live folder refresh, and mounted-drive shortcuts.\n\n" ++
+            "The roadmap adds metadata, remote locations, and an extension API.",
     );
 }

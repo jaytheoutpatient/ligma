@@ -1215,6 +1215,19 @@ pub fn trashDir(gpa: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(gpa, &.{ base, "Trash" });
 }
 
+/// Create the `files/` and `info/` directories so the Trash view can be
+/// watched even before the first item is moved there.
+pub fn ensureTrashDirs(gpa: std.mem.Allocator, io: std.Io) !void {
+    const root = try trashDir(gpa);
+    defer gpa.free(root);
+    const files_dir = try std.fs.path.join(gpa, &.{ root, "files" });
+    defer gpa.free(files_dir);
+    const info_dir = try std.fs.path.join(gpa, &.{ root, "info" });
+    defer gpa.free(info_dir);
+    try std.Io.Dir.cwd().createDirPath(io, files_dir);
+    try std.Io.Dir.cwd().createDirPath(io, info_dir);
+}
+
 // ---- Filesystem helpers ---------------------------------------------------
 
 fn statPath(io: std.Io, path: []const u8) !std.Io.File.Stat {

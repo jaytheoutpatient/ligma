@@ -284,6 +284,17 @@ pub const LocalModel = struct {
         return allocator.dupe(u8, entry.path) catch @panic("OOM");
     }
 
+    /// Find the model index for a path after a snapshot refresh. Used to
+    /// restore selection when a directory changes underneath the view.
+    pub fn indexForPath(self: *LocalModel, path: []const u8) ?QModelIndex {
+        for (self.visible.items, 0..) |entry_index, row| {
+            if (std.mem.eql(u8, self.entries.items[entry_index].path, path)) {
+                return self.qt.createIndex(@intCast(row), 0);
+            }
+        }
+        return null;
+    }
+
     pub fn nameAt(self: *LocalModel, allocator: std.mem.Allocator, index: QModelIndex) []u8 {
         const entry = self.entryAt(index) orelse return allocator.dupe(u8, "") catch @panic("OOM");
         return allocator.dupe(u8, entry.name) catch @panic("OOM");
