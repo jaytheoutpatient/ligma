@@ -209,7 +209,7 @@ Per-folder state remembers view mode, sort column/order, grouping, zoom, hidden-
 
 ### 4.5 Quick Look and preview
 
-**Implemented (v0.4):** selecting exactly one image or video file shows a larger thumbnail panel at the bottom of the Places sidebar (window's bottom-left corner). It hides for folders, non-media files, multi-selections, and empty selections. Images are decoded at display size via `QImageReader`; video frames are extracted by an asynchronous ffmpeg job (1 s seek, retried from frame 0 for shorter clips). MIME classification is content-aware.
+**Implemented (v0.5):** the entire sidebar area below Places and Drives is a persistent preview panel. Selecting exactly one image shows a scaled `QImageReader` preview; selecting a video extracts a frame with an asynchronous ffmpeg job (1 s seek, retried from frame 0 for shorter clips). Hovering a video row plays a muted, looping Qt Multimedia snippet, then restores the selected item's preview when the pointer leaves or the hover interval ends. Folders, non-media files, multi-selections, and empty selections show a summary or idle placeholder while the panel stays visible. MIME classification uses extension checks for common media types and a shared `QMimeDatabase` fallback.
 
 Planned on top of this:
 
@@ -594,7 +594,9 @@ Metadata is visible in the details columns, information panel, search, and group
 
 ### 5.8 Previews and thumbnails
 
-**Implemented (v0.4):** the single-selection preview panel (`src/ui/preview.zig`) rides on the selection model — not the current index — because Qt moves the current index before extending a Shift+arrow selection, and a model reset clears the selection without emitting a signal. In-flight ffmpeg jobs are keyed by `QProcess` pointer and cleaned up through stale-sequence checks in their `finished`/`errorOccurred` callbacks; `FailedToStart` is handled in the error path because Qt emits no `finished()` in that case.
+**Implemented (v0.5):** the single-selection preview panel (`src/ui/preview.zig`) rides on the selection model — not the current index — because Qt moves the current index before extending a Shift+arrow selection, and a model reset clears the selection without emitting a signal. In-flight ffmpeg jobs are keyed by `QProcess` pointer and cleaned up through stale-sequence checks in their `finished`/`errorOccurred` callbacks; `FailedToStart` is handled in the error path because Qt emits no `finished()` in that case.
+
+Video rows also get frame thumbnails in Icons and Grid (`src/ui/local_model.zig`). Extraction is queued one job at a time and capped at 512 pending paths so a folder full of clips cannot monopolize the UI thread or spawn an ffmpeg storm. The preview panel reuses one `QMimeDatabase` and checks common extensions before the MIME lookup; both changes keep fast pointer movement responsive. The panel itself expands to fill the sidebar's remaining height instead of using a fixed thumbnail box.
 
 Planned generalization:
 
@@ -679,12 +681,14 @@ Extension lifecycle: install → validate manifest → permission prompt → ena
 
 ### 5.10 Settings and state
 
-- User config: `$XDG_CONFIG_HOME/ligma/config.toml` (human-editable, commented).
-- State DB: `$XDG_DATA_HOME/ligma/state.db` (per-folder views, sessions, bookmarks, metadata, operation journal).
-- Cache: `$XDG_CACHE_HOME/ligma/` (thumbnails, search cache, preview failures).
-- Runtime: `$XDG_RUNTIME_DIR/ligma/` (single-instance socket, IPC).
-- Settings search and import/export; schema migrations with backups.
-- Defaults are casual-friendly. Advanced options are grouped under "Advanced" and exposed in the command palette.
+**Implemented (v0.5):** `src/core/settings.zig` reads and writes a human-editable `$XDG_CONFIG_HOME/ligma/settings.toml` (or `~/.config/ligma/settings.toml`). The Settings window (`src/ui/settings_dialog.zig`, `Ctrl+,`) mirrors Luciole's categories with Ligma's gradient-and-card presentation: General, Appearance, Views, Thumbnails, and Preview. It covers activation/typing behavior, delete confirmation, new-tab switching, session restore, terminal command, theme, window opacity, corner-radius scale, compact menus, tab/status bar visibility, sidebar and drives, sidebar width, preview visibility and hover duration, view mode, density, filename elision, emblems, hidden/backup files, sorting, grid icon size, list column visibility, thumbnail policy and size limit, and video thumbnails/hover. Changes apply immediately; Reset All restores defaults.
+
+Open absolute folder tabs are saved to `$XDG_CONFIG_HOME/ligma/session` when session restore is enabled and removed when it is disabled. Theme selection remains in `$XDG_CONFIG_HOME/ligma/appearance` because the View > Appearance menu and Matugen/qt6ct integration share it.
+
+- Future config: `$XDG_DATA_HOME/ligma/state.db` for per-folder views, bookmarks, metadata, and the operation journal.
+- Future cache: `$XDG_CACHE_HOME/ligma/` (thumbnails, search cache, preview failures).
+- Future runtime: `$XDG_RUNTIME_DIR/ligma/` (single-instance socket, IPC).
+- Settings search/import/export and schema migrations remain future work.
 
 ### 5.11 Security model
 
@@ -875,7 +879,9 @@ Implemented in the v0.5 prototype:
 - Smooth wheel scrolling through a reusable Qt event filter, and eased slide open/close animations for the terminal and music player docks, including their title-bar close buttons.
 - Discord Rich Presence (`src/core/discord.zig`): title/artist/album from GStreamer tags, timestamps while playing, pause/stop handling, local socket discovery for native and Flatpak clients, and configurable app ID. Optional MusicBrainz enrichment supplies canonical metadata and release years.
 - Executable files (ELF binaries, scripts, AppImages) can be launched after a confirmation prompt by pressing Enter, double-clicking, or choosing `File > Run Selected` (`Ctrl+Return`); the process starts detached with the file's folder as its working directory.
-- Tabs (`Ctrl+T`, `Ctrl+W`) and split view (`F3`, `F6`); panes keep independent state.
+- Tabs (`Ctrl+T`, `Ctrl+W`) and split view (`F3`, `F6`); panes keep independent state. Optional session restore reopens absolute folder tabs from `$XDG_CONFIG_HOME/ligma/session`.
+- Settings window (`Ctrl+,`) with General, Appearance, Views, Thumbnails, and Preview categories. Live-apply controls persist to `settings.toml`; Reset All returns to defaults. Appearance includes theme, window opacity, corner-roundness scale, compact menus, tab/status bar visibility, sidebar and drives, and sidebar width.
+- Preview panel fills the sidebar's remaining height below Places and Drives. Images and ffmpeg video frames scale into it; hovering a video plays a muted looping Qt Multimedia snippet. Video files also use extracted frames as Icons/Grid thumbnails, generated one at a time with a bounded queue.
 - Global filename search with streamed results in a dock.
 - SQLite FTS5 index (`files`, `files_fts`, `files_fts_trigram`) with WAL, background home-directory crawler, status-bar health, and a rebuild action.
 - Live breadth-first scanner fallback while indexing, outside the indexed root, or when indexing is disabled.
@@ -889,7 +895,7 @@ Implemented in the v0.5 prototype:
 
 Known prototype limitations (addressed in later phases):
 
-- The model is a flat single-folder snapshot: no tree expansion, thumbnails, or per-folder view state yet. View mode is per-pane and resets to Details for new panes.
+- The model is a flat single-folder snapshot: no tree expansion or per-folder view state yet. View mode is per-pane; new panes start from the saved Settings view mode.
 - Directory watchers cover entry creates, deletes, renames, and moves. In-place edits that only change an existing file's contents may still need a manual reload (`F5`).
 - Drives are polled every 2 seconds through `QStorageInfo`, with unmounted USB/removable partitions discovered through `lsblk`. Mounting uses `udisksctl mount`; unmounting uses `udisksctl`/`pkexec`. Formatting, filesystem repair, and full UDisks2 device management are not implemented yet.
 - Trash browsing uses the home Trash directory only; per-mount `.Trash-$uid` locations are not implemented yet.

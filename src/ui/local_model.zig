@@ -13,6 +13,7 @@ const QMimeData = qt6.QMimeData;
 const QMimeDatabase = qt6.QMimeDatabase;
 const QModelIndex = qt6.QModelIndex;
 const QPixmap = qt6.QPixmap;
+const QProcess = qt6.QProcess;
 const QSize = qt6.QSize;
 const QUrl = qt6.QUrl;
 const QVariant = qt6.QVariant;
@@ -20,6 +21,7 @@ const QVariant = qt6.QVariant;
 extern fn ligma_qvariant_from_icon(icon: ?*anyopaque) ?*anyopaque;
 
 const qnamespace_enums = qt6.qnamespace_enums;
+const qprocess_enums = qt6.qprocess_enums;
 
 pub const Location = enum { directory, trash };
 
@@ -48,12 +50,23 @@ pub const LocalModel = struct {
 
     filter: ?[]u8 = null,
     show_hidden: bool = false,
+    show_backups: bool = true,
+    directories_first: bool = true,
+    show_emblems: bool = true,
     sort_column: i32 = 0,
     sort_order: i32 = qnamespace_enums.SortOrder.AscendingOrder,
 
     job: ?*LoadJob = null,
     retired: std.ArrayList(*LoadJob) = .empty,
     generation: u64 = 0,
+
+    video_icons: std.StringHashMapUnmanaged(QIcon) = .empty,
+    video_pending: std.StringHashMapUnmanaged(void) = .empty,
+    video_queue: std.ArrayList([]u8) = .empty,
+    video_active: u8 = 0,
+    thumbnail_policy: ThumbnailPolicy = .local,
+    thumbnail_max_mib: i32 = 64,
+    video_thumbnails: bool = true,
 
     drop_handler: ?DropHandler = null,
     drag_copy_hint: bool = false,
@@ -69,6 +82,7 @@ pub const LocalModel = struct {
     ) bool;
 
     pub const Poll = enum { none, updated, failed };
+    pub const ThumbnailPolicy = enum { never, local, all };
 
     pub const Entry = struct {
         name: []u8,
@@ -171,7 +185,14 @@ pub const LocalModel = struct {
         }
         self.retired.deinit(self.gpa);
 
+        self.cancelVideoThumbnails();
         self.clearEntries();
+        var video_it = self.video_icons.iterator();
+        while (video_it.next()) |item| {
+            self.gpa.free(item.key_ptr.*);
+            item.value_ptr.*.delete();
+        }
+        self.video_icons.deinit(self.gpa);
         if (self.mime_db.ptr != null) self.mime_db.delete();
         self.visible.deinit(self.gpa);
         self.freeRoot();
@@ -257,6 +278,68 @@ pub const LocalModel = struct {
         self.show_hidden = show;
         self.rebuildVisible();
         self.resetModel();
+    }
+
+    pub fn setShowBackups(self: *LocalModel, show: bool) void {
+        if (self.show_backups == show) return;
+        self.show_backups = show;
+        self.rebuildVisible();
+        self.resetModel();
+    }
+
+    pub fn setDirectoriesFirst(self: *LocalModel, enabled: bool) void {
+        if (self.directories_first == enabled) return;
+        self.directories_first = enabled;
+        self.rebuildVisible();
+        self.resetModel();
+    }
+
+    pub fn setShowEmblems(self: *LocalModel, show: bool) void {
+        if (self.show_emblems == show) return;
+        self.show_emblems = show;
+        self.clearEntryIcons();
+        self.resetModel();
+    }
+
+    pub fn setThumbnailPolicy(self: *LocalModel, policy: ThumbnailPolicy) void {
+        if (self.thumbnail_policy == policy) return;
+        self.thumbnail_policy = policy;
+        self.clearEntryIcons();
+        if (policy == .never) {
+            self.cancelVideoThumbnails();
+            self.clearVideoIconCache();
+        }
+        self.resetModel();
+    }
+
+    pub fn setThumbnailMaxMib(self: *LocalModel, mib: i32) void {
+        self.thumbnail_max_mib = std.math.clamp(mib, 1, 1024);
+    }
+
+    pub fn setVideoThumbnails(self: *LocalModel, enabled: bool) void {
+        if (self.video_thumbnails == enabled) return;
+        self.video_thumbnails = enabled;
+        if (!enabled) self.cancelVideoThumbnails();
+        self.clearEntryIcons();
+        self.resetModel();
+    }
+
+    fn clearEntryIcons(self: *LocalModel) void {
+        for (self.entries.items) |*entry| {
+            if (entry.icon) |icon| icon.delete();
+            entry.icon = null;
+            entry.icon_loaded = false;
+        }
+    }
+
+    fn clearVideoIconCache(self: *LocalModel) void {
+        var it = self.video_icons.iterator();
+        while (it.next()) |item| {
+            self.gpa.free(item.key_ptr.*);
+            item.value_ptr.*.delete();
+        }
+        self.video_icons.deinit(self.gpa);
+        self.video_icons = .empty;
     }
 
     /// Apply a completed background snapshot. Returns `updated` or `failed`
@@ -363,7 +446,7 @@ pub const LocalModel = struct {
     fn resolveIcon(self: *LocalModel, entry: *Entry) ?QIcon {
         // QFileIconProvider adds the link badge for symlinks; themed MIME icons
         // do not, so let the provider handle those rows.
-        if (entry.is_symlink) return null;
+        if (entry.is_symlink and self.show_emblems) return null;
 
         if (entry.is_dir) {
             const folder = self.themedIcon("folder") orelse return null;
@@ -388,8 +471,13 @@ pub const LocalModel = struct {
         const mime_name = mime.name(self.gpa);
         defer self.gpa.free(mime_name);
 
-        if (std.mem.startsWith(u8, mime_name, "image/")) {
+        if (self.thumbnail_policy != .never and std.mem.startsWith(u8, mime_name, "image/")) {
             if (self.imageIcon(entry)) |icon| return icon;
+        }
+
+        if (std.mem.startsWith(u8, mime_name, "video/")) {
+            if (self.video_icons.get(entry.path)) |icon| return QIcon.new3(icon);
+            self.requestVideoThumbnail(entry.path);
         }
 
         const icon_name = mime.iconName(self.gpa);
@@ -430,8 +518,8 @@ pub const LocalModel = struct {
     }
 
     fn imageIcon(self: *LocalModel, entry: *Entry) ?QIcon {
-        _ = self;
-        if (entry.size > 64 * 1024 * 1024) return null;
+        const limit = @as(u64, @intCast(@max(self.thumbnail_max_mib, 1))) * 1024 * 1024;
+        if (entry.size > limit) return null;
 
         const reader = QImageReader.new3(entry.path);
         defer reader.delete();
@@ -491,6 +579,127 @@ pub const LocalModel = struct {
         return null;
     }
 
+    fn requestVideoThumbnail(self: *LocalModel, path: []const u8) void {
+        if (self.thumbnail_policy == .never or !self.video_thumbnails) return;
+        if (self.video_icons.contains(path) or self.video_pending.contains(path)) return;
+        // A folder full of clips should not queue unbounded background work.
+        // The first screenful wins; reloading the folder retries the rest.
+        if (self.video_queue.items.len >= 512) return;
+
+        const pending_key = self.gpa.dupe(u8, path) catch return;
+        self.video_pending.put(self.gpa, pending_key, {}) catch {
+            self.gpa.free(pending_key);
+            return;
+        };
+        const queued = self.gpa.dupe(u8, path) catch {
+            if (self.video_pending.fetchRemove(pending_key)) |item|
+                self.gpa.free(item.key);
+            return;
+        };
+        self.video_queue.append(self.gpa, queued) catch {
+            self.gpa.free(queued);
+            if (self.video_pending.fetchRemove(pending_key)) |item|
+                self.gpa.free(item.key);
+            return;
+        };
+        self.pumpVideoThumbnails();
+    }
+
+    fn pumpVideoThumbnails(self: *LocalModel) void {
+        while (self.video_active < 1 and self.video_queue.items.len > 0) {
+            const path = self.video_queue.orderedRemove(0);
+            const tmp = std.fmt.allocPrint(
+                self.gpa,
+                "/tmp/ligma-grid-thumb-{d}-{d}.png",
+                .{ std.os.linux.getpid(), thumb_serial },
+            ) catch {
+                self.completeVideoThumbnail(path);
+                self.gpa.free(path);
+                continue;
+            };
+            thumb_serial +%= 1;
+            const job = self.gpa.create(VideoThumbJob) catch {
+                self.completeVideoThumbnail(path);
+                self.gpa.free(path);
+                self.gpa.free(tmp);
+                continue;
+            };
+            job.* = .{
+                .model = self,
+                .proc = undefined,
+                .path = path,
+                .tmp = tmp,
+                .attempt = 0,
+            };
+
+            const proc = QProcess.new();
+            job.proc = proc;
+            proc.setProgram("ffmpeg");
+            video_jobs.put(self.gpa, @intFromPtr(proc.ptr), job) catch {
+                self.completeVideoThumbnail(job.path);
+                freeVideoThumbJob(self.gpa, self.io, job);
+                proc.delete();
+                continue;
+            };
+            self.video_active += 1;
+            proc.onFinished2(onVideoThumbFinished);
+            proc.onErrorOccurred(onVideoThumbError);
+            startVideoThumbFfmpeg(proc, job);
+        }
+    }
+
+    fn installVideoThumbnail(self: *LocalModel, path: []const u8, icon: QIcon) void {
+        for (self.entries.items, 0..) |*entry, entry_index| {
+            if (!std.mem.eql(u8, entry.path, path)) continue;
+            if (entry.icon) |old| old.delete();
+            entry.icon = QIcon.new3(icon);
+            entry.icon_loaded = true;
+
+            for (self.visible.items, 0..) |visible_index, row| {
+                if (visible_index != entry_index) continue;
+                const model_index = self.qt.index(@intCast(row), 0, emptyIndex());
+                self.qt.dataChanged(model_index, model_index);
+                break;
+            }
+        }
+    }
+
+    fn completeVideoThumbnail(self: *LocalModel, path: []const u8) void {
+        if (self.video_pending.fetchRemove(path)) |item| self.gpa.free(item.key);
+    }
+
+    fn cancelVideoThumbnails(self: *LocalModel) void {
+        var keys: std.ArrayList(usize) = .empty;
+        defer keys.deinit(self.gpa);
+        var it = video_jobs.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.model == self)
+                keys.append(self.gpa, entry.key_ptr.*) catch {};
+        }
+        for (keys.items) |key| {
+            const job = video_jobs.get(key) orelse continue;
+            _ = video_jobs.remove(key);
+            job.proc.kill();
+            freeVideoThumbJob(self.gpa, self.io, job);
+            job.proc.delete();
+        }
+        self.video_active = 0;
+
+        for (self.video_queue.items) |path| self.gpa.free(path);
+        self.video_queue.deinit(self.gpa);
+        self.video_queue = .empty;
+
+        var pending = self.video_pending.iterator();
+        while (pending.next()) |item| self.gpa.free(item.key_ptr.*);
+        self.video_pending.deinit(self.gpa);
+        self.video_pending = .empty;
+
+        if (video_jobs.count() == 0) {
+            video_jobs.deinit(self.gpa);
+            video_jobs = .empty;
+        }
+    }
+
     fn cancelActive(self: *LocalModel) void {
         const job = self.job orelse return;
         self.job = null;
@@ -524,6 +733,7 @@ pub const LocalModel = struct {
 
         for (self.entries.items, 0..) |entry, index| {
             if (!trash and !self.show_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
+            if (!trash and !self.show_backups and std.mem.endsWith(u8, entry.name, "~")) continue;
             if (filter.len > 0) {
                 if (trash) {
                     const original = entry.original_path orelse "";
@@ -545,7 +755,7 @@ pub const LocalModel = struct {
 
         // Folders stay above files in both sort directions, which is what
         // users expect from a file manager even when sorting by size or date.
-        if (a.is_dir != b.is_dir) return a.is_dir;
+        if (self.directories_first and a.is_dir != b.is_dir) return a.is_dir;
 
         const order = if (self.location == .trash)
             switch (self.sort_column) {
@@ -788,6 +998,148 @@ fn copyTrashEntry(gpa: std.mem.Allocator, entry: file_ops.TrashEntry) !LocalMode
         .deletion_text = entry.deletion_text,
         .deletion_len = entry.deletion_len,
     };
+}
+
+const VideoThumbJob = struct {
+    model: *LocalModel,
+    proc: QProcess,
+    path: []u8,
+    tmp: []u8,
+    attempt: u8,
+};
+
+var video_jobs: std.AutoHashMapUnmanaged(usize, *VideoThumbJob) = .empty;
+var thumb_serial: u64 = 0;
+
+fn freeVideoThumbJob(gpa: std.mem.Allocator, io: std.Io, job: *VideoThumbJob) void {
+    std.Io.Dir.deleteFileAbsolute(io, job.tmp) catch {};
+    gpa.free(job.path);
+    gpa.free(job.tmp);
+    gpa.destroy(job);
+}
+
+fn startVideoThumbFfmpeg(proc: QProcess, job: *VideoThumbJob) void {
+    const scale = std.fmt.allocPrint(job.model.gpa, "scale=256:-2", .{}) catch {
+        _ = video_jobs.remove(@intFromPtr(proc.ptr));
+        job.model.video_active -|= 1;
+        job.model.completeVideoThumbnail(job.path);
+        freeVideoThumbJob(job.model.gpa, job.model.io, job);
+        proc.deleteLater();
+        job.model.pumpVideoThumbnails();
+        return;
+    };
+    defer job.model.gpa.free(scale);
+
+    var argv: [12][]const u8 = undefined;
+    var n: usize = 0;
+    argv[n] = "-y";
+    n += 1;
+    argv[n] = "-loglevel";
+    n += 1;
+    argv[n] = "error";
+    n += 1;
+    if (job.attempt == 0) {
+        argv[n] = "-ss";
+        n += 1;
+        argv[n] = "1";
+        n += 1;
+    }
+    argv[n] = "-i";
+    n += 1;
+    argv[n] = job.path;
+    n += 1;
+    argv[n] = "-frames:v";
+    n += 1;
+    argv[n] = "1";
+    n += 1;
+    argv[n] = "-vf";
+    n += 1;
+    argv[n] = scale;
+    n += 1;
+    argv[n] = job.tmp;
+    n += 1;
+
+    proc.setArguments(job.model.gpa, argv[0..n]);
+    proc.start2();
+}
+
+fn onVideoThumbFinished(proc: QProcess, exit_code: i32, exit_status: i32) callconv(.c) void {
+    const key = @intFromPtr(proc.ptr);
+    const job = video_jobs.get(key) orelse {
+        proc.deleteLater();
+        return;
+    };
+    const model = job.model;
+    const ok = exit_status == 0 and exit_code == 0;
+    var icon: ?QIcon = null;
+
+    if (ok) {
+        const pixmap = QPixmap.new4(job.tmp);
+        defer pixmap.delete();
+        if (!pixmap.isNull()) {
+            const created = QIcon.new2(pixmap);
+            if (!created.isNull()) icon = created else created.delete();
+        }
+    }
+
+    if (icon) |created| {
+        if (model.video_icons.get(job.path)) |cached| {
+            created.delete();
+            model.installVideoThumbnail(job.path, cached);
+        } else {
+            const path_key = model.gpa.dupe(u8, job.path) catch {
+                created.delete();
+                model.completeVideoThumbnail(job.path);
+                _ = video_jobs.remove(key);
+                model.video_active -|= 1;
+                freeVideoThumbJob(model.gpa, model.io, job);
+                proc.deleteLater();
+                model.pumpVideoThumbnails();
+                return;
+            };
+            model.video_icons.put(model.gpa, path_key, created) catch {
+                model.gpa.free(path_key);
+                created.delete();
+                model.completeVideoThumbnail(job.path);
+                _ = video_jobs.remove(key);
+                model.video_active -|= 1;
+                freeVideoThumbJob(model.gpa, model.io, job);
+                proc.deleteLater();
+                model.pumpVideoThumbnails();
+                return;
+            };
+            model.installVideoThumbnail(job.path, created);
+        }
+    } else if (job.attempt == 0) {
+        job.attempt = 1;
+        startVideoThumbFfmpeg(proc, job);
+        return;
+    }
+
+    model.completeVideoThumbnail(job.path);
+    _ = video_jobs.remove(key);
+    model.video_active -|= 1;
+    freeVideoThumbJob(model.gpa, model.io, job);
+    proc.deleteLater();
+    model.pumpVideoThumbnails();
+}
+
+fn onVideoThumbError(proc: QProcess, code: i32) callconv(.c) void {
+    if (code != qprocess_enums.ProcessError.FailedToStart) return;
+    const key = @intFromPtr(proc.ptr);
+    const job = video_jobs.get(key) orelse return;
+    if (job.attempt == 0) {
+        job.attempt = 1;
+        startVideoThumbFfmpeg(proc, job);
+        return;
+    }
+    const model = job.model;
+    model.completeVideoThumbnail(job.path);
+    _ = video_jobs.remove(key);
+    model.video_active -|= 1;
+    freeVideoThumbJob(model.gpa, model.io, job);
+    proc.deleteLater();
+    model.pumpVideoThumbnails();
 }
 
 // ---- Qt virtual callbacks -------------------------------------------------

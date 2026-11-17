@@ -13,7 +13,9 @@
 #include <QFont>
 #include <QFontDatabase>
 #include <QKeyEvent>
+#include <QProcess>
 #include <QString>
+#include <QStringList>
 #include <QWidget>
 
 namespace {
@@ -84,6 +86,21 @@ void ligma_terminal_start(void *handle, const char *shell, const char *working_d
         return;
     if (shell && *shell)
         term->setShellProgram(fromUtf8(shell));
+    if (working_directory && *working_directory)
+        term->setWorkingDirectory(fromUtf8(working_directory));
+    term->startShellProgram();
+}
+
+void ligma_terminal_start_command(void *handle, const char *command, const char *working_directory)
+{
+    auto *term = static_cast<QTermWidget *>(handle);
+    if (!term)
+        return;
+    QStringList parts = QProcess::splitCommand(fromUtf8(command));
+    if (parts.isEmpty())
+        return;
+    term->setShellProgram(parts.takeFirst());
+    term->setArgs(parts);
     if (working_directory && *working_directory)
         term->setWorkingDirectory(fromUtf8(working_directory));
     term->startShellProgram();

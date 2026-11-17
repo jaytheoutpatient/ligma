@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.linkSystemLibrary("qtermwidget6", .{});
     exe.root_module.linkSystemLibrary("stdc++", .{});
     exe.root_module.linkSystemLibrary("Qt6Network", .{});
+    exe.root_module.linkSystemLibrary("Qt6Multimedia", .{});
+    exe.root_module.linkSystemLibrary("Qt6MultimediaWidgets", .{});
 
     // libqt6zig does not expose a QVariant constructor for QIcon, so the item
     // model uses this tiny helper for DecorationRole.
@@ -174,13 +176,18 @@ const qt_libraries = [_][]const u8{
     "qabstractitemview",
     "qabstractscrollarea",
     "qabstractslider",
+    "qabstractspinbox",
     "qaction",
     "qactiongroup",
     "qapplication",
+    "qaudiooutput",
     "qboxlayout",
+    "qcheckbox",
+    "qcombobox",
     "qcoreapplication",
     "qcursor",
     "qdesktopservices",
+    "qdialog",
     "qdir",
     "qdockwidget",
     "qevent",
@@ -203,6 +210,7 @@ const qt_libraries = [_][]const u8{
     "qlistview",
     "qlistwidget",
     "qmainwindow",
+    "qmediaplayer",
     "qmenu",
     "qmenubar",
     "qmessagebox",
@@ -219,9 +227,11 @@ const qt_libraries = [_][]const u8{
     "qprogressbar",
     "qpushbutton",
     "qrect",
+    "qscrollarea",
     "qscrollbar",
     "qsize",
     "qslider",
+    "qspinbox",
     "qsplitter",
     "qstackedwidget",
     "qstatusbar",
@@ -231,5 +241,6 @@ const qt_libraries = [_][]const u8{
     "qtreeview",
     "qurl",
     "qvariant",
+    "qvideowidget",
     "qwidget",
 };

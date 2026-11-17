@@ -5,6 +5,8 @@ const file_ops = @import("core/file_ops.zig");
 const paths = @import("core/paths.zig");
 const search_index = @import("core/search_index.zig");
 const search_scan = @import("core/search_scan.zig");
+const settings_mod = @import("core/settings.zig");
+const settings_dialog = @import("ui/settings_dialog.zig");
 const text_sort = @import("core/text_sort.zig");
 const local_model = @import("ui/local_model.zig");
 const mounts = @import("ui/mounts.zig");
@@ -15,6 +17,7 @@ const terminal_mod = @import("ui/terminal.zig");
 
 const QAction = qt6.QAction;
 const QActionGroup = qt6.QActionGroup;
+const QAbstractItemView = qt6.QAbstractItemView;
 const QApplication = qt6.QApplication;
 const QDesktopServices = qt6.QDesktopServices;
 const QDir = qt6.QDir;
@@ -56,6 +59,7 @@ const QWidget = qt6.QWidget;
 
 const qabstractitemview_enums = qt6.qabstractitemview_enums;
 const qnamespace_enums = qt6.qnamespace_enums;
+const qsizepolicy_enums = qt6.qsizepolicy_enums;
 const qdockwidget_enums = qt6.qdockwidget_enums;
 const qfiledevice_enums = qt6.qfiledevice_enums;
 const qiodevicebase_enums = qt6.qiodevicebase_enums;
@@ -162,6 +166,7 @@ extern fn ligma_smooth_scroll_attach(view: ?*anyopaque) void;
 extern fn ligma_set_row_gradient_colors(start_r: c_int, start_g: c_int, start_b: c_int, end_r: c_int, end_g: c_int, end_b: c_int) void;
 extern fn ligma_attach_row_gradient(view: ?*anyopaque) void;
 extern fn ligma_set_list_text_alignment(view: ?*anyopaque, center: c_int) void;
+extern fn ligma_attach_typing_filter(view: ?*anyopaque, callback: *const fn (u32) callconv(.c) c_int) void;
 extern fn ligma_dock_slide_show(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_new(title: [*:0]const u8, parent: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) ?*anyopaque;
@@ -179,6 +184,9 @@ const App = struct {
     window: QMainWindow,
     tabs: QTabWidget,
     main_splitter: QSplitter,
+    sidebar: QWidget,
+    sidebar_spacer: QWidget,
+    settings: settings_mod.Settings,
     places: QListWidget,
     drives_label: QLabel,
     drives: QListWidget,
@@ -327,6 +335,12 @@ fn loadApplicationIcon() QIcon {
 }
 
 pub fn run(init: std.process.Init, qapp: QApplication) !void {
+    const settings_path = settingsPath(init.gpa) catch null;
+    defer if (settings_path) |path| init.gpa.free(path);
+    const initial_settings = if (settings_path) |path|
+        settings_mod.load(init.gpa, init.io, path)
+    else
+        settings_mod.Settings{};
     QApplication.setApplicationName("Ligma");
     QApplication.setApplicationDisplayName("Ligma");
     QApplication.setDesktopFileName("org.ligma.FileManager");
@@ -390,12 +404,19 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     drives.hide();
     sidebar_layout.addWidget(drives);
 
-    sidebar_layout.addStretch();
-
-    // Bottom-left preview: selecting a single image or video shows a larger
-    // thumbnail here, under the Places and Drives lists.
+    // The preview owns all of the remaining sidebar height below Places and
+    // Drives. It stays visible with an idle placeholder when nothing is
+    // selected.
     const preview_panel = preview_mod.PreviewPanel.create(init.gpa, init.io);
-    sidebar_layout.addWidget(preview_panel.container);
+    preview_panel.container.setMinimumHeight(160);
+    sidebar_layout.addWidget2(preview_panel.container, 1);
+
+    // Placeholder that only participates while the preview is hidden, so the
+    // sidebar lists stay at the top instead of stretching to fill the space.
+    const sidebar_spacer = QWidget.new2();
+    sidebar_spacer.setSizePolicy2(qsizepolicy_enums.Policy.Preferred, qsizepolicy_enums.Policy.Expanding);
+    sidebar_spacer.hide();
+    sidebar_layout.addWidget(sidebar_spacer);
 
     main_splitter.addWidget(sidebar);
 
@@ -569,6 +590,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     _ = edit_menu.addSeparator();
     const cancel_op_action = makeAction(edit_menu, "Cancel Operation", "Escape", onCancelOperation);
     edit_menu.addAction(cancel_op_action);
+    _ = edit_menu.addSeparator();
+    const preferences_action = makeAction(edit_menu, "Preferences…", "Ctrl+,", onOpenSettings);
+    edit_menu.addAction(preferences_action);
 
     const view_menu = QMenu.new4("&View", window);
     _ = menubar.addMenu(view_menu);
@@ -715,6 +739,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .window = window,
         .tabs = tabs,
         .main_splitter = main_splitter,
+        .sidebar = sidebar,
+        .sidebar_spacer = sidebar_spacer,
+        .settings = initial_settings,
         .places = places,
         .drives_label = drives_label,
         .drives = drives,
@@ -782,6 +809,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .undo_action = undo_action,
     };
 
+    app.preview.activate();
+    app.show_hidden = app.settings.show_hidden;
+    applySettingsChrome();
     updateAppearanceActions();
     applyThemeStyles();
 
@@ -814,6 +844,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     player_dock.onVisibilityChanged(onPlayerVisibilityChanged);
     tabs.onCurrentChanged(onTabChanged);
     tabs.onTabCloseRequested(onTabCloseRequested);
+    main_splitter.onSplitterMoved(onSplitterMoved);
     qapp.onFocusChanged(onFocusChanged);
     search_list.onItemActivated(onSearchActivated);
     global_search.onReturnPressed(onSearchReturn);
@@ -822,14 +853,15 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     file_timer.onTimeout(onFileTimer);
     model_timer.onTimeout(onModelTimer);
 
-    const first_tab = createTab(home);
+    _ = createRestoredTab(home);
     window.show();
+    applySidebarWidth(app.settings.sidebar_width);
     _ = ligma_mpris_start(&mpris_callbacks);
     ligma_mpris_notify();
     model_timer.start(50);
     mount_timer.start(2000);
     initSearchIndex(home);
-    if (first_tab.panes[0]) |pane| focusPane(pane);
+    if (activePane()) |pane| focusPane(pane);
 
     _ = QApplication.exec();
 
@@ -843,6 +875,241 @@ fn configHome(gpa: std.mem.Allocator) ![]u8 {
     }
     const home = std.c.getenv("HOME") orelse return error.NoHomeDirectory;
     return std.fs.path.join(gpa, &.{ std.mem.span(home), ".config" });
+}
+
+fn settingsPath(gpa: std.mem.Allocator) ![]u8 {
+    const config = try configHome(gpa);
+    defer gpa.free(config);
+    return std.fs.path.join(gpa, &.{ config, "ligma", "settings.toml" });
+}
+
+fn sessionPath(gpa: std.mem.Allocator) ![]u8 {
+    const config = try configHome(gpa);
+    defer gpa.free(config);
+    return std.fs.path.join(gpa, &.{ config, "ligma", "session" });
+}
+
+/// Persist the open tabs when the user asked Ligma to restore them. Only
+/// absolute folder paths are written; Trash and temporary locations start
+/// fresh instead of reviving stale state.
+fn saveSession() void {
+    const path = sessionPath(app.gpa) catch return;
+    defer app.gpa.free(path);
+    if (!app.settings.restore_last_window) {
+        std.Io.Dir.deleteFileAbsolute(app.io, path) catch {};
+        return;
+    }
+
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("{d}\n", .{app.tabs.currentIndex()}) catch return;
+    for (app.tabs_list.items) |tab| {
+        const pane = tab.panes[tab.active] orelse tab.panes[0] orelse continue;
+        const current = pane.model.currentPath() orelse continue;
+        if (current.len == 0 or current[0] != '/') continue;
+        writer.print("{s}\n", .{current}) catch break;
+    }
+
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(app.io, dir) catch {};
+    }
+    std.Io.Dir.cwd().writeFile(app.io, .{
+        .sub_path = path,
+        .data = writer.buffered(),
+        .flags = .{ .truncate = true },
+    }) catch {};
+}
+
+fn createRestoredTab(home: []const u8) *Tab {
+    if (!app.settings.restore_last_window) return createTab(home);
+    const path = sessionPath(app.gpa) catch return createTab(home);
+    defer app.gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        app.io,
+        path,
+        app.gpa,
+        std.Io.Limit.limited(64 * 1024),
+    ) catch return createTab(home);
+    defer app.gpa.free(data);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    const active_text = std.mem.trim(u8, lines.next() orelse "", " \t\r");
+    const active = std.fmt.parseInt(i32, active_text, 10) catch 0;
+
+    var first_tab: ?*Tab = null;
+    while (lines.next()) |raw| {
+        const folder = std.mem.trim(u8, raw, " \t\r");
+        if (folder.len == 0 or folder[0] != '/') continue;
+        const tab = createTab(folder);
+        if (first_tab == null) first_tab = tab;
+    }
+    if (first_tab == null) return createTab(home);
+    if (active >= 0 and active < app.tabs.count())
+        app.tabs.setCurrentIndex(active);
+    return first_tab.?;
+}
+
+fn saveSettings() void {
+    const path = settingsPath(app.gpa) catch return;
+    defer app.gpa.free(path);
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(app.io, dir) catch {};
+    }
+    settings_mod.save(app.settings, app.gpa, app.io, path) catch {};
+}
+
+var menu_style_applied: ?bool = null;
+
+fn applySettingsChrome() void {
+    const radius_changed = @abs(theme.radius_scale - app.settings.corner_radius_scale) > 0.001;
+    theme.setRadiusScale(app.settings.corner_radius_scale);
+    app.window.setWindowOpacity(app.settings.background_opacity);
+    if (menu_style_applied == null or menu_style_applied.? != app.settings.compact_menus) {
+        applyMenuStyle();
+        menu_style_applied = app.settings.compact_menus;
+    }
+
+    app.sidebar.setVisible(app.settings.show_sidebar);
+    app.sidebar_spacer.setVisible(!app.settings.show_preview);
+    app.tabs.setTabBarAutoHide(!app.settings.always_show_tab_bar);
+    app.status.setVisible(app.settings.always_show_status_bar);
+    app.preview.container.setVisible(app.settings.show_preview);
+    app.preview.setHoverEnabled(app.settings.show_preview and app.settings.video_hover_preview);
+    app.preview.setHoverSeconds(app.settings.video_hover_seconds);
+    applySidebarWidth(app.settings.sidebar_width);
+
+    const has_drives = app.settings.show_drives and app.mount_places.items.len > 0;
+    app.drives_label.setVisible(has_drives);
+    app.drives.setVisible(has_drives);
+    if (app.hidden_action) |action| action.setChecked(app.show_hidden);
+    if (radius_changed) {
+        applyThemeStyles();
+        settings_dialog.refreshTheme();
+    }
+}
+
+/// Keep menus compact like Luciole's, using the same accent-free chrome so
+/// the menus still follow the active palette.
+fn applyMenuStyle() void {
+    if (!app.settings.compact_menus) {
+        app.window.setStyleSheet("");
+        return;
+    }
+    app.window.setStyleSheet(
+        "QMenu { padding: 3px; }" ++
+            "QMenu::item { padding: 4px 28px 4px 24px; }" ++
+            "QMenu::separator { height: 1px; margin: 3px 8px; background: rgba(127, 127, 127, 0.25); }",
+    );
+}
+
+fn applySidebarWidth(width: i32) void {
+    if (!app.settings.show_sidebar) return;
+    const sizes = app.main_splitter.sizes(app.gpa);
+    defer app.gpa.free(sizes);
+    const total = if (sizes.len >= 2) sizes[0] + sizes[1] else 1240;
+    const min_right: i32 = 360;
+    const clamped = std.math.clamp(width, 160, @max(160, total - min_right));
+    var next = [_]i32{ clamped, @max(min_right, total - clamped) };
+    app.main_splitter.setSizes(&next);
+}
+
+fn onSplitterMoved(splitter: QSplitter, _: i32, _: i32) callconv(.c) void {
+    const sizes = splitter.sizes(app.gpa);
+    defer app.gpa.free(sizes);
+    if (sizes.len > 0 and app.settings.show_sidebar) {
+        app.settings.sidebar_width = std.math.clamp(sizes[0], 160, 620);
+    }
+}
+
+fn onSettingsApplied() callconv(.c) void {
+    applySettingsToAllPanes();
+}
+
+fn onSettingsTheme(index: i32) callconv(.c) void {
+    const mode: Appearance = switch (index) {
+        0 => .matugen,
+        1 => .light,
+        2 => .dark,
+        else => .system,
+    };
+    setAppearance(mode);
+}
+
+fn onSettingsSidebarWidth(width: i32) callconv(.c) void {
+    applySidebarWidth(width);
+}
+
+fn onOpenSettings(_: QAction) callconv(.c) void {
+    settings_dialog.open(
+        app.window,
+        app.gpa,
+        &app.settings,
+        @backingInt(appearance_mode),
+        matugen_available,
+        .{
+            .apply = onSettingsApplied,
+            .set_theme = onSettingsTheme,
+            .sidebar_width = onSettingsSidebarWidth,
+        },
+    );
+}
+
+fn settingsViewMode(mode: settings_mod.ViewMode) ViewMode {
+    return switch (mode) {
+        .details => .details,
+        .icons => .icons,
+        .compact => .compact,
+        .grid => .grid,
+    };
+}
+
+fn settingsThumbnailPolicy() local_model.LocalModel.ThumbnailPolicy {
+    return switch (app.settings.thumbnail_policy) {
+        .never => .never,
+        .local => .local,
+        .all => .all,
+    };
+}
+
+fn applySettingsToPane(pane: *Pane) void {
+    pane.model.setShowHidden(app.settings.show_hidden);
+    pane.model.setShowBackups(app.settings.show_backups);
+    pane.model.setDirectoriesFirst(app.settings.directories_first);
+    pane.model.setShowEmblems(app.settings.show_emblems);
+    pane.model.setThumbnailPolicy(settingsThumbnailPolicy());
+    pane.model.setThumbnailMaxMib(app.settings.thumbnail_max_mib);
+    pane.model.setVideoThumbnails(app.settings.video_thumbnails);
+
+    const order = if (app.settings.sort_descending)
+        qnamespace_enums.SortOrder.DescendingOrder
+    else
+        qnamespace_enums.SortOrder.AscendingOrder;
+    pane.tree.sortByColumn(app.settings.sortColumn(), order);
+    pane.tree.setColumnHidden(1, !app.settings.show_size_column);
+    pane.tree.setColumnHidden(2, !app.settings.show_kind_column);
+    pane.tree.setColumnHidden(3, !app.settings.show_modified_column);
+    pane.tree.setTextElideMode(if (app.settings.filename_truncation == .middle)
+        qnamespace_enums.TextElideMode.ElideMiddle
+    else
+        qnamespace_enums.TextElideMode.ElideRight);
+
+    const desired = settingsViewMode(app.settings.view_mode);
+    if (pane.view_mode != desired) {
+        applyViewMode(pane, desired);
+    } else if (desired != .details) {
+        configureListView(pane, desired);
+    }
+}
+
+fn applySettingsToAllPanes() void {
+    app.show_hidden = app.settings.show_hidden;
+    applySettingsChrome();
+    for (app.panes_list.items) |pane| applySettingsToPane(pane);
+    updateViewModeActions();
+    if (app.settings.show_preview) {
+        if (activePane()) |pane| refreshPreview(pane);
+    }
+    saveSettings();
 }
 
 fn appearanceSettingsPath(gpa: std.mem.Allocator) ![]u8 {
@@ -1007,6 +1274,7 @@ fn setAppearance(mode: Appearance) void {
         detectMatugenScheme(app.gpa, app.io);
         if (!matugen_available) {
             updateAppearanceActions();
+            settings_dialog.setThemeIndex(@backingInt(appearance_mode));
             return;
         }
     }
@@ -1015,6 +1283,8 @@ fn setAppearance(mode: Appearance) void {
     applyAppearancePalette(app.gpa, app.io);
     applyThemeStyles();
     updateAppearanceActions();
+    settings_dialog.setThemeIndex(@backingInt(mode));
+    settings_dialog.refreshTheme();
 }
 
 fn onAppearanceMatugen(_: QAction) callconv(.c) void {
@@ -1117,6 +1387,9 @@ fn shutdown() void {
     app.drive_bars.deinit(app.gpa);
     app.drive_labels.deinit(app.gpa);
     app.drive_eject_labels.deinit(app.gpa);
+    saveSession();
+    saveSettings();
+    app.settings.deinit(app.gpa);
     for (app.mount_places.items) |*volume| volume.deinit(app.gpa);
     app.mount_places.deinit(app.gpa);
     if (app.file_job) |job| {
@@ -1258,14 +1531,14 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
     ligma_attach_row_gradient(tree.ptr);
     ligma_smooth_scroll_attach(tree.ptr);
     ligma_smooth_scroll_attach(list.ptr);
+    ligma_attach_typing_filter(tree.ptr, onTypingKey);
+    ligma_attach_typing_filter(list.ptr, onTypingKey);
 
     const model = local_model.LocalModel.create(app.gpa, app.io, container) catch
         @panic("Out of memory creating model");
-    model.setShowHidden(app.show_hidden);
     model.setDropHandler(onModelDrop);
     tree.setModel(model.qt);
     list.setModel(model.qt);
-    tree.sortByColumn(0, qnamespace_enums.SortOrder.AscendingOrder);
 
     // Both views share one selection model, so switching between Details,
     // Icons, and Compact preserves the selected paths.
@@ -1289,17 +1562,20 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
         .path_edit = path_edit,
         .search_edit = search_edit,
         .selection = selection,
+        .view_mode = settingsViewMode(app.settings.view_mode),
     };
     app.panes_list.append(app.gpa, pane) catch @panic("Out of memory creating pane");
 
     tree.onClicked(onTreeClicked);
     tree.onActivated(onTreeActivated);
+    tree.onEntered(onTreeEntered);
     tree.onMousePressEvent(onTreeMousePress);
     tree.setContextMenuPolicy(qnamespace_enums.ContextMenuPolicy.CustomContextMenu);
     tree.onCustomContextMenuRequested(onTreeContextMenu);
 
     list.onClicked(onListClicked);
     list.onActivated(onListActivated);
+    list.onEntered(onListEntered);
     list.onMousePressEvent(onListMousePress);
     list.setContextMenuPolicy(qnamespace_enums.ContextMenuPolicy.CustomContextMenu);
     list.onCustomContextMenuRequested(onListContextMenu);
@@ -1311,6 +1587,11 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
     layout.setStretch(1, 1);
     tab.splitter.addWidget(container);
 
+    if (pane.view_mode != .details) {
+        configureListView(pane, pane.view_mode);
+        stack.setCurrentIndex(1);
+    }
+    applySettingsToPane(pane);
     navigateTo(pane, initial_path, true);
     return pane;
 }
@@ -1508,38 +1789,46 @@ fn applyViewMode(pane: *Pane, mode: ViewMode) void {
 }
 
 fn configureListView(pane: *Pane, mode: ViewMode) void {
+    const comfortable = app.settings.density == .comfortable;
     switch (mode) {
         .details => {},
         .icons, .grid => {
             const large = mode == .grid;
+            const icon_side: i32 = if (large) app.settings.grid_icon_size else 64;
             ligma_set_list_text_alignment(pane.list.ptr, 1);
             pane.list.setUniformItemSizes(true);
-            const icon_size = QSize.new4(if (large) 96 else 64, if (large) 96 else 64);
+            pane.list.setLayoutMode(qlistview_enums.LayoutMode.Batched);
+            const icon_size = QSize.new4(icon_side, icon_side);
             defer icon_size.delete();
             pane.list.setIconSize(icon_size);
-            const grid = QSize.new4(if (large) 176 else 132, if (large) 156 else 108);
+            const cell_w: i32 = if (comfortable) 96 else 80;
+            const cell_h: i32 = if (comfortable) 76 else 60;
+            const grid = QSize.new4(icon_side + cell_w, icon_side + cell_h);
             defer grid.delete();
             pane.list.setGridSize(grid);
             pane.list.setViewMode(qlistview_enums.ViewMode.IconMode);
             pane.list.setFlow(qlistview_enums.Flow.LeftToRight);
             pane.list.setWrapping(true);
             pane.list.setWordWrap(true);
-            pane.list.setSpacing(if (large) 10 else 8);
+            pane.list.setSpacing(if (comfortable) 12 else 8);
         },
         .compact => {
             ligma_set_list_text_alignment(pane.list.ptr, 0);
             pane.list.setUniformItemSizes(false);
-            const icon_size = QSize.new4(24, 24);
+            pane.list.setLayoutMode(qlistview_enums.LayoutMode.SinglePass);
+            const icon_side: i32 = if (comfortable) 28 else 24;
+            const icon_size = QSize.new4(icon_side, icon_side);
             defer icon_size.delete();
             pane.list.setIconSize(icon_size);
-            const grid = QSize.new4(0, 34);
+            const row_h: i32 = if (comfortable) 42 else 34;
+            const grid = QSize.new4(0, row_h);
             defer grid.delete();
             pane.list.setGridSize(grid);
             pane.list.setViewMode(qlistview_enums.ViewMode.ListMode);
             pane.list.setFlow(qlistview_enums.Flow.TopToBottom);
             pane.list.setWrapping(false);
             pane.list.setWordWrap(false);
-            pane.list.setSpacing(2);
+            pane.list.setSpacing(if (comfortable) 4 else 2);
         },
     }
 }
@@ -1556,6 +1845,13 @@ fn setViewMode(mode: ViewMode) void {
     const pane = activePane() orelse return;
     applyViewMode(pane, mode);
     updateViewModeActions();
+    app.settings.view_mode = switch (mode) {
+        .details => .details,
+        .icons => .icons,
+        .compact => .compact,
+        .grid => .grid,
+    };
+    saveSettings();
     focusPane(pane);
 }
 
@@ -1580,6 +1876,10 @@ fn onViewGrid(_: QAction) callconv(.c) void {
 /// video file. The item is the selected row — not currentIndex(), which Qt
 /// may move ahead of the selection (Shift+arrow extension).
 fn refreshPreview(pane: *Pane) void {
+    if (!app.settings.show_preview) {
+        app.preview.container.hide();
+        return;
+    }
     if (pane.model.isTrash()) {
         app.preview.hide();
         return;
@@ -2069,7 +2369,12 @@ fn openSelected(pane: *Pane, index: QModelIndex) void {
     defer app.gpa.free(path);
 
     if (pane.model.isDir(index)) {
-        navigateTo(pane, path, true);
+        if (app.settings.switch_new_tab) {
+            const tab = createTab(path);
+            if (tab.panes[tab.active]) |next| focusPane(next);
+        } else {
+            navigateTo(pane, path, true);
+        }
         return;
     }
 
@@ -2753,14 +3058,7 @@ fn onDeleteSelected(_: QAction) callconv(.c) void {
             ) catch "Permanently delete the selected items from Trash? This cannot be undone.";
         defer app.gpa.free(forced_message);
 
-        const forced_answer = QMessageBox.question2(
-            app.window,
-            "Delete from Trash",
-            forced_message,
-            qmessagebox_enums.StandardButton.Yes,
-            qmessagebox_enums.StandardButton.No,
-        );
-        if (forced_answer != qmessagebox_enums.StandardButton.Yes) return;
+        if (!confirmPermanentDelete("Delete from Trash", forced_message)) return;
 
         const purge_job = file_ops.Job.createPurge(app.gpa, app.io, items.items) catch {
             showStatus("Could not start the delete operation", 3500);
@@ -2795,20 +3093,24 @@ fn onDeleteSelected(_: QAction) callconv(.c) void {
         ) catch "Permanently delete the selected items? This cannot be undone.";
     defer app.gpa.free(message);
 
-    const answer = QMessageBox.question2(
-        app.window,
-        "Delete Permanently",
-        message,
-        qmessagebox_enums.StandardButton.Yes,
-        qmessagebox_enums.StandardButton.No,
-    );
-    if (answer != qmessagebox_enums.StandardButton.Yes) return;
+    if (!confirmPermanentDelete("Delete Permanently", message)) return;
 
     const job = file_ops.Job.createDelete(app.gpa, app.io, selected.items) catch {
         showStatus("Could not start the delete operation", 3500);
         return;
     };
     _ = startFileJob(job, false);
+}
+
+fn confirmPermanentDelete(title: []const u8, message: []const u8) bool {
+    if (!app.settings.confirm_delete) return true;
+    return QMessageBox.question2(
+        app.window,
+        title,
+        message,
+        qmessagebox_enums.StandardButton.Yes,
+        qmessagebox_enums.StandardButton.No,
+    ) == qmessagebox_enums.StandardButton.Yes;
 }
 
 fn onProperties(_: QAction) callconv(.c) void {
@@ -3630,7 +3932,7 @@ fn refreshMountedPlaces() void {
         app.drive_bars.append(app.gpa, bar) catch {};
     }
 
-    const has_drives = app.mount_places.items.len > 0;
+    const has_drives = app.settings.show_drives and app.mount_places.items.len > 0;
     app.drives_label.setVisible(has_drives);
     app.drives.setVisible(has_drives);
 
@@ -4674,12 +4976,27 @@ fn withoutTrailingSlash(path: []const u8) []const u8 {
 
 const AddPlaceResult = enum { added, duplicate, failed };
 
-fn onTreeClicked(tree: QTreeView, _: QModelIndex) callconv(.c) void {
-    _ = activateFromWidget(tree);
+/// In single-click mode the first click acts immediately. Ignore the second
+/// click of a double-click so it cannot open whatever moved under the pointer
+/// after a folder navigation.
+var single_click_guard_until: i64 = 0;
+
+fn singleClickOpen(pane: *Pane, index: QModelIndex) void {
+    if (!index.isValid()) return;
+    const now = nowMilliseconds();
+    if (now < single_click_guard_until) return;
+    single_click_guard_until = now + @as(i64, QApplication.doubleClickInterval());
+    openSelected(pane, index);
 }
 
-fn onListClicked(list: QListView, _: QModelIndex) callconv(.c) void {
-    _ = activateFromWidget(list);
+fn onTreeClicked(tree: QTreeView, index: QModelIndex) callconv(.c) void {
+    const pane = activateFromWidget(tree) orelse return;
+    if (app.settings.activation == .single_click) singleClickOpen(pane, index);
+}
+
+fn onListClicked(list: QListView, index: QModelIndex) callconv(.c) void {
+    const pane = activateFromWidget(list) orelse return;
+    if (app.settings.activation == .single_click) singleClickOpen(pane, index);
 }
 
 fn setDragCopyHintFromEvent(pane: *Pane, event: QMouseEvent) void {
@@ -4698,6 +5015,51 @@ fn onTreeMousePress(tree: QTreeView, event: QMouseEvent) callconv(.c) void {
 fn onListMousePress(list: QListView, event: QMouseEvent) callconv(.c) void {
     if (findPaneContaining(list)) |pane| setDragCopyHintFromEvent(pane, event);
     list.superMousePressEvent(event);
+}
+
+fn paneForView(view: QAbstractItemView) ?*Pane {
+    const address = @intFromPtr(view.ptr orelse return null);
+    for (app.panes_list.items) |pane| {
+        if (@intFromPtr(pane.tree.ptr orelse continue) == address) return pane;
+        if (@intFromPtr(pane.list.ptr orelse continue) == address) return pane;
+    }
+    return null;
+}
+
+fn onTreeEntered(tree: QTreeView, index: QModelIndex) callconv(.c) void {
+    onViewEntered(.{ .ptr = @ptrCast(tree.ptr) }, index);
+}
+
+fn onListEntered(list: QListView, index: QModelIndex) callconv(.c) void {
+    onViewEntered(.{ .ptr = @ptrCast(list.ptr) }, index);
+}
+
+fn onTypingKey(codepoint: u32) callconv(.c) c_int {
+    if (app.settings.typing_mode == .typeahead) return 0;
+    if (codepoint > 0x10ffff) return 0;
+    var buffer: [4]u8 = undefined;
+    const length = std.unicode.utf8Encode(@intCast(codepoint), &buffer) catch return 0;
+    const text = buffer[0..length];
+    if (app.settings.typing_mode == .filter) {
+        const pane = activePane() orelse return 0;
+        pane.search_edit.setFocus();
+        pane.search_edit.setText(text);
+        return 1;
+    }
+    app.global_search.setFocus();
+    app.global_search.setText(text);
+    return 1;
+}
+
+fn onViewEntered(view: QAbstractItemView, index: QModelIndex) callconv(.c) void {
+    if (!index.isValid()) return;
+    const pane = paneForView(view) orelse return;
+    const entry = pane.model.entryAt(index) orelse return;
+    if (entry.is_dir) {
+        app.preview.hoverVideo("");
+        return;
+    }
+    app.preview.hoverVideo(entry.path);
 }
 
 fn onTreeActivated(tree: QTreeView, index: QModelIndex) callconv(.c) void {
@@ -4881,12 +5243,14 @@ fn onRebuildIndex(_: QAction) callconv(.c) void {
 
 fn onToggleHidden(_: QAction) callconv(.c) void {
     app.show_hidden = !app.show_hidden;
+    app.settings.show_hidden = app.show_hidden;
     if (app.hidden_action) |action| action.setChecked(app.show_hidden);
 
     for (app.panes_list.items) |pane| {
         pane.model.setShowHidden(app.show_hidden);
         if (isActivePane(pane)) refreshCount(pane);
     }
+    saveSettings();
 }
 
 fn onToggleSplit(_: QAction) callconv(.c) void {
@@ -4941,7 +5305,15 @@ fn openTerminalAt(directory: []const u8) void {
     }
     app.terminal_dock.raise();
     if (!app.terminal_started) {
-        app.terminal_started = terminal_mod.start(app.terminal_widget, app.gpa, userShell(), directory);
+        app.terminal_started = if (app.settings.terminal_command.len > 0)
+            terminal_mod.startCommand(
+                app.terminal_widget,
+                app.gpa,
+                app.settings.terminal_command,
+                directory,
+            )
+        else
+            terminal_mod.start(app.terminal_widget, app.gpa, userShell(), directory);
     } else {
         _ = terminal_mod.changeDirectory(app.terminal_widget, app.gpa, directory);
     }

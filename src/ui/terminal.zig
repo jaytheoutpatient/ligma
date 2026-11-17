@@ -19,6 +19,7 @@ extern fn ligma_terminal_new(
     toggle: ToggleCallback,
 ) ?*anyopaque;
 extern fn ligma_terminal_start(handle: ?*anyopaque, shell: [*:0]const u8, working_directory: [*:0]const u8) void;
+extern fn ligma_terminal_start_command(handle: ?*anyopaque, command: [*:0]const u8, working_directory: [*:0]const u8) void;
 extern fn ligma_terminal_set_focus(handle: ?*anyopaque) void;
 extern fn ligma_terminal_change_dir(handle: ?*anyopaque, working_directory: [*:0]const u8) void;
 extern fn ligma_terminal_shutdown(handle: ?*anyopaque) void;
@@ -38,6 +39,15 @@ pub fn start(widget: QWidget, gpa: std.mem.Allocator, shell: []const u8, working
     const cwd_z = gpa.dupeSentinel(u8, working_directory, 0) catch return false;
     defer gpa.free(cwd_z);
     ligma_terminal_start(widget.ptr, shell_z, cwd_z);
+    return true;
+}
+
+pub fn startCommand(widget: QWidget, gpa: std.mem.Allocator, command: []const u8, working_directory: []const u8) bool {
+    const command_z = gpa.dupeSentinel(u8, command, 0) catch return false;
+    defer gpa.free(command_z);
+    const cwd_z = gpa.dupeSentinel(u8, working_directory, 0) catch return false;
+    defer gpa.free(cwd_z);
+    ligma_terminal_start_command(widget.ptr, command_z, cwd_z);
     return true;
 }
 

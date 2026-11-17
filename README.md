@@ -37,6 +37,7 @@ This repository contains a working **v0.5 prototype**:
 - **Drives** — the sidebar lists mounted volumes plus unmounted USB/removable partitions. Mounted rows show a free-space label and a used-capacity progress bar; unmounted rows show **not mounted** and mount when clicked. Mounted drives sort before unmounted ones, and both groups sort naturally by label (so `Game Drive 10` follows `Game Drive 9`). USB filesystems without a label use the drive model instead of a UUID. Mounted removable drives get an **⏏ eject button**; right-click offers **Safely Remove** (unmount, then power off via UDisks2) or **Unmount**. Tooltips include the mount path, device, filesystem, and free/total space, and the list updates automatically when devices appear, mount, unmount, or disappear
 - **Compact sidebar** — the Places and Drives lists size themselves to their contents and scroll once they reach a height cap, instead of leaving a large empty box. List borders are removed; selected and hovered rows use solid-to-transparent theme-accent gradients, and drive usage bars fade to transparent at their fill edge
 - **Appearance** — **View > Appearance** switches between **Matugen**, **Light**, **Dark**, and **System**. Matugen reads the active qt6ct color scheme, so the file manager follows the same Material You palette as Qt applications; Light/Dark are built-in palettes and System follows the desktop. The choice persists in `$XDG_CONFIG_HOME/ligma/appearance` (or `~/.config/ligma/appearance`), and switching updates the sidebar, file pane, music player, and drive bars immediately. The Matugen entry is disabled when no scheme is installed
+- **Settings** — **Edit > Preferences…** (`Ctrl+,`) opens a Ligma-styled settings window with General, Appearance, Views, Thumbnails, and Preview categories. Changes apply live; behavior, view, sidebar, preview, thumbnail, and window preferences persist in `$XDG_CONFIG_HOME/ligma/settings.toml`, while the color theme stays in `ligma/appearance`. Controls cover click activation, typing behavior, delete confirmation, new-tab switching, session restore, terminal command, theme, window opacity, corner roundness, compact menus, tab/status bar visibility, sidebar and drives, sidebar width, preview visibility and hover length, view mode, density, elision, emblems, hidden/backup files, sorting, grid icon size, list columns, thumbnail policy and size limit, and video thumbnail/hover toggles
 - Back / forward / up / home / reload navigation with per-pane history
 - Editable path bar with `~`, relative-path, and `file://` resolution
 - In-memory current-folder filter and folder-first sorting by any column
@@ -44,8 +45,8 @@ This repository contains a working **v0.5 prototype**:
 - Opens files with the desktop's default application, except audio files that play in the built-in music player
 - **Tabs** — `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+W`
 - **Split view** — `F3` toggles, `F6` focuses the other pane; panes keep independent history and filters
-- **View modes** — **Details** (`Ctrl+1`), **Icons** (`Ctrl+2`), **Compact** (`Ctrl+3`), and **Grid** (`Ctrl+4`). The Details and grid-style views share one selection model, so switching modes preserves the selected paths. Grid uses larger adaptive tiles with wrapped names and image thumbnails; Icons is the denser icon grid. Details rows use a full-row gradient delegate for selection and hover (readable light-theme text and light-on-dark text), while the icon, grid, and compact views use the shared list gradient
-- **File-type icons** — every file resolves through the system MIME icon theme with a generic MIME-family fallback, so documents, images, audio, video, archives, scripts, and launchers each get an appropriate icon. Home and the XDG folders use special themed icons (`folder-music`, `folder-pictures`, etc.), `.desktop` files use their declared `Icon=` entry, and image files render a scaled thumbnail. Symlinks keep the provider's link badge
+- **View modes** — **Details** (`Ctrl+1`), **Icons** (`Ctrl+2`), **Compact** (`Ctrl+3`), and **Grid** (`Ctrl+4`). The Details and grid-style views share one selection model, so switching modes preserves the selected paths. Grid uses larger adaptive tiles with wrapped names and image/video thumbnails; Icons is the denser icon grid. Details rows use a full-row gradient delegate for selection and hover (readable light-theme text and light-on-dark text), while the icon, grid, and compact views use the shared list gradient
+- **File-type icons** — every file resolves through the system MIME icon theme with a generic MIME-family fallback, so documents, images, audio, video, archives, scripts, and launchers each get an appropriate icon. Home and the XDG folders use special themed icons (`folder-music`, `folder-pictures`, etc.), `.desktop` files use their declared `Icon=` entry, image files render a scaled thumbnail, and video files render a frame extracted in the background by ffmpeg. Symlinks keep the provider's link badge
 - **Natural filename sorting** — names sort case-insensitively with numeric runs compared by value, so `Track 2` precedes `Track 10` and `Album 9` precedes `Album 10`. The same ordering applies to files, Trash original paths, drive labels, and recursively queued music
 - **Global filename search** — `Ctrl+Shift+F`, streamed results in a search dock
 - **SQLite FTS5 search index** — automatic background build, trigram substring matching, status-bar health, and `View > Rebuild Search Index`
@@ -58,7 +59,7 @@ This repository contains a working **v0.5 prototype**:
 - **Embedded terminal** — `F12` toggles a terminal panel docked on the right; the first open starts the user's shell in the active folder, and the session survives hiding and reopening. Opening and closing the panel, and the music player, slide in from their dock edges; closing with the dock's title-bar button animates the same way
 - **Smooth scrolling** — wheel events animate the Places, Drives, file views, search results, and player playlist instead of jumping by whole rows
 - **Run executables** — activating an executable file asks for confirmation, then launches it detached with its folder as the working directory
-- **Preview panel** — selecting exactly one image or video file shows a larger thumbnail in the window's bottom-left corner
+- **Preview panel** — the whole sidebar area below Places and Drives is a persistent preview panel. It shows a scaled image, an ffmpeg video frame, or a file summary, and hovering a video plays a short muted snippet
 - **Built-in music player** — GStreamer-powered playback with prev/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, optional EQ/ReplayGain, and a playlist. A direct-ALSA/bit-perfect output mode is available for exclusive playback. Natural completion keeps the queue and advances to the next track; the context menu adds **Play** and **Add to Playlist**
 - **MPRIS / playerctl** — exposes `org.mpris.MediaPlayer2.ligma` with root and Player interfaces, so desktop media keys, `playerctl`, panels, and other MPRIS clients can read metadata, seek, set volume, change loop/shuffle, and control playback
 - **Discord Rich Presence** — shows the current song and artist in Discord through its local IPC socket, optionally enriched with canonical MusicBrainz title/artist/album data
@@ -70,14 +71,22 @@ Not implemented yet: metadata, remote locations, archives, and extensions. See t
 
 ## Preview panel
 
-Selecting exactly one file whose MIME type is `image/` or `video/*` shows a thumbnail in a small panel at the bottom of the sidebar, below Places and Drives. The panel hides for folders, text files, multi-selections, and empty selections.
+The panel occupies all of the sidebar space below Places and Drives and stays visible with an idle placeholder when nothing is selected. It updates from the selection model, not the current index, so Shift+arrow extensions and model resets resolve correctly.
 
-- Images are decoded with `QImageReader` straight into the display size, so opening a large photo never allocates the full image.
-- Video thumbnails are extracted by an asynchronous `ffmpeg -ss 1 -frames:v 1` job into a temporary PNG; videos shorter than the one-second seek are retried from frame 0.
-- MIME classification is content-aware (`QMimeDatabase.mimeTypeForFile`), not extension-based.
-- Selection semantics follow the selection model, not the current index: the panel tracks `selectionChanged`, so Shift+arrow extensions (where Qt moves the current index before extending the selection) and model resets (which clear the selection without a signal) both resolve correctly.
+- Selecting one image shows a scaled preview via `QImageReader`; the full image is never allocated at its original size.
+- Selecting one video extracts a frame with an asynchronous `ffmpeg -ss 1 -frames:v 1` job into a temporary PNG. Videos shorter than the one-second seek are retried from frame 0.
+- Hovering a video row plays a muted, looping snippet in the panel through Qt Multimedia. Moving away restores the selected item's preview, and the snippet stops after the configured interval.
+- Folders, multi-selections, and empty selections show the idle placeholder; other single files show their name and size. The panel stays visible throughout.
+- Video files also use an extracted frame as their icon in Icons and Grid views. Extraction runs one job at a time in the background, with a bounded queue, so large clip folders keep scrolling smoothly.
+- MIME classification uses fast extension checks for common image/video files and falls back to a shared `QMimeDatabase` for unusual types.
 
-Current limitations: no thumbnail cache, one ffmpeg process per selection change, no debouncing, and a fixed 212×168 thumbnail box that does not adapt to the sidebar width. These are tracked for the thumbnail/cache milestone in the spec.
+## Settings
+
+Open Settings with `Ctrl+,` or **Edit > Preferences…**. The window uses the same accent gradients, rounded cards, and compact spacing as the rest of Ligma. Changes apply immediately; there is no Apply button, and **Reset All** restores the built-in defaults.
+
+Settings are stored in `$XDG_CONFIG_HOME/ligma/settings.toml` (or `~/.config/ligma/settings.toml`) and survive restarts. The open tabs are saved in `$XDG_CONFIG_HOME/ligma/session` when **Restore tabs from last window** is enabled; absolute folder tabs are restored and the previous active tab is selected. When the option is off, the session file is removed.
+
+The theme choice remains in `$XDG_CONFIG_HOME/ligma/appearance`, since it is also reachable from **View > Appearance** and from Matugen/qt6ct.
 
 ## Terminal panel
 
@@ -210,8 +219,9 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 
 - Linux
 - Zig **0.17.0+** (the build script downloads an official compiler into `.tools/` when needed)
-- Qt **6.8+** development files (tested with 6.12.0; QtWidgets, QtNetwork, and QtDBus)
+- Qt **6.8+** development files (tested with 6.12.0; QtWidgets, QtNetwork, QtDBus, QtMultimedia, and QtMultimediaWidgets)
 - GStreamer **1.x** development files and the base/good/bad/ugly plugin sets, plus a PipeWire or ALSA sink
+- **ffmpeg** for video thumbnails and the static video preview frame
 - QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`; Debian: `libqtermwidget-dev`; newer Ubuntu: `libqtermwidget6-2-dev`)
 - SQLite 3 development files with FTS5 and the trigram tokenizer (tested with 3.54.1)
 - `util-linux` (`lsblk`, `umount`) and **UDisks2** (`udisksctl`) for USB/removable-drive detection and mounting
@@ -221,8 +231,8 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 On Debian/Ubuntu-style systems:
 
 ```bash
-sudo apt install build-essential pkg-config qt6-base-dev \
-  libsqlite3-dev libutf8proc-dev libqtermwidget-dev \
+sudo apt install build-essential pkg-config qt6-base-dev qt6-multimedia-dev \
+  libsqlite3-dev libutf8proc-dev libqtermwidget-dev ffmpeg \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
@@ -236,7 +246,7 @@ sudo apt install build-essential pkg-config qt6-base-dev \
 On Arch Linux:
 
 ```bash
-sudo pacman -S qt6-base sqlite qtermwidget utf8proc \
+sudo pacman -S qt6-base qt6-multimedia sqlite qtermwidget utf8proc ffmpeg \
   gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
   gst-plugins-ugly gst-plugin-pipewire udisks2 util-linux
 ```
@@ -307,6 +317,7 @@ sudo update-desktop-database /usr/share/applications
 | `Ctrl+T` / `Ctrl+W` | New tab / close tab |
 | `Ctrl+Shift+W` | Close window |
 | `F3` / `F6` | Toggle split view / focus other pane |
+| `Ctrl+,` | Open Settings |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` | Details / Icons / Compact / Grid view |
 | `F12` | Toggle the terminal panel |
 | `F9` | Toggle the music player |

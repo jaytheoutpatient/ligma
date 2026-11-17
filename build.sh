@@ -101,7 +101,8 @@ system_deps_ready() {
     command -v pkg-config >/dev/null 2>&1 || return 1
     command -v lsblk >/dev/null 2>&1 || return 1
     command -v udisksctl >/dev/null 2>&1 || return 1
-    pkg-config --exists qtermwidget6 gstreamer-1.0 sqlite3 Qt6DBus
+    command -v ffmpeg >/dev/null 2>&1 || return 1
+    pkg-config --exists qtermwidget6 gstreamer-1.0 sqlite3 Qt6DBus Qt6Multimedia Qt6MultimediaWidgets
 }
 
 ZIG_BOOTSTRAP_VERSION="0.17.0"
@@ -296,20 +297,20 @@ install_deps() {
     setup_privilege
 
     if command -v pacman >/dev/null 2>&1; then
-        local packages=(base-devel pkgconf qt6-base sqlite qtermwidget
+        local packages=(base-devel pkgconf qt6-base qt6-multimedia sqlite qtermwidget
             utf8proc gstreamer gst-plugins-base gst-plugins-good
             gst-plugins-bad gst-plugins-ugly gst-plugin-pipewire
-            udisks2 util-linux zig)
+            udisks2 util-linux ffmpeg zig)
         printf 'Detected pacman. Installing: %s\n' "${packages[*]}"
         confirm_install pacman
         run_priv pacman -S --needed --noconfirm "${packages[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
-        local packages=(build-essential pkg-config qt6-base-dev
+        local packages=(build-essential pkg-config qt6-base-dev qt6-multimedia-dev
             libsqlite3-dev libutf8proc-dev libgstreamer1.0-dev
             libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base
             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
             gstreamer1.0-plugins-ugly gstreamer1.0-pipewire
-            gstreamer1.0-alsa udisks2 util-linux)
+            gstreamer1.0-alsa udisks2 util-linux ffmpeg)
         run_priv apt-get update
         local candidate=""
         local qterm_package=""
@@ -330,12 +331,12 @@ install_deps() {
         confirm_install apt
         run_priv apt-get install -y "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        local packages=(gcc-c++ pkgconf-pkg-config qt6-qtbase-devel
+        local packages=(gcc-c++ pkgconf-pkg-config qt6-qtbase-devel qt6-qtmultimedia-devel
             sqlite-devel qtermwidget-devel utf8proc-devel
             gstreamer1-devel gstreamer1-plugins-base-devel
             gstreamer1-plugins-base gstreamer1-plugins-good
             gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free
-            pipewire-gstreamer udisks2 util-linux)
+            pipewire-gstreamer udisks2 util-linux ffmpeg)
         printf 'Detected dnf. Installing: %s\n' "${packages[*]}"
         confirm_install dnf
         run_priv dnf install -y "${packages[@]}"
@@ -366,6 +367,9 @@ need_pkg qtermwidget6
 need_pkg gstreamer-1.0
 need_pkg sqlite3
 need_pkg Qt6DBus
+need_pkg Qt6Multimedia
+need_pkg Qt6MultimediaWidgets
+need_command ffmpeg
 
 printf 'Ligma build\n'
 printf '  Zig:      %s\n' "$(zig version)"

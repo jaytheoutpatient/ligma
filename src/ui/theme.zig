@@ -15,6 +15,18 @@ pub const Rgb = struct {
 pub var accent_start: Rgb = .{ .r = 59, .g = 130, .b = 246 };
 pub var accent_end: Rgb = .{ .r = 99, .g = 102, .b = 241 };
 
+/// Multiplies the corner radius used by rows, cards, and progress bars.
+/// 1.0 is the default look; 0 is square, 2 is extra round.
+pub var radius_scale: f64 = 1.0;
+
+pub fn setRadiusScale(value: f64) void {
+    radius_scale = std.math.clamp(value, 0.0, 2.0);
+}
+
+pub fn radius(base: i32) i32 {
+    return std.math.clamp(@as(i32, @intFromFloat(@as(f64, @floatFromInt(base)) * radius_scale)), 0, 32);
+}
+
 pub fn parseHexColor(text: []const u8) ?Rgb {
     const value = std.mem.trim(u8, text, " \t\r\n");
     if (value.len != 7 or value[0] != '#') return null;
@@ -38,7 +50,7 @@ pub fn listStyle(buffer: []u8) []const u8 {
     return std.fmt.bufPrint(
         buffer,
         "QListWidget {{ background: transparent; border: none; outline: none; padding: 2px; }}" ++
-            "QListWidget::item {{ border: none; border-radius: 6px; padding: 4px 6px; margin: 1px 0; }}" ++
+            "QListWidget::item {{ border: none; border-radius: {d}px; padding: 4px 6px; margin: 1px 0; }}" ++
             "QListWidget::item:hover {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
             "stop:0 rgba({d}, {d}, {d}, 0.34), stop:1 rgba({d}, {d}, {d}, 0.0)); }}" ++
             "QListWidget::item:selected {{ color: white; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
@@ -52,11 +64,22 @@ pub fn listStyle(buffer: []u8) []const u8 {
             "QListWidget QScrollBar::add-page:vertical, QListWidget QScrollBar::sub-page:vertical " ++
             "{{ background: transparent; }}",
         .{
-            accent_start.r, accent_start.g, accent_start.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
-            accent_start.r, accent_start.g, accent_start.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
+            radius(6),
+            accent_start.r,
+            accent_start.g,
+            accent_start.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
+            accent_start.r,
+            accent_start.g,
+            accent_start.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
         },
     ) catch "QListWidget { background: transparent; border: none; }";
 }
@@ -73,11 +96,21 @@ pub fn viewStyle(buffer: []u8) []const u8 {
             "stop:0 rgba({d}, {d}, {d}, 0.85), stop:0.6 rgba({d}, {d}, {d}, 0.45), " ++
             "stop:1 rgba({d}, {d}, {d}, 0.0)); }}",
         .{
-            accent_start.r, accent_start.g, accent_start.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
-            accent_start.r, accent_start.g, accent_start.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
+            accent_start.r,
+            accent_start.g,
+            accent_start.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
+            accent_start.r,
+            accent_start.g,
+            accent_start.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
         },
     ) catch "QTreeView, QListView { outline: 0; }";
 }
@@ -85,14 +118,22 @@ pub fn viewStyle(buffer: []u8) []const u8 {
 pub fn progressStyle(buffer: []u8) []const u8 {
     return std.fmt.bufPrint(
         buffer,
-        "QProgressBar {{ border: 0; border-radius: 3px; background: rgba(128, 128, 128, 0.22); }}" ++
-            "QProgressBar::chunk {{ border-radius: 3px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
+        "QProgressBar {{ border: 0; border-radius: {d}px; background: rgba(128, 128, 128, 0.22); }}" ++
+            "QProgressBar::chunk {{ border-radius: {d}px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
             "stop:0 rgba({d}, {d}, {d}, 1.0), stop:0.58 rgba({d}, {d}, {d}, 0.72), " ++
             "stop:1 rgba({d}, {d}, {d}, 0.0)); }}",
         .{
-            accent_start.r, accent_start.g, accent_start.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
-            accent_end.r,   accent_end.g,   accent_end.b,
+            radius(3),
+            radius(3),
+            accent_start.r,
+            accent_start.g,
+            accent_start.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
+            accent_end.r,
+            accent_end.g,
+            accent_end.b,
         },
     ) catch "QProgressBar { border: 0; }";
 }

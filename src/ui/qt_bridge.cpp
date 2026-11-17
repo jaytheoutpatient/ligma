@@ -8,10 +8,12 @@
 #include <QAbstractItemView>
 #include <QCloseEvent>
 #include <QApplication>
+#include <QCheckBox>
 #include <QDockWidget>
 #include <QEasingCurve>
 #include <QEvent>
 #include <QIcon>
+#include <QKeyEvent>
 #include <QLinearGradient>
 #include <QMouseEvent>
 #include <QPainter>
@@ -42,6 +44,62 @@ QRect treeRowRect(const QTreeView *tree, const QModelIndex &index, const QRect &
         return fallback;
     return QRect(0, cell.top(), tree->viewport()->width(), height);
 }
+
+using TypingCallback = int (*)(unsigned int codepoint);
+
+class TypingFilter final : public QObject {
+  public:
+    TypingFilter(QObject *parent, TypingCallback callback)
+        : QObject(parent)
+        , callback_(callback)
+    {
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() != QEvent::KeyPress)
+            return QObject::eventFilter(watched, event);
+        auto *key = static_cast<QKeyEvent *>(event);
+        if ((key->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)) != 0)
+            return QObject::eventFilter(watched, event);
+        const QString text = key->text();
+        if (text.isEmpty())
+            return QObject::eventFilter(watched, event);
+        const uint codepoint = text.at(0).unicode();
+        if (codepoint < 32)
+            return QObject::eventFilter(watched, event);
+        if (callback_ != nullptr && callback_(codepoint) != 0)
+            return true;
+        return QObject::eventFilter(watched, event);
+    }
+
+  private:
+    TypingCallback callback_;
+};
+
+class RowToggleFilter final : public QObject {
+  public:
+    RowToggleFilter(QObject *parent, QCheckBox *box)
+        : QObject(parent)
+        , box_(box)
+    {
+    }
+
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() == QEvent::MouseButtonRelease) {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+            if (mouse->button() == Qt::LeftButton && box_ != nullptr) {
+                box_->toggle();
+                return true;
+            }
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+  private:
+    QCheckBox *box_;
+};
 
 class CenteredGridDelegate final : public QStyledItemDelegate {
   public:
@@ -305,6 +363,22 @@ void *ligma_qvariant_from_icon(void *icon)
     if (icon == nullptr)
         return nullptr;
     return new QVariant(*static_cast<QIcon *>(icon));
+}
+
+void ligma_checkbox_row_click(void *text_pointer, void *checkbox_pointer)
+{
+    auto *text = static_cast<QWidget *>(text_pointer);
+    auto *box = static_cast<QCheckBox *>(checkbox_pointer);
+    if (text != nullptr && box != nullptr)
+        text->installEventFilter(new RowToggleFilter(text, box));
+}
+
+void ligma_attach_typing_filter(void *view_pointer, TypingCallback callback)
+{
+    auto *view = static_cast<QAbstractItemView *>(view_pointer);
+    if (view == nullptr || view->viewport() == nullptr)
+        return;
+    view->viewport()->installEventFilter(new TypingFilter(view->viewport(), callback));
 }
 
 void ligma_set_list_text_alignment(void *view_pointer, int center)
