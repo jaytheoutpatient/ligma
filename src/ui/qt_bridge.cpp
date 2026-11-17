@@ -18,6 +18,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPalette>
 #include <QPropertyAnimation>
 #include <QScrollBar>
 #include <QString>
@@ -363,6 +364,56 @@ void *ligma_qvariant_from_icon(void *icon)
     if (icon == nullptr)
         return nullptr;
     return new QVariant(*static_cast<QIcon *>(icon));
+}
+
+/// Applies the window's background tint without fading its contents. The
+/// tint comes from the active palette's Window color, so Light, Dark, and
+/// Matugen all keep their own character. Below full opacity the top-level
+/// window becomes translucent and the large file-view surfaces stop painting
+/// their own opaque background; labels, icons, and input fields stay opaque.
+void ligma_apply_window_chrome(void *window_pointer, double opacity, int compact_menus)
+{
+    auto *window = static_cast<QWidget *>(window_pointer);
+    if (window == nullptr)
+        return;
+
+    const double clamped = std::clamp(opacity, 0.0, 1.0);
+    const bool translucent = clamped < 0.999;
+    window->setAttribute(Qt::WA_StyledBackground, true);
+    window->setAttribute(Qt::WA_TranslucentBackground, translucent);
+    if (!translucent)
+        window->setAttribute(Qt::WA_NoSystemBackground, false);
+
+    QString style;
+    if (translucent) {
+        const QColor tint = QApplication::palette().color(QPalette::Window);
+        const int alpha = qRound(clamped * 255.0);
+        const QString background = QString("rgba(%1, %2, %3, %4)")
+                                       .arg(tint.red())
+                                       .arg(tint.green())
+                                       .arg(tint.blue())
+                                       .arg(alpha);
+        style += "QMainWindow { background: transparent; }";
+        style += "QSplitter { background-color: " + background + "; }";
+        style += "QTabWidget, QTabWidget::pane, QTabBar, QStackedWidget "
+                 "{ background: transparent; }";
+        style += "QTreeView, QListView { background: transparent; }";
+        style += "QHeaderView { background-color: " + background + "; }";
+        style += "QHeaderView::section { background-color: " + background + "; "
+                 "border: none; padding: 2px 4px; }";
+        style += "QMenuBar, QMenuBar::item, QStatusBar "
+                 "{ background-color: " + background + "; }";
+    }
+
+    if (compact_menus != 0) {
+        style += "QMenu { padding: 3px; }";
+        style += "QMenu::item { padding: 4px 28px 4px 24px; }";
+        style += "QMenu::separator { height: 1px; margin: 3px 8px; "
+                 "background: rgba(127, 127, 127, 0.25); }";
+    }
+
+    window->setStyleSheet(style);
+    window->update();
 }
 
 void ligma_checkbox_row_click(void *text_pointer, void *checkbox_pointer)

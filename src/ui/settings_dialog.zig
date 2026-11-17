@@ -22,6 +22,7 @@ const QLineEdit = qt6.QLineEdit;
 const QListWidget = qt6.QListWidget;
 const QPushButton = qt6.QPushButton;
 const QScrollArea = qt6.QScrollArea;
+const QSlider = qt6.QSlider;
 const QSpinBox = qt6.QSpinBox;
 const QStackedWidget = qt6.QStackedWidget;
 const QVBoxLayout = qt6.QVBoxLayout;
@@ -39,6 +40,8 @@ pub const Callbacks = struct {
     set_theme: *const fn (mode: i32) callconv(.c) void,
     /// Resize the sidebar without touching any other window state.
     sidebar_width: *const fn (width: i32) callconv(.c) void,
+    /// Update only the window background tint while the slider is moving.
+    background_opacity: *const fn (opacity: f64) callconv(.c) void,
 };
 
 const Ui = struct {
@@ -55,7 +58,8 @@ const Ui = struct {
     terminal: QLineEdit = undefined,
 
     theme: QComboBox = undefined,
-    opacity: QDoubleSpinBox = undefined,
+    opacity: QSlider = undefined,
+    opacity_value: QLabel = undefined,
     corner: QDoubleSpinBox = undefined,
     compact_menus: QCheckBox = undefined,
     always_tabs: QCheckBox = undefined,
@@ -236,6 +240,21 @@ fn onAnyDoubleSpin(_: QDoubleSpinBox, _: f64) callconv(.c) void {
     commit();
 }
 
+fn onOpacityChanged(_: QSlider, value: i32) callconv(.c) void {
+    updateOpacityLabel(value);
+    if (suppress) return;
+    settings_ptr.background_opacity = @as(f64, @floatFromInt(value)) / 100.0;
+    // Re-applying every pane setting on each drag step would be needless
+    // work, so the slider only rebuilds the window chrome.
+    callbacks.background_opacity(settings_ptr.background_opacity);
+}
+
+fn updateOpacityLabel(value: i32) void {
+    var buffer: [16]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "{d}%", .{value}) catch "";
+    ui.opacity_value.setText(text);
+}
+
 fn onAnyText(_: QLineEdit) callconv(.c) void {
     commit();
 }
@@ -274,7 +293,7 @@ fn commit() void {
             ui.gpa.dupe(u8, terminal_text) catch &.{};
     }
 
-    s.background_opacity = ui.opacity.value();
+    s.background_opacity = @as(f64, @floatFromInt(ui.opacity.value())) / 100.0;
     s.corner_radius_scale = ui.corner.value();
     s.compact_menus = ui.compact_menus.isChecked();
     s.always_show_tab_bar = ui.always_tabs.isChecked();
@@ -347,7 +366,8 @@ fn syncControls(settings: *const settings_mod.Settings) void {
     ui.restore_last_window.setChecked(settings.restore_last_window);
     ui.terminal.setText(settings.terminal_command);
 
-    ui.opacity.setValue(settings.background_opacity);
+    ui.opacity.setValue(@intFromFloat(@round(settings.background_opacity * 100.0)));
+    updateOpacityLabel(ui.opacity.value());
     ui.corner.setValue(settings.corner_radius_scale);
     ui.compact_menus.setChecked(settings.compact_menus);
     ui.always_tabs.setChecked(settings.always_show_tab_bar);
@@ -428,7 +448,29 @@ fn buildAppearancePage(matugen_available: bool) void {
     if (!matugen_available) ui.theme.setToolTip("Matugen is not installed or has not generated a scheme yet.");
 
     const window_look = addCard(page, "Window");
-    ui.opacity = addDoubleSpin(window_look, "Window opacity", "Applies to the whole window", 0.30, 1.0, 0.05);
+    const opacity_row = QWidget.new2();
+    opacity_row.setMinimumWidth(240);
+    const opacity_layout = QHBoxLayout.new(opacity_row);
+    opacity_layout.setContentsMargins(0, 0, 0, 0);
+    opacity_layout.setSpacing(8);
+    ui.opacity = QSlider.new3(qnamespace_enums.Orientation.Horizontal);
+    ui.opacity.setRange(20, 100);
+    ui.opacity.setPageStep(10);
+    ui.opacity.setMinimumWidth(180);
+    ui.opacity_value = QLabel.new3("100%");
+    ui.opacity_value.setObjectName("ligmaValue");
+    ui.opacity_value.setFixedWidth(40);
+    ui.opacity_value.setAlignment(qnamespace_enums.AlignmentFlag.AlignRight |
+        qnamespace_enums.AlignmentFlag.AlignVCenter);
+    opacity_layout.addWidget2(ui.opacity, 1);
+    opacity_layout.addWidget(ui.opacity_value);
+    ui.opacity.onValueChanged(onOpacityChanged);
+    _ = addRow(
+        window_look,
+        "Background opacity",
+        "How much of the desktop shows through the window background",
+        opacity_row,
+    );
     ui.corner = addDoubleSpin(window_look, "Corner roundness", "Scales row, card, and progress radius", 0.0, 2.0, 0.1);
     ui.compact_menus = addCheck(window_look, "Compact context menus", "Tighter padding in menus");
     ui.always_tabs = addCheck(window_look, "Always show tab bar", "Keep the tab strip visible with one tab");
@@ -663,6 +705,14 @@ fn dialogStyle() []const u8 {
             "border: 1px solid rgba(127, 127, 127, 0.45); background: rgba(127, 127, 127, 0.12); }}" ++
             "QCheckBox::indicator:checked {{ border: none; background: qlineargradient(x1:0, y1:0, x2:1, y2:1, " ++
             "stop:0 rgb({d}, {d}, {d}), stop:1 rgb({d}, {d}, {d})); }}" ++
+            "QLabel#ligmaValue {{ font-weight: 600; }}" ++
+            "QSlider::groove:horizontal {{ height: 4px; background: rgba(127, 127, 127, 0.25); " ++
+            "border-radius: 2px; }}" ++
+            "QSlider::sub-page:horizontal {{ border-radius: 2px; " ++
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
+            "stop:0 rgb({d}, {d}, {d}), stop:1 rgb({d}, {d}, {d})); }}" ++
+            "QSlider::handle:horizontal {{ width: 14px; height: 14px; margin: -6px 0; " ++
+            "border-radius: 7px; background: rgb({d}, {d}, {d}); }}" ++
             "QPushButton {{ background: rgba(127, 127, 127, 0.12); border: none; border-radius: {d}px; " ++
             "padding: 6px 16px; }}" ++
             "QPushButton:hover {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
@@ -684,6 +734,15 @@ fn dialogStyle() []const u8 {
             theme.accent_end.r,
             theme.accent_end.g,
             theme.accent_end.b,
+            theme.accent_start.r,
+            theme.accent_start.g,
+            theme.accent_start.b,
+            theme.accent_end.r,
+            theme.accent_end.g,
+            theme.accent_end.b,
+            theme.accent_start.r,
+            theme.accent_start.g,
+            theme.accent_start.b,
             button_radius,
             theme.accent_start.r,
             theme.accent_start.g,

@@ -167,6 +167,7 @@ extern fn ligma_set_row_gradient_colors(start_r: c_int, start_g: c_int, start_b:
 extern fn ligma_attach_row_gradient(view: ?*anyopaque) void;
 extern fn ligma_set_list_text_alignment(view: ?*anyopaque, center: c_int) void;
 extern fn ligma_attach_typing_filter(view: ?*anyopaque, callback: *const fn (u32) callconv(.c) c_int) void;
+extern fn ligma_apply_window_chrome(window: ?*anyopaque, opacity: f64, compact_menus: c_int) void;
 extern fn ligma_dock_slide_show(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_new(title: [*:0]const u8, parent: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) ?*anyopaque;
@@ -958,16 +959,13 @@ fn saveSettings() void {
     settings_mod.save(app.settings, app.gpa, app.io, path) catch {};
 }
 
-var menu_style_applied: ?bool = null;
+var window_chrome_opacity: f64 = -1.0;
+var window_chrome_compact: ?bool = null;
 
 fn applySettingsChrome() void {
     const radius_changed = @abs(theme.radius_scale - app.settings.corner_radius_scale) > 0.001;
     theme.setRadiusScale(app.settings.corner_radius_scale);
-    app.window.setWindowOpacity(app.settings.background_opacity);
-    if (menu_style_applied == null or menu_style_applied.? != app.settings.compact_menus) {
-        applyMenuStyle();
-        menu_style_applied = app.settings.compact_menus;
-    }
+    applyWindowChrome(false);
 
     app.sidebar.setVisible(app.settings.show_sidebar);
     app.sidebar_spacer.setVisible(!app.settings.show_preview);
@@ -988,18 +986,21 @@ fn applySettingsChrome() void {
     }
 }
 
-/// Keep menus compact like Luciole's, using the same accent-free chrome so
-/// the menus still follow the active palette.
-fn applyMenuStyle() void {
-    if (!app.settings.compact_menus) {
-        app.window.setStyleSheet("");
-        return;
-    }
-    app.window.setStyleSheet(
-        "QMenu { padding: 3px; }" ++
-            "QMenu::item { padding: 4px 28px 4px 24px; }" ++
-            "QMenu::separator { height: 1px; margin: 3px 8px; background: rgba(127, 127, 127, 0.25); }",
+/// Rebuild the top-level chrome only when the opacity, menu style, or theme
+/// actually changed. The C++ side derives the tint from the active palette and
+/// keeps labels, icons, and input fields opaque.
+fn applyWindowChrome(force: bool) void {
+    if (!force and window_chrome_compact != null and
+        @abs(window_chrome_opacity - app.settings.background_opacity) < 0.001 and
+        window_chrome_compact.? == app.settings.compact_menus) return;
+
+    ligma_apply_window_chrome(
+        app.window.ptr,
+        app.settings.background_opacity,
+        @intFromBool(app.settings.compact_menus),
     );
+    window_chrome_opacity = app.settings.background_opacity;
+    window_chrome_compact = app.settings.compact_menus;
 }
 
 fn applySidebarWidth(width: i32) void {
@@ -1039,6 +1040,12 @@ fn onSettingsSidebarWidth(width: i32) callconv(.c) void {
     applySidebarWidth(width);
 }
 
+fn onSettingsBackgroundOpacity(opacity: f64) callconv(.c) void {
+    app.settings.background_opacity = opacity;
+    applyWindowChrome(false);
+    saveSettings();
+}
+
 fn onOpenSettings(_: QAction) callconv(.c) void {
     settings_dialog.open(
         app.window,
@@ -1050,6 +1057,7 @@ fn onOpenSettings(_: QAction) callconv(.c) void {
             .apply = onSettingsApplied,
             .set_theme = onSettingsTheme,
             .sidebar_width = onSettingsSidebarWidth,
+            .background_opacity = onSettingsBackgroundOpacity,
         },
     );
 }
@@ -1350,6 +1358,7 @@ fn applyThemeStyles() void {
     }
     refreshDriveBarStyles();
     app.player.applyThemeStyle();
+    applyWindowChrome(true);
 }
 
 fn shutdown() void {

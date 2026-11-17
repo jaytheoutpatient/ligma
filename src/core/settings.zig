@@ -98,7 +98,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
     settings.sidebar_width = std.math.clamp(settings.sidebar_width, 160, 620);
     settings.thumbnail_max_mib = std.math.clamp(settings.thumbnail_max_mib, 1, 1024);
     settings.video_hover_seconds = std.math.clamp(settings.video_hover_seconds, 1, 30);
-    settings.background_opacity = std.math.clamp(settings.background_opacity, 0.30, 1.0);
+    settings.background_opacity = std.math.clamp(settings.background_opacity, 0.20, 1.0);
     settings.corner_radius_scale = std.math.clamp(settings.corner_radius_scale, 0.0, 2.0);
     return settings;
 }
