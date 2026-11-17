@@ -2,12 +2,18 @@ const std = @import("std");
 const qt6 = @import("libqt6zig");
 
 const file_ops = @import("../core/file_ops.zig");
+const text_sort = @import("../core/text_sort.zig");
 
 const QAbstractItemModel = qt6.QAbstractItemModel;
 const QFileIconProvider = qt6.QFileIconProvider;
 const QFileInfo = qt6.QFileInfo;
+const QIcon = qt6.QIcon;
+const QImageReader = qt6.QImageReader;
 const QMimeData = qt6.QMimeData;
+const QMimeDatabase = qt6.QMimeDatabase;
 const QModelIndex = qt6.QModelIndex;
+const QPixmap = qt6.QPixmap;
+const QSize = qt6.QSize;
 const QUrl = qt6.QUrl;
 const QVariant = qt6.QVariant;
 
@@ -33,6 +39,7 @@ pub const LocalModel = struct {
     io: std.Io,
     qt: QAbstractItemModel,
     icon_provider: QFileIconProvider = undefined,
+    mime_db: QMimeDatabase = .{ .ptr = null },
 
     root_path: ?[]u8 = null,
     location: Location = .directory,
@@ -76,12 +83,15 @@ pub const LocalModel = struct {
         info_path: ?[]u8 = null,
         deletion_text: [19]u8 = std.mem.zeroes([19]u8),
         deletion_len: usize = 0,
+        icon: ?QIcon = null,
+        icon_loaded: bool = false,
 
         fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
             gpa.free(self.name);
             gpa.free(self.path);
             if (self.original_path) |path| gpa.free(path);
             if (self.info_path) |path| gpa.free(path);
+            if (self.icon) |icon| icon.delete();
             self.* = undefined;
         }
 
@@ -109,6 +119,8 @@ pub const LocalModel = struct {
             .icon_provider = QFileIconProvider.new(),
         };
         errdefer self.icon_provider.delete();
+        self.mime_db = QMimeDatabase.new();
+        errdefer self.mime_db.delete();
 
         try registry.put(registry_allocator, @intFromPtr(qt_model.ptr.?), self);
         errdefer _ = registry.remove(@intFromPtr(qt_model.ptr.?));
@@ -160,6 +172,7 @@ pub const LocalModel = struct {
         self.retired.deinit(self.gpa);
 
         self.clearEntries();
+        if (self.mime_db.ptr != null) self.mime_db.delete();
         self.visible.deinit(self.gpa);
         self.freeRoot();
         self.freeFilter();
@@ -336,6 +349,148 @@ pub const LocalModel = struct {
         return &self.entries.items[self.visible.items[position]];
     }
 
+    fn iconFor(self: *LocalModel, entry: *Entry) QIcon {
+        if (entry.icon_loaded) {
+            return entry.icon orelse QIcon{ .ptr = null };
+        }
+
+        const icon = self.resolveIcon(entry) orelse self.fallbackIcon(entry);
+        entry.icon = icon;
+        entry.icon_loaded = true;
+        return icon;
+    }
+
+    fn resolveIcon(self: *LocalModel, entry: *Entry) ?QIcon {
+        // QFileIconProvider adds the link badge for symlinks; themed MIME icons
+        // do not, so let the provider handle those rows.
+        if (entry.is_symlink) return null;
+
+        if (entry.is_dir) {
+            const folder = self.themedIcon("folder") orelse return null;
+            if (specialFolderIcon(entry.path)) |name| {
+                if (self.themedIcon(name)) |icon| {
+                    folder.delete();
+                    return icon;
+                }
+            }
+            return folder;
+        }
+
+        if (std.mem.endsWith(u8, entry.name, ".desktop")) {
+            if (self.desktopIconName(entry.path)) |name| {
+                defer self.gpa.free(name);
+                if (self.iconFromName(name)) |icon| return icon;
+            }
+        }
+
+        const mime = self.mime_db.mimeTypeForFile(entry.path);
+        defer mime.delete();
+        const mime_name = mime.name(self.gpa);
+        defer self.gpa.free(mime_name);
+
+        if (std.mem.startsWith(u8, mime_name, "image/")) {
+            if (self.imageIcon(entry)) |icon| return icon;
+        }
+
+        const icon_name = mime.iconName(self.gpa);
+        defer self.gpa.free(icon_name);
+        if (self.iconFromName(icon_name)) |icon| return icon;
+        if (self.themedIcon(genericMimeIcon(mime_name))) |icon| return icon;
+        return null;
+    }
+
+    fn fallbackIcon(self: *LocalModel, entry: *Entry) QIcon {
+        const info = QFileInfo.new2(entry.path);
+        defer info.delete();
+        return self.icon_provider.icon2(info);
+    }
+
+    fn themedIcon(self: *LocalModel, name: []const u8) ?QIcon {
+        _ = self;
+        if (name.len == 0) return null;
+        const icon = QIcon.fromTheme(name);
+        if (icon.isNull()) {
+            icon.delete();
+            return null;
+        }
+        return icon;
+    }
+
+    fn iconFromName(self: *LocalModel, name: []const u8) ?QIcon {
+        if (name.len == 0) return null;
+        if (name[0] == '/') {
+            const icon = QIcon.new4(name);
+            if (icon.isNull()) {
+                icon.delete();
+                return null;
+            }
+            return icon;
+        }
+        return self.themedIcon(name);
+    }
+
+    fn imageIcon(self: *LocalModel, entry: *Entry) ?QIcon {
+        _ = self;
+        if (entry.size > 64 * 1024 * 1024) return null;
+
+        const reader = QImageReader.new3(entry.path);
+        defer reader.delete();
+        reader.setAutoTransform(true);
+
+        const size = reader.size();
+        defer size.delete();
+        const width = size.width();
+        const height = size.height();
+        if (width <= 0 or height <= 0) return null;
+
+        const fit = fitWithin(width, height, 128, 128);
+        const scaled = QSize.new4(fit[0], fit[1]);
+        defer scaled.delete();
+        reader.setScaledSize(scaled);
+
+        const image = reader.read();
+        defer image.delete();
+        if (image.isNull()) return null;
+
+        const pixmap = QPixmap.fromImage(image);
+        defer pixmap.delete();
+        if (pixmap.isNull()) return null;
+
+        const icon = QIcon.new2(pixmap);
+        if (icon.isNull()) {
+            icon.delete();
+            return null;
+        }
+        return icon;
+    }
+
+    fn desktopIconName(self: *LocalModel, path: []const u8) ?[]u8 {
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.gpa,
+            std.Io.Limit.limited(64 * 1024),
+        ) catch return null;
+        defer self.gpa.free(data);
+
+        var in_desktop_entry = false;
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (line[0] == '[') {
+                in_desktop_entry = std.mem.eql(u8, line, "[Desktop Entry]");
+                continue;
+            }
+            if (!in_desktop_entry) continue;
+            if (!std.mem.startsWith(u8, line, "Icon=")) continue;
+            const value = std.mem.trim(u8, line["Icon=".len..], " \t\r");
+            if (value.len == 0) return null;
+            return self.gpa.dupe(u8, value) catch null;
+        }
+        return null;
+    }
+
     fn cancelActive(self: *LocalModel) void {
         const job = self.job orelse return;
         self.job = null;
@@ -394,8 +549,8 @@ pub const LocalModel = struct {
 
         const order = if (self.location == .trash)
             switch (self.sort_column) {
-                0 => std.ascii.orderIgnoreCase(a.name, b.name),
-                1 => std.ascii.orderIgnoreCase(
+                0 => text_sort.orderIgnoreCase(a.name, b.name),
+                1 => text_sort.orderIgnoreCase(
                     a.original_path orelse "",
                     b.original_path orelse "",
                 ),
@@ -405,14 +560,14 @@ pub const LocalModel = struct {
                     b.deletion_text[0..b.deletion_len],
                 ),
                 3 => std.math.order(a.size, b.size),
-                else => std.ascii.orderIgnoreCase(a.name, b.name),
+                else => text_sort.orderIgnoreCase(a.name, b.name),
             }
         else switch (self.sort_column) {
-            0 => std.ascii.orderIgnoreCase(a.name, b.name),
+            0 => text_sort.orderIgnoreCase(a.name, b.name),
             1 => std.math.order(a.size, b.size),
             2 => std.math.order(kindRank(a), kindRank(b)),
             3 => std.math.order(a.mtime, b.mtime),
-            else => std.ascii.orderIgnoreCase(a.name, b.name),
+            else => text_sort.orderIgnoreCase(a.name, b.name),
         };
 
         const ascending = self.sort_order != qnamespace_enums.SortOrder.DescendingOrder;
@@ -704,10 +859,7 @@ fn onData(
     const entry = self.entryAt(index) orelse return emptyVariant();
 
     if (role == qnamespace_enums.ItemDataRole.DecorationRole and index.column() == 0) {
-        const info = QFileInfo.new2(entry.path);
-        defer info.delete();
-        const icon = self.icon_provider.icon2(info);
-        defer icon.delete();
+        const icon = self.iconFor(entry);
         const variant_ptr = ligma_qvariant_from_icon(icon.ptr) orelse return emptyVariant();
         return QVariant{ .ptr = @ptrCast(variant_ptr) };
     }
@@ -1052,6 +1204,79 @@ pub fn formatModified(seconds: i64) []const u8 {
 }
 
 var modified_buffer: [32]u8 = undefined;
+
+fn specialFolderIcon(path: []const u8) ?[]const u8 {
+    const home = std.c.getenv("HOME") orelse return null;
+    const home_path = withoutTrailingSlashes(std.mem.span(home));
+    if (samePath(path, home_path)) return "user-home";
+
+    const specials = [_]struct { name: []const u8, icon: []const u8 }{
+        .{ .name = "Desktop", .icon = "user-desktop" },
+        .{ .name = "Documents", .icon = "folder-documents" },
+        .{ .name = "Downloads", .icon = "folder-download" },
+        .{ .name = "Music", .icon = "folder-music" },
+        .{ .name = "Pictures", .icon = "folder-pictures" },
+        .{ .name = "Public", .icon = "folder-publicshare" },
+        .{ .name = "Templates", .icon = "folder-templates" },
+        .{ .name = "Videos", .icon = "folder-videos" },
+    };
+    var buffer: [4096]u8 = undefined;
+    for (specials) |special| {
+        const joined = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ home_path, special.name }) catch continue;
+        if (samePath(path, joined)) return special.icon;
+    }
+
+    // XDG user directories can be relocated or localized. Fall back to the
+    // conventional folder name so a custom Music/Pictures location still gets
+    // its themed icon.
+    const base = std.fs.path.basename(path);
+    for (specials) |special| {
+        if (std.ascii.eqlIgnoreCase(base, special.name)) return special.icon;
+    }
+    return null;
+}
+
+fn genericMimeIcon(mime: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, mime, "image/")) return "image-x-generic";
+    if (std.mem.startsWith(u8, mime, "audio/")) return "audio-x-generic";
+    if (std.mem.startsWith(u8, mime, "video/")) return "video-x-generic";
+    if (std.mem.startsWith(u8, mime, "text/")) return "text-x-generic";
+    if (std.mem.startsWith(u8, mime, "font/")) return "font-x-generic";
+    if (std.mem.startsWith(u8, mime, "model/")) return "model-x-generic";
+    if (std.mem.eql(u8, mime, "application/pdf")) return "application-pdf";
+    if (std.mem.startsWith(u8, mime, "application/zip") or
+        std.mem.startsWith(u8, mime, "application/x-tar") or
+        std.mem.startsWith(u8, mime, "application/x-7z") or
+        std.mem.startsWith(u8, mime, "application/x-rar"))
+    {
+        return "package-x-generic";
+    }
+    return "application-x-generic";
+}
+
+fn samePath(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, withoutTrailingSlashes(a), withoutTrailingSlashes(b));
+}
+
+fn withoutTrailingSlashes(path: []const u8) []const u8 {
+    var trimmed = path;
+    while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+    return trimmed;
+}
+
+fn fitWithin(width: i32, height: i32, box_w: i32, box_h: i32) [2]i32 {
+    if (width <= 0 or height <= 0) return .{ 0, 0 };
+    const w: f64 = @floatFromInt(width);
+    const h: f64 = @floatFromInt(height);
+    const scale = @min(
+        @as(f64, @floatFromInt(box_w)) / w,
+        @as(f64, @floatFromInt(box_h)) / h,
+        1.0,
+    );
+    const fw: i32 = @intFromFloat(@max(1.0, @floor(w * scale)));
+    const fh: i32 = @intFromFloat(@max(1.0, @floor(h * scale)));
+    return .{ fw, fh };
+}
 
 fn kindLabel(entry: *const LocalModel.Entry) []const u8 {
     if (entry.is_symlink) {

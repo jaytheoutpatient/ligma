@@ -43,6 +43,20 @@ QRect treeRowRect(const QTreeView *tree, const QModelIndex &index, const QRect &
     return QRect(0, cell.top(), tree->viewport()->width(), height);
 }
 
+class CenteredGridDelegate final : public QStyledItemDelegate {
+  public:
+    explicit CenteredGridDelegate(QObject *parent = nullptr)
+        : QStyledItemDelegate(parent)
+    {
+    }
+
+    void initStyleOption(QStyleOptionViewItem *option, const QModelIndex &index) const override
+    {
+        QStyledItemDelegate::initStyleOption(option, index);
+        option->displayAlignment = Qt::AlignHCenter | Qt::AlignTop;
+    }
+};
+
 class GradientRowDelegate final : public QStyledItemDelegate {
   public:
     explicit GradientRowDelegate(QAbstractItemView *view)
@@ -291,6 +305,20 @@ void *ligma_qvariant_from_icon(void *icon)
     if (icon == nullptr)
         return nullptr;
     return new QVariant(*static_cast<QIcon *>(icon));
+}
+
+void ligma_set_list_text_alignment(void *view_pointer, int center)
+{
+    auto *view = static_cast<QAbstractItemView *>(view_pointer);
+    if (view == nullptr)
+        return;
+    auto *current = view->itemDelegate();
+    if (center != 0) {
+        if (dynamic_cast<CenteredGridDelegate *>(current) == nullptr)
+            view->setItemDelegate(new CenteredGridDelegate(view));
+    } else if (dynamic_cast<CenteredGridDelegate *>(current) != nullptr) {
+        view->setItemDelegate(new QStyledItemDelegate(view));
+    }
 }
 
 void ligma_set_row_gradient_colors(int start_r, int start_g, int start_b, int end_r,

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const qt6 = @import("libqt6zig");
+const text_sort = @import("../core/text_sort.zig");
 
 const QProcess = qt6.QProcess;
 const QStorageInfo = qt6.QStorageInfo;
@@ -139,9 +140,22 @@ fn listUnmountedUsb(gpa: std.mem.Allocator, result: *std.ArrayList(Volume)) !voi
             const children = children_value.?.array.items;
             for (children) |child_value| {
                 if (child_value != .object) continue;
-                try appendUnmounted(gpa, result, child_value.object, model, children.len);
+                const child = child_value.object;
+                if (jsonString(child.get("path"))) |path| {
+                    if (!isUnmounted(child)) {
+                        const raw_label = jsonString(child.get("label")) orelse "";
+                        markMountedRemovable(gpa, result.items, path, raw_label, model, children.len);
+                    }
+                }
+                try appendUnmounted(gpa, result, child, model, children.len);
             }
         } else {
+            if (jsonString(device.get("path"))) |path| {
+                if (!isUnmounted(device)) {
+                    const raw_label = jsonString(device.get("label")) orelse "";
+                    markMountedRemovable(gpa, result.items, path, raw_label, model, 1);
+                }
+            }
             try appendUnmounted(gpa, result, device, model, 1);
         }
     }
@@ -203,6 +217,34 @@ fn appendUnmounted(
     });
 }
 
+fn markMountedRemovable(
+    gpa: std.mem.Allocator,
+    volumes: []Volume,
+    device: []const u8,
+    raw_label: []const u8,
+    model: []const u8,
+    child_count: usize,
+) void {
+    // A filesystem label is best; for a single-partition removable drive use
+    // the drive model when the filesystem has no label. This avoids showing a
+    // UUID where a human-readable name is available.
+    const preferred = if (raw_label.len > 0)
+        raw_label
+    else if (model.len > 0 and child_count == 1)
+        model
+    else
+        "";
+
+    for (volumes) |*volume| {
+        if (!volume.mounted or !std.mem.eql(u8, volume.device, device)) continue;
+        volume.removable = true;
+        if (preferred.len == 0 or std.mem.eql(u8, volume.label, preferred)) continue;
+        const label = gpa.dupe(u8, preferred) catch continue;
+        gpa.free(volume.label);
+        volume.label = label;
+    }
+}
+
 fn isUnmounted(device: std.json.ObjectMap) bool {
     const value = device.get("mountpoints") orelse return true;
     if (value != .array) return true;
@@ -239,7 +281,9 @@ fn hasDevice(volumes: []const Volume, device: []const u8) bool {
 }
 
 fn volumeLessThan(_: void, left: Volume, right: Volume) bool {
-    return std.ascii.orderIgnoreCase(left.label, right.label) == .lt;
+    // Mounted drives come first, then both groups sort naturally by label.
+    if (left.mounted != right.mounted) return left.mounted;
+    return text_sort.lessThanIgnoreCase(left.label, right.label);
 }
 
 fn isNoiseFs(device: []const u8, path: []const u8) bool {
@@ -305,4 +349,32 @@ test "loop devices and unrelated pseudo mounts are ignored" {
     try std.testing.expect(!isNoiseFs("/dev/nvme0n1p1", "/boot"));
     try std.testing.expect(!isNoiseFs("server:/share", "/mnt/share"));
     try std.testing.expect(isNoiseFs("proc", "/proc"));
+}
+
+test "mounted drives sort first and labels sort naturally" {
+    const base = Volume{
+        .label = @constCast(""),
+        .path = @constCast(""),
+        .device = @constCast(""),
+        .fs_type = @constCast(""),
+        .bytes_total = 0,
+        .bytes_free = 0,
+        .mounted = false,
+        .removable = false,
+        .read_only = false,
+    };
+    var usb = base;
+    usb.label = @constCast("Game Drive Xbox");
+    var internal = base;
+    internal.label = @constCast("Balls");
+    internal.mounted = true;
+    try std.testing.expect(volumeLessThan({}, internal, usb));
+
+    var track2 = base;
+    track2.label = @constCast("Track 2");
+    track2.mounted = true;
+    var track10 = base;
+    track10.label = @constCast("Track 10");
+    track10.mounted = true;
+    try std.testing.expect(volumeLessThan({}, track2, track10));
 }

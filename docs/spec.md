@@ -277,7 +277,7 @@ Decision: ship desktop icons as an optional component in P6, with a clear warnin
 | F2 | Rename |
 | Ctrl+Shift+N | New folder |
 | Ctrl+H | Show/hide hidden files |
-| Ctrl+1 / Ctrl+2 / Ctrl+3 | Details / Icons / Compact view |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4 | Details / Icons / Compact / Grid view |
 | Ctrl+Shift+V | Paste into current folder |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo file operation |
 | Delete / Shift+Delete | Move to trash / delete permanently |
@@ -862,8 +862,8 @@ Implemented in the v0.5 prototype:
 - Back/forward/up/home/reload navigation with independent per-pane history.
 - Editable path bar with `~`, relative-path, and `file://` resolution.
 - Custom `LocalModel` (`src/ui/local_model.zig`) replacing `QFileSystemModel`: worker-thread folder enumeration, UI-timer polling, and a flat details snapshot.
-- Details, Icons, and Compact views (`Ctrl+1`/`Ctrl+2`/`Ctrl+3`) over the same model. Details keeps the Name/Size/Kind/Modified columns, Icons uses a wrapped icon grid, and Compact uses a dense icon list. A shared selection model preserves selected paths across view changes.
-- Details and Icons show themed file, folder, and symlink icons through `QFileIconProvider`.
+- Details, Icons, Compact, and Grid views (`Ctrl+1`/`Ctrl+2`/`Ctrl+3`/`Ctrl+4`) over the same model. Details keeps the Name/Size/Kind/Modified columns, Icons uses a wrapped 64 px icon grid, Grid uses a larger 96 px adaptive tile grid with image thumbnails and wrapped names, and Compact uses a dense icon list. A shared selection model preserves selected paths across view changes.
+- File icons resolve from the system MIME theme with generic MIME-family fallbacks, special Home/XDG folder icons, `.desktop` `Icon=` entries, and scaled image thumbnails. Symlinks retain `QFileIconProvider`'s link emblem. File names, Trash paths, drive labels, and recursively queued music use case-insensitive natural numeric sorting (`Track 2` before `Track 10`).
 - In-memory case-insensitive substring filter (directories remain visible) that never touches the filesystem.
 - Hidden-file toggle that applies to every pane.
 - File opening through the desktop's default application, with audio routed to the built-in player.

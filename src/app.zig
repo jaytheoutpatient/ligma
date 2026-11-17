@@ -5,6 +5,7 @@ const file_ops = @import("core/file_ops.zig");
 const paths = @import("core/paths.zig");
 const search_index = @import("core/search_index.zig");
 const search_scan = @import("core/search_scan.zig");
+const text_sort = @import("core/text_sort.zig");
 const local_model = @import("ui/local_model.zig");
 const mounts = @import("ui/mounts.zig");
 const player_mod = @import("ui/player.zig");
@@ -26,6 +27,7 @@ const QInputDialog = qt6.QInputDialog;
 const QItemSelection = qt6.QItemSelection;
 const QItemSelectionModel = qt6.QItemSelectionModel;
 const QKeySequence = qt6.QKeySequence;
+const QCursor = qt6.QCursor;
 const QLabel = qt6.QLabel;
 const QLineEdit = qt6.QLineEdit;
 const QListView = qt6.QListView;
@@ -97,7 +99,7 @@ const UndoBatch = std.ArrayList(file_ops.UndoItem);
 
 const ClipMode = enum { none, copy, cut };
 
-const ViewMode = enum { details, icons, compact };
+const ViewMode = enum { details, icons, compact, grid };
 
 const Appearance = enum { matugen, light, dark, system };
 
@@ -159,6 +161,7 @@ const mpris_callbacks: MprisCallbacks = .{
 extern fn ligma_smooth_scroll_attach(view: ?*anyopaque) void;
 extern fn ligma_set_row_gradient_colors(start_r: c_int, start_g: c_int, start_b: c_int, end_r: c_int, end_g: c_int, end_b: c_int) void;
 extern fn ligma_attach_row_gradient(view: ?*anyopaque) void;
+extern fn ligma_set_list_text_alignment(view: ?*anyopaque, center: c_int) void;
 extern fn ligma_dock_slide_show(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_new(title: [*:0]const u8, parent: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) ?*anyopaque;
@@ -181,6 +184,7 @@ const App = struct {
     drives: QListWidget,
     drive_bars: std.ArrayList(QProgressBar) = .empty,
     drive_labels: std.ArrayList(QLabel) = .empty,
+    drive_eject_labels: std.ArrayList(QLabel) = .empty,
     mount_places: std.ArrayList(mounts.Volume) = .empty,
     drives_updating: bool = false,
     mount_timer: QTimer,
@@ -206,6 +210,7 @@ const App = struct {
     drive_menu: QMenu,
     ctx_mount_action: QAction,
     ctx_unmount_action: QAction,
+    ctx_eject_action: QAction,
     ctx_empty_place_trash_action: QAction,
     ctx_play_place_music_action: QAction,
     context_drive_row: i32 = -1,
@@ -214,6 +219,7 @@ const App = struct {
     view_details_action: QAction,
     view_icons_action: QAction,
     view_compact_action: QAction,
+    view_grid_action: QAction,
     appearance_matugen_action: QAction,
     appearance_light_action: QAction,
     appearance_dark_action: QAction,
@@ -265,6 +271,8 @@ const App = struct {
     unmount_label: [256]u8 = undefined,
     unmount_label_len: usize = 0,
     unmount_tried_pkexec: bool = false,
+    unmount_power_off: bool = false,
+    unmount_power_off_started: bool = false,
     unmount_active: bool = false,
 
     mount_process: QProcess,
@@ -591,6 +599,10 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     compact_view_action.setCheckable(true);
     _ = view_group.addAction(compact_view_action);
     view_menu.addAction(compact_view_action);
+    const grid_view_action = makeAction(view_menu, "Grid", "Ctrl+4", onViewGrid);
+    grid_view_action.setCheckable(true);
+    _ = view_group.addAction(grid_view_action);
+    view_menu.addAction(grid_view_action);
     _ = view_menu.addSeparator();
     const appearance_menu = QMenu.new4("&Appearance", view_menu);
     _ = view_menu.addMenu(appearance_menu);
@@ -690,6 +702,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const drive_menu = QMenu.new(window);
     const ctx_mount_action = drive_menu.addAction2("&Mount");
     ctx_mount_action.onTriggered(onCtxMountDrive);
+    const ctx_eject_action = drive_menu.addAction2("&Safely Remove");
+    ctx_eject_action.onTriggered(onCtxEjectDrive);
     const ctx_unmount_action = drive_menu.addAction2("&Unmount");
     ctx_unmount_action.onTriggered(onCtxUnmountDrive);
 
@@ -721,11 +735,13 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .drive_menu = drive_menu,
         .ctx_mount_action = ctx_mount_action,
         .ctx_unmount_action = ctx_unmount_action,
+        .ctx_eject_action = ctx_eject_action,
         .ctx_empty_place_trash_action = ctx_empty_place_trash_action,
         .ctx_play_place_music_action = ctx_play_place_music_action,
         .view_details_action = details_view_action,
         .view_icons_action = icons_view_action,
         .view_compact_action = compact_view_action,
+        .view_grid_action = grid_view_action,
         .appearance_matugen_action = appearance_matugen_action,
         .appearance_light_action = appearance_light_action,
         .appearance_dark_action = appearance_dark_action,
@@ -1100,6 +1116,7 @@ fn shutdown() void {
     app.fs_watch_paths.deinit(app.gpa);
     app.drive_bars.deinit(app.gpa);
     app.drive_labels.deinit(app.gpa);
+    app.drive_eject_labels.deinit(app.gpa);
     for (app.mount_places.items) |*volume| volume.deinit(app.gpa);
     app.mount_places.deinit(app.gpa);
     if (app.file_job) |job| {
@@ -1467,11 +1484,15 @@ fn applyViewMode(pane: *Pane, mode: ViewMode) void {
     switch (mode) {
         .details => pane.stack.setCurrentIndex(0),
         .icons => {
-            configureListView(pane, true);
+            configureListView(pane, .icons);
             pane.stack.setCurrentIndex(1);
         },
         .compact => {
-            configureListView(pane, false);
+            configureListView(pane, .compact);
+            pane.stack.setCurrentIndex(1);
+        },
+        .grid => {
+            configureListView(pane, .grid);
             pane.stack.setCurrentIndex(1);
         },
     }
@@ -1486,33 +1507,40 @@ fn applyViewMode(pane: *Pane, mode: ViewMode) void {
     }
 }
 
-fn configureListView(pane: *Pane, large_icons: bool) void {
-    if (large_icons) {
-        pane.list.setUniformItemSizes(true);
-        const icon_size = QSize.new4(64, 64);
-        defer icon_size.delete();
-        pane.list.setIconSize(icon_size);
-        const grid = QSize.new4(132, 108);
-        defer grid.delete();
-        pane.list.setGridSize(grid);
-        pane.list.setViewMode(qlistview_enums.ViewMode.IconMode);
-        pane.list.setFlow(qlistview_enums.Flow.LeftToRight);
-        pane.list.setWrapping(true);
-        pane.list.setWordWrap(true);
-        pane.list.setSpacing(8);
-    } else {
-        pane.list.setUniformItemSizes(false);
-        const icon_size = QSize.new4(24, 24);
-        defer icon_size.delete();
-        pane.list.setIconSize(icon_size);
-        const grid = QSize.new4(0, 34);
-        defer grid.delete();
-        pane.list.setGridSize(grid);
-        pane.list.setViewMode(qlistview_enums.ViewMode.ListMode);
-        pane.list.setFlow(qlistview_enums.Flow.TopToBottom);
-        pane.list.setWrapping(false);
-        pane.list.setWordWrap(false);
-        pane.list.setSpacing(2);
+fn configureListView(pane: *Pane, mode: ViewMode) void {
+    switch (mode) {
+        .details => {},
+        .icons, .grid => {
+            const large = mode == .grid;
+            ligma_set_list_text_alignment(pane.list.ptr, 1);
+            pane.list.setUniformItemSizes(true);
+            const icon_size = QSize.new4(if (large) 96 else 64, if (large) 96 else 64);
+            defer icon_size.delete();
+            pane.list.setIconSize(icon_size);
+            const grid = QSize.new4(if (large) 176 else 132, if (large) 156 else 108);
+            defer grid.delete();
+            pane.list.setGridSize(grid);
+            pane.list.setViewMode(qlistview_enums.ViewMode.IconMode);
+            pane.list.setFlow(qlistview_enums.Flow.LeftToRight);
+            pane.list.setWrapping(true);
+            pane.list.setWordWrap(true);
+            pane.list.setSpacing(if (large) 10 else 8);
+        },
+        .compact => {
+            ligma_set_list_text_alignment(pane.list.ptr, 0);
+            pane.list.setUniformItemSizes(false);
+            const icon_size = QSize.new4(24, 24);
+            defer icon_size.delete();
+            pane.list.setIconSize(icon_size);
+            const grid = QSize.new4(0, 34);
+            defer grid.delete();
+            pane.list.setGridSize(grid);
+            pane.list.setViewMode(qlistview_enums.ViewMode.ListMode);
+            pane.list.setFlow(qlistview_enums.Flow.TopToBottom);
+            pane.list.setWrapping(false);
+            pane.list.setWordWrap(false);
+            pane.list.setSpacing(2);
+        },
     }
 }
 
@@ -1521,6 +1549,7 @@ fn updateViewModeActions() void {
     app.view_details_action.setChecked(mode == .details);
     app.view_icons_action.setChecked(mode == .icons);
     app.view_compact_action.setChecked(mode == .compact);
+    app.view_grid_action.setChecked(mode == .grid);
 }
 
 fn setViewMode(mode: ViewMode) void {
@@ -1540,6 +1569,10 @@ fn onViewIcons(_: QAction) callconv(.c) void {
 
 fn onViewCompact(_: QAction) callconv(.c) void {
     setViewMode(.compact);
+}
+
+fn onViewGrid(_: QAction) callconv(.c) void {
+    setViewMode(.grid);
 }
 
 /// Feeds the bottom-left preview panel with the pane's current selection.
@@ -2389,7 +2422,7 @@ fn collectMusicFiles(
 }
 
 fn musicPathLessThan(_: void, left: []u8, right: []u8) bool {
-    return std.mem.lessThan(u8, left, right);
+    return text_sort.lessThanIgnoreCase(left, right);
 }
 
 fn onFileMenuAboutToShow(_: QMenu) callconv(.c) void {
@@ -3540,6 +3573,7 @@ fn refreshMountedPlaces() void {
     app.mount_generation +%= 1;
     app.drive_bars.clearRetainingCapacity();
     app.drive_labels.clearRetainingCapacity();
+    app.drive_eject_labels.clearRetainingCapacity();
     app.drives.clear();
 
     for (app.mount_places.items) |*volume| volume.deinit(app.gpa);
@@ -3565,9 +3599,22 @@ fn refreshMountedPlaces() void {
         item_layout.setContentsMargins(4, 3, 4, 3);
         item_layout.setSpacing(3);
 
+        const top_row = QHBoxLayout.new2();
+        top_row.setContentsMargins(0, 0, 0, 0);
+        top_row.setSpacing(4);
+
         const label = QLabel.new3(volume.label);
         label.setStyleSheet("font-weight: 600;");
-        item_layout.addWidget(label);
+        top_row.addWidget(label);
+        top_row.addStretch();
+
+        const eject = QLabel.new3("⏏");
+        eject.setAlignment(qnamespace_enums.AlignmentFlag.AlignCenter);
+        eject.setFixedWidth(22);
+        eject.setToolTip("Safely remove this drive");
+        eject.setVisible(volume.mounted and volume.removable);
+        top_row.addWidget(eject);
+        item_layout.addLayout(top_row);
 
         const bar = QProgressBar.new2();
         bar.setRange(0, 100);
@@ -3579,6 +3626,7 @@ fn refreshMountedPlaces() void {
 
         app.drives.setItemWidget(item, item_widget);
         app.drive_labels.append(app.gpa, label) catch {};
+        app.drive_eject_labels.append(app.gpa, eject) catch {};
         app.drive_bars.append(app.gpa, bar) catch {};
     }
 
@@ -3609,6 +3657,14 @@ fn updateDriveWidgets() void {
     for (app.mount_places.items, 0..) |volume, index| {
         if (index < app.drive_bars.items.len) {
             app.drive_bars.items[index].setValue(usedPercent(volume));
+        }
+        if (index < app.drive_eject_labels.items.len) {
+            const removable = volume.mounted and volume.removable;
+            app.drive_eject_labels.items[index].setVisible(removable);
+            app.drive_eject_labels.items[index].setToolTip(if (removable)
+                "Safely remove this drive"
+            else
+                "");
         }
         if (index < app.drive_labels.items.len) {
             var amount_buffer: [32]u8 = undefined;
@@ -3673,8 +3729,17 @@ fn updateDriveWidgets() void {
                     formatBytes(&total_buffer, volume.bytes_total),
                 },
             ) catch volume.label;
+        var final_buffer: [1200]u8 = undefined;
+        const final_tooltip = if (volume.mounted and volume.removable)
+            std.fmt.bufPrint(
+                &final_buffer,
+                "{s}\nClick the eject icon to safely remove",
+                .{tooltip},
+            ) catch tooltip
+        else
+            tooltip;
         const item = app.drives.item(@intCast(index));
-        if (item.ptr != null) item.setToolTip(tooltip);
+        if (item.ptr != null) item.setToolTip(final_tooltip);
     }
 }
 
@@ -3708,6 +3773,10 @@ fn onDriveItemClicked(list: QListWidget, item: QListWidgetItem) callconv(.c) voi
         startMount(volume.label, volume.device);
         return;
     }
+    if (volume.removable and driveEjectClicked(list, item)) {
+        startUnmount(volume.label, volume.path, volume.device, true);
+        return;
+    }
 
     const pane = activePane() orelse return;
     app.places_updating = true;
@@ -3715,6 +3784,13 @@ fn onDriveItemClicked(list: QListWidget, item: QListWidgetItem) callconv(.c) voi
     app.places_updating = false;
     navigateTo(pane, volume.path, true);
     focusPane(pane);
+}
+
+fn driveEjectClicked(list: QListWidget, item: QListWidgetItem) bool {
+    const rect = list.visualItemRect(item);
+    const viewport = list.viewport();
+    const position = viewport.mapFromGlobal2(QCursor.pos());
+    return position.x() >= rect.right() - 28;
 }
 
 fn onDrivesContextMenu(list: QListWidget, pos: QPoint) callconv(.c) void {
@@ -3732,6 +3808,17 @@ fn onDrivesContextMenu(list: QListWidget, pos: QPoint) callconv(.c) void {
     const volume = app.mount_places.items[index];
     var label_buffer: [512]u8 = undefined;
     if (volume.mounted) {
+        const removable = volume.removable;
+        app.ctx_eject_action.setVisible(removable);
+        if (removable) {
+            const eject_label = std.fmt.bufPrint(
+                &label_buffer,
+                "&Safely Remove “{s}”",
+                .{volume.label},
+            ) catch "&Safely Remove";
+            app.ctx_eject_action.setText(eject_label);
+            app.ctx_eject_action.setEnabled(!app.unmount_active and !app.mount_active);
+        }
         const label = std.fmt.bufPrint(
             &label_buffer,
             "&Unmount “{s}”",
@@ -3751,11 +3838,32 @@ fn onDrivesContextMenu(list: QListWidget, pos: QPoint) callconv(.c) void {
         app.ctx_mount_action.setVisible(true);
         app.ctx_mount_action.setEnabled(!app.mount_active and !app.unmount_active);
         app.ctx_unmount_action.setVisible(false);
+        app.ctx_eject_action.setVisible(false);
     }
 
     const global = list.mapToGlobal2(pos);
     defer global.delete();
     app.drive_menu.popup(global);
+}
+
+fn onCtxEjectDrive(_: QAction) callconv(.c) void {
+    const row = app.context_drive_row;
+    app.context_drive_row = -1;
+    if (row < 0) return;
+    if (app.mount_active or app.unmount_active) {
+        showStatus("A drive operation is already in progress", 3000);
+        return;
+    }
+    if (app.context_drive_generation != app.mount_generation) {
+        showStatus("The drive list changed — try again", 3000);
+        return;
+    }
+    const index: usize = @intCast(row);
+    if (index >= app.mount_places.items.len) return;
+
+    const volume = app.mount_places.items[index];
+    if (!volume.mounted or !volume.removable) return;
+    startUnmount(volume.label, volume.path, volume.device, true);
 }
 
 fn onCtxMountDrive(_: QAction) callconv(.c) void {
@@ -3925,10 +4033,10 @@ fn onCtxUnmountDrive(_: QAction) callconv(.c) void {
     );
     if (answer != qmessagebox_enums.StandardButton.Yes) return;
 
-    startUnmount(label, path, device);
+    startUnmount(label, path, device, false);
 }
 
-fn startUnmount(label: []const u8, path: []const u8, device: []const u8) void {
+fn startUnmount(label: []const u8, path: []const u8, device: []const u8, power_off: bool) void {
     if (app.unmount_active or app.mount_active) {
         showStatus("A drive operation is already in progress", 3000);
         return;
@@ -3945,9 +4053,11 @@ fn startUnmount(label: []const u8, path: []const u8, device: []const u8) void {
     @memcpy(app.unmount_label[0..app.unmount_label_len], label[0..app.unmount_label_len]);
     app.unmount_active = true;
     app.unmount_tried_pkexec = false;
+    app.unmount_power_off = power_off;
+    app.unmount_power_off_started = false;
 
     if (std.mem.startsWith(u8, device, "/dev/")) {
-        showStatus("Unmounting drive…", 0);
+        showStatus(if (power_off) "Ejecting drive…" else "Unmounting drive…", 0);
         app.unmount_process.start3(
             app.gpa,
             "udisksctl",
@@ -3981,34 +4091,71 @@ fn clearUnmountState() void {
     app.unmount_device = null;
     app.unmount_active = false;
     app.unmount_tried_pkexec = false;
+    app.unmount_power_off = false;
+    app.unmount_power_off_started = false;
 }
 
 fn onUnmountFinished(_: QProcess, exit_code: i32) callconv(.c) void {
     if (!app.unmount_active) return;
 
-    if (exit_code != 0 and !app.unmount_tried_pkexec) {
-        if (app.unmount_path != null) {
+    const label = app.unmount_label[0..app.unmount_label_len];
+    var stderr: ?[]const u8 = null;
+    defer if (stderr) |text| app.gpa.free(text);
+    if (exit_code != 0) {
+        stderr = app.unmount_process.readAllStandardError(app.gpa);
+    }
+
+    if (exit_code != 0 and !app.unmount_tried_pkexec and !app.unmount_power_off_started) {
+        const detail = stderr orelse "";
+        if ((detail.len == 0 or unmountNeedsAuthorization(detail)) and app.unmount_path != null) {
             startPkexecUnmount();
             return;
         }
     }
 
-    const label = app.unmount_label[0..app.unmount_label_len];
     if (exit_code == 0) {
-        clearUnmountState();
-        refreshMountedPlaces();
-        var buffer: [512]u8 = undefined;
-        const message = std.fmt.bufPrint(&buffer, "Unmounted “{s}”", .{label}) catch "Drive unmounted";
-        showStatus(message, 4500);
+        // After a successful unmount, a removable drive can be powered off.
+        // Keep the state alive until the second udisksctl command finishes.
+        if (app.unmount_power_off and !app.unmount_power_off_started) {
+            const device = app.unmount_device orelse {
+                finishUnmountSuccess(label, false);
+                return;
+            };
+            if (std.mem.startsWith(u8, device, "/dev/")) {
+                app.unmount_power_off_started = true;
+                const ignored_out = app.unmount_process.readAllStandardOutput(app.gpa);
+                app.gpa.free(ignored_out);
+                const ignored_err = app.unmount_process.readAllStandardError(app.gpa);
+                app.gpa.free(ignored_err);
+                var power_buffer: [512]u8 = undefined;
+                const power_device = powerOffDevice(device, &power_buffer);
+                showStatus("Powering off drive…", 0);
+                app.unmount_process.start3(
+                    app.gpa,
+                    "udisksctl",
+                    &.{ "power-off", "-b", power_device },
+                    qiodevicebase_enums.OpenModeFlag.ReadOnly,
+                );
+                return;
+            }
+        }
+        finishUnmountSuccess(label, app.unmount_power_off_started);
         return;
     }
 
-    const stderr = app.unmount_process.readAllStandardError(app.gpa);
-    defer app.gpa.free(stderr);
+    if (app.unmount_power_off_started) {
+        // Unmount succeeded but power-off did not. The filesystem is already
+        // safely unmounted, so report the partial success without a modal.
+        clearUnmountState();
+        refreshMountedPlaces();
+        showStatus("Unmounted — the drive could not be powered off", 5000);
+        return;
+    }
+
     clearUnmountState();
     refreshMountedPlaces();
 
-    const detail = std.mem.trim(u8, stderr, " \t\r\n");
+    const detail = std.mem.trim(u8, stderr orelse "", " \t\r\n");
     showStatus("Unmount failed", 4000);
     var buffer: [2048]u8 = undefined;
     const message = if (detail.len > 0)
@@ -4026,9 +4173,71 @@ fn onUnmountFinished(_: QProcess, exit_code: i32) callconv(.c) void {
     _ = QMessageBox.warning(app.window, "Unmount Failed", message);
 }
 
+fn unmountNeedsAuthorization(detail: []const u8) bool {
+    const needles = [_][]const u8{
+        "NotAuthorized",
+        "not authorized",
+        "Authentication",
+        "authentication",
+        "Permission denied",
+        "permission denied",
+        "polkit",
+    };
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, detail, needle) != null) return true;
+    }
+    return false;
+}
+
+fn powerOffDevice(device: []const u8, buffer: []u8) []const u8 {
+    const base = std.fs.path.basename(device);
+    if (base.len == 0) return device;
+
+    // udisksctl power-off operates on a drive. /dev/sdb1 -> /dev/sdb,
+    // /dev/nvme0n1p1 -> /dev/nvme0n1, /dev/mmcblk0p1 -> /dev/mmcblk0.
+    var end = base.len;
+    while (end > 0 and base[end - 1] >= '0' and base[end - 1] <= '9') end -= 1;
+    if (end == base.len) return device;
+    if (end > 0 and base[end - 1] == 'p' and
+        (std.mem.startsWith(u8, base, "nvme") or std.mem.startsWith(u8, base, "mmcblk")))
+    {
+        end -= 1;
+    }
+    if (end == 0) return device;
+
+    const parent = std.fmt.bufPrint(buffer, "/dev/{s}", .{base[0..end]}) catch return device;
+    return parent;
+}
+
+test "power-off device strips partition suffixes" {
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/dev/sdb", powerOffDevice("/dev/sdb1", &buffer));
+    try std.testing.expectEqualStrings("/dev/sdb", powerOffDevice("/dev/sdb", &buffer));
+    try std.testing.expectEqualStrings("/dev/nvme0n1", powerOffDevice("/dev/nvme0n1p1", &buffer));
+    try std.testing.expectEqualStrings("/dev/mmcblk0", powerOffDevice("/dev/mmcblk0p1", &buffer));
+}
+
+fn finishUnmountSuccess(label: []const u8, powered_off: bool) void {
+    clearUnmountState();
+    refreshMountedPlaces();
+    var buffer: [512]u8 = undefined;
+    const message = if (powered_off)
+        std.fmt.bufPrint(&buffer, "Safely removed “{s}”", .{label}) catch "Drive removed"
+    else
+        std.fmt.bufPrint(&buffer, "Unmounted “{s}”", .{label}) catch "Drive unmounted";
+    showStatus(message, 4500);
+}
+
 fn onUnmountError(_: QProcess, error_code: i32) callconv(.c) void {
     if (!app.unmount_active) return;
     if (error_code != qprocess_enums.ProcessError.FailedToStart) return;
+
+    if (app.unmount_power_off_started) {
+        clearUnmountState();
+        refreshMountedPlaces();
+        showStatus("Unmounted — the drive could not be powered off", 5000);
+        return;
+    }
 
     if (!app.unmount_tried_pkexec and app.unmount_path != null) {
         startPkexecUnmount();

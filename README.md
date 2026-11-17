@@ -31,10 +31,10 @@ Read the full product and technical specification in [`docs/spec.md`](docs/spec.
 This repository contains a working **v0.5 prototype**:
 
 - Zig 0.17 + Qt 6.12 via [`libqt6zig`](https://github.com/rcalixte/libqt6zig)
-- Places and Drives sidebar, Details/Icons/Compact views, item count, and window title
+- Places and Drives sidebar, Details/Icons/Compact/Grid views, item count, and window title
 - **Custom item model** — `src/ui/local_model.zig` lists folders and Trash on a worker thread, polls snapshots from the UI, and renders folder or trash-specific columns
 - **Live folder refresh** — watches every open pane and the Trash directory, coalesces filesystem events, reloads the affected snapshots, and restores the selection
-- **Drives** — the sidebar lists mounted volumes plus unmounted USB/removable partitions. Mounted rows show a free-space label and a used-capacity progress bar; unmounted rows show **not mounted** and mount when clicked. Tooltips include the mount path, device, filesystem, and free/total space. Right-click for **Mount** or **Unmount** (UDisks2 first, then `pkexec`), and the list updates automatically when devices appear, mount, unmount, or disappear
+- **Drives** — the sidebar lists mounted volumes plus unmounted USB/removable partitions. Mounted rows show a free-space label and a used-capacity progress bar; unmounted rows show **not mounted** and mount when clicked. Mounted drives sort before unmounted ones, and both groups sort naturally by label (so `Game Drive 10` follows `Game Drive 9`). USB filesystems without a label use the drive model instead of a UUID. Mounted removable drives get an **⏏ eject button**; right-click offers **Safely Remove** (unmount, then power off via UDisks2) or **Unmount**. Tooltips include the mount path, device, filesystem, and free/total space, and the list updates automatically when devices appear, mount, unmount, or disappear
 - **Compact sidebar** — the Places and Drives lists size themselves to their contents and scroll once they reach a height cap, instead of leaving a large empty box. List borders are removed; selected and hovered rows use solid-to-transparent theme-accent gradients, and drive usage bars fade to transparent at their fill edge
 - **Appearance** — **View > Appearance** switches between **Matugen**, **Light**, **Dark**, and **System**. Matugen reads the active qt6ct color scheme, so the file manager follows the same Material You palette as Qt applications; Light/Dark are built-in palettes and System follows the desktop. The choice persists in `$XDG_CONFIG_HOME/ligma/appearance` (or `~/.config/ligma/appearance`), and switching updates the sidebar, file pane, music player, and drive bars immediately. The Matugen entry is disabled when no scheme is installed
 - Back / forward / up / home / reload navigation with per-pane history
@@ -44,7 +44,9 @@ This repository contains a working **v0.5 prototype**:
 - Opens files with the desktop's default application, except audio files that play in the built-in music player
 - **Tabs** — `Ctrl+T`, `Ctrl+W`, `Ctrl+Shift+W`
 - **Split view** — `F3` toggles, `F6` focuses the other pane; panes keep independent history and filters
-- **View modes** — **Details** (`Ctrl+1`), **Icons** (`Ctrl+2`), and **Compact** (`Ctrl+3`). The Details and icon views share one selection model, so switching modes preserves the selected paths; Details and Icons use themed file/folder icons. Details rows use a full-row gradient delegate for selection and hover (readable light-theme text and light-on-dark text), while the icon and compact views use the shared list gradient
+- **View modes** — **Details** (`Ctrl+1`), **Icons** (`Ctrl+2`), **Compact** (`Ctrl+3`), and **Grid** (`Ctrl+4`). The Details and grid-style views share one selection model, so switching modes preserves the selected paths. Grid uses larger adaptive tiles with wrapped names and image thumbnails; Icons is the denser icon grid. Details rows use a full-row gradient delegate for selection and hover (readable light-theme text and light-on-dark text), while the icon, grid, and compact views use the shared list gradient
+- **File-type icons** — every file resolves through the system MIME icon theme with a generic MIME-family fallback, so documents, images, audio, video, archives, scripts, and launchers each get an appropriate icon. Home and the XDG folders use special themed icons (`folder-music`, `folder-pictures`, etc.), `.desktop` files use their declared `Icon=` entry, and image files render a scaled thumbnail. Symlinks keep the provider's link badge
+- **Natural filename sorting** — names sort case-insensitively with numeric runs compared by value, so `Track 2` precedes `Track 10` and `Album 9` precedes `Album 10`. The same ordering applies to files, Trash original paths, drive labels, and recursively queued music
 - **Global filename search** — `Ctrl+Shift+F`, streamed results in a search dock
 - **SQLite FTS5 search index** — automatic background build, trigram substring matching, status-bar health, and `View > Rebuild Search Index`
 - **Async file operations** — copy, cut, paste, rename, new folder, trash, restore, permanent delete, empty Trash, and undo, all on a worker thread with progress and cancellation
@@ -97,7 +99,7 @@ Activating a file whose MIME type is `audio/*` plays it in the built-in player i
 - The seek slider follows playback and can be dragged to jump. The volume slider sets output volume for this player.
 - The **Output** button switches between the default PipeWire sink and a direct ALSA device at runtime. Enter `hw:X,Y` for exclusive/bit-perfect output, or leave it empty for PipeWire.
 - Activating another audio file appends it to the playlist (or reuses its existing entry) and starts it. **Add to Playlist** appends every selected audio file without interrupting the current track.
-- **Play** in the context menu replaces the queue with the selected audio files and starts the first one. The playlist widget also accepts clicks to jump to a track.
+- **Play** in the context menu replaces the queue with the selected audio files and starts the first one. Recursively queued music is sorted naturally, so numbered tracks play in numeric order. The playlist widget also accepts clicks to jump to a track.
 - Files are classified with `QMimeDatabase`, so content-detected audio formats work even when their extension is unusual.
 - The player exposes MPRIS 2 on the session bus. Metadata includes a stable per-track object path, title, artist, album, and length; `Position` and `Seeked` are reported in microseconds. The **Raise** method shows Ligma and opens the player dock, and **Quit** exits cleanly.
 - Closing the dock keeps the playlist and playback alive; reopening it shows the same state.
@@ -305,7 +307,7 @@ sudo update-desktop-database /usr/share/applications
 | `Ctrl+T` / `Ctrl+W` | New tab / close tab |
 | `Ctrl+Shift+W` | Close window |
 | `F3` / `F6` | Toggle split view / focus other pane |
-| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Details / Icons / Compact view |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` | Details / Icons / Compact / Grid view |
 | `F12` | Toggle the terminal panel |
 | `F9` | Toggle the music player |
 | `Ctrl+L` | Edit location |
