@@ -191,7 +191,10 @@ class SmoothScrollFilter final : public QObject {
         auto *wheel = static_cast<QWheelEvent *>(event);
         if (wheel->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier))
             return QObject::eventFilter(watched, event);
-        int distance = wheel->pixelDelta().y();
+        // Qt uses the same sign for pixelDelta and angleDelta: positive means
+        // scrolling up. QAbstractItemView applies `value - delta`, so negate
+        // both here; using pixelDelta directly made touchpad scrolling reverse.
+        int distance = -wheel->pixelDelta().y();
         if (distance == 0) {
             const int angle = wheel->angleDelta().y();
             if (angle == 0)
