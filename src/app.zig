@@ -168,6 +168,7 @@ extern fn ligma_attach_row_gradient(view: ?*anyopaque) void;
 extern fn ligma_set_list_text_alignment(view: ?*anyopaque, center: c_int) void;
 extern fn ligma_attach_typing_filter(view: ?*anyopaque, callback: *const fn (u32) callconv(.c) c_int) void;
 extern fn ligma_set_grid_item_size(view: ?*anyopaque, width: c_int, height: c_int) void;
+extern fn ligma_set_scroll_sensitivity(value: f64) void;
 extern fn ligma_apply_window_chrome(window: ?*anyopaque, opacity: f64, compact_menus: c_int) void;
 extern fn ligma_dock_slide_show(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
@@ -973,6 +974,7 @@ var window_chrome_compact: ?bool = null;
 fn applySettingsChrome() void {
     const radius_changed = @abs(theme.radius_scale - app.settings.corner_radius_scale) > 0.001;
     theme.setRadiusScale(app.settings.corner_radius_scale);
+    ligma_set_scroll_sensitivity(app.settings.scroll_sensitivity);
     applyWindowChrome(false);
 
     app.sidebar.setVisible(app.settings.show_sidebar);
@@ -1055,6 +1057,12 @@ fn onSettingsBackgroundOpacity(opacity: f64) callconv(.c) void {
     saveSettings();
 }
 
+fn onSettingsScrollSensitivity(sensitivity: f64) callconv(.c) void {
+    app.settings.scroll_sensitivity = sensitivity;
+    ligma_set_scroll_sensitivity(sensitivity);
+    saveSettings();
+}
+
 fn onOpenSettings(_: QAction) callconv(.c) void {
     settings_dialog.open(
         app.window,
@@ -1067,6 +1075,7 @@ fn onOpenSettings(_: QAction) callconv(.c) void {
             .set_theme = onSettingsTheme,
             .sidebar_width = onSettingsSidebarWidth,
             .background_opacity = onSettingsBackgroundOpacity,
+            .scroll_sensitivity = onSettingsScrollSensitivity,
         },
     );
 }

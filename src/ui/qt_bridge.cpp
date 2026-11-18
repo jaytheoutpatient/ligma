@@ -37,6 +37,7 @@ namespace {
 
 QColor row_gradient_start(59, 130, 246);
 QColor row_gradient_end(99, 102, 241);
+double scroll_sensitivity = 1.0;
 
 QRect treeRowRect(const QTreeView *tree, const QModelIndex &index, const QRect &fallback)
 {
@@ -370,11 +371,12 @@ class SmoothScrollFilter final : public QObject {
         const int pixel_delta = -wheel->pixelDelta().y();
         int distance = 0;
         if (pixel_delta != 0) {
-            // Touchpads report fine pixel deltas. A 2.5x scale keeps a light
-            // swipe responsive while still preserving fine control.
+            // Touchpads report fine pixel deltas. The base scale keeps a light
+            // swipe responsive; the user multiplier adjusts it globally.
             const int magnitude = pixel_delta < 0 ? -pixel_delta : pixel_delta;
-            distance = (pixel_delta < 0 ? -1 : 1) *
-                std::max((magnitude * 5) / 2, 2);
+            const int scaled = std::max(
+                1, qRound(((magnitude * 5) / 2.0) * scroll_sensitivity));
+            distance = (pixel_delta < 0 ? -1 : 1) * scaled;
         } else {
             const int angle = wheel->angleDelta().y();
             if (angle == 0)
@@ -384,7 +386,8 @@ class SmoothScrollFilter final : public QObject {
             const int unit = per_pixel
                 ? std::max(bar_->singleStep() * 5, 200)
                 : std::max(bar_->singleStep() * 3, 60);
-            distance = (angle > 0 ? -1 : 1) * unit;
+            const int scaled = std::max(1, qRound(unit * scroll_sensitivity));
+            distance = (angle > 0 ? -1 : 1) * scaled;
         }
 
         animation_->stop();
@@ -535,6 +538,11 @@ void ligma_checkbox_row_click(void *text_pointer, void *checkbox_pointer)
     auto *box = static_cast<QCheckBox *>(checkbox_pointer);
     if (text != nullptr && box != nullptr)
         text->installEventFilter(new RowToggleFilter(text, box));
+}
+
+void ligma_set_scroll_sensitivity(double value)
+{
+    scroll_sensitivity = std::clamp(value, 0.25, 4.0);
 }
 
 void ligma_attach_typing_filter(void *view_pointer, TypingCallback callback)

@@ -42,6 +42,8 @@ pub const Callbacks = struct {
     sidebar_width: *const fn (width: i32) callconv(.c) void,
     /// Update only the window background tint while the slider is moving.
     background_opacity: *const fn (opacity: f64) callconv(.c) void,
+    /// Update wheel and touchpad scroll distance immediately.
+    scroll_sensitivity: *const fn (sensitivity: f64) callconv(.c) void,
 };
 
 const Ui = struct {
@@ -71,6 +73,8 @@ const Ui = struct {
 
     view_mode: QComboBox = undefined,
     density: QComboBox = undefined,
+    scroll_sensitivity: QSlider = undefined,
+    scroll_value: QLabel = undefined,
     truncation: QComboBox = undefined,
     show_emblems: QCheckBox = undefined,
     show_hidden: QCheckBox = undefined,
@@ -241,7 +245,7 @@ fn onAnyDoubleSpin(_: QDoubleSpinBox, _: f64) callconv(.c) void {
 }
 
 fn onOpacityChanged(_: QSlider, value: i32) callconv(.c) void {
-    updateOpacityLabel(value);
+    updatePercentLabel(ui.opacity_value, value);
     if (suppress) return;
     settings_ptr.background_opacity = @as(f64, @floatFromInt(value)) / 100.0;
     // Re-applying every pane setting on each drag step would be needless
@@ -249,10 +253,17 @@ fn onOpacityChanged(_: QSlider, value: i32) callconv(.c) void {
     callbacks.background_opacity(settings_ptr.background_opacity);
 }
 
-fn updateOpacityLabel(value: i32) void {
+fn onScrollSensitivityChanged(_: QSlider, value: i32) callconv(.c) void {
+    updatePercentLabel(ui.scroll_value, value);
+    if (suppress) return;
+    settings_ptr.scroll_sensitivity = @as(f64, @floatFromInt(value)) / 100.0;
+    callbacks.scroll_sensitivity(settings_ptr.scroll_sensitivity);
+}
+
+fn updatePercentLabel(label: QLabel, value: i32) void {
     var buffer: [16]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, "{d}%", .{value}) catch "";
-    ui.opacity_value.setText(text);
+    label.setText(text);
 }
 
 fn onAnyText(_: QLineEdit) callconv(.c) void {
@@ -314,6 +325,7 @@ fn commit() void {
         1 => .comfortable,
         else => .compact,
     };
+    s.scroll_sensitivity = @as(f64, @floatFromInt(ui.scroll_sensitivity.value())) / 100.0;
     s.filename_truncation = switch (ui.truncation.currentIndex()) {
         1 => .middle,
         else => .end,
@@ -367,7 +379,7 @@ fn syncControls(settings: *const settings_mod.Settings) void {
     ui.terminal.setText(settings.terminal_command);
 
     ui.opacity.setValue(@intFromFloat(@round(settings.background_opacity * 100.0)));
-    updateOpacityLabel(ui.opacity.value());
+    updatePercentLabel(ui.opacity_value, ui.opacity.value());
     ui.corner.setValue(settings.corner_radius_scale);
     ui.compact_menus.setChecked(settings.compact_menus);
     ui.always_tabs.setChecked(settings.always_show_tab_bar);
@@ -384,6 +396,8 @@ fn syncControls(settings: *const settings_mod.Settings) void {
         .grid => 3,
     });
     ui.density.setCurrentIndex(if (settings.density == .comfortable) 1 else 0);
+    ui.scroll_sensitivity.setValue(@intFromFloat(@round(settings.scroll_sensitivity * 100.0)));
+    updatePercentLabel(ui.scroll_value, ui.scroll_sensitivity.value());
     ui.truncation.setCurrentIndex(if (settings.filename_truncation == .middle) 1 else 0);
     ui.show_emblems.setChecked(settings.show_emblems);
     ui.show_hidden.setChecked(settings.show_hidden);
@@ -497,6 +511,30 @@ fn buildViewsPage() void {
     ui.truncation = addCombo(view, "Long filenames", "Details view elision", &.{
         "Shorten at the end", "Shorten in the middle",
     });
+    const scroll_row = QWidget.new2();
+    scroll_row.setMinimumWidth(240);
+    const scroll_layout = QHBoxLayout.new(scroll_row);
+    scroll_layout.setContentsMargins(0, 0, 0, 0);
+    scroll_layout.setSpacing(8);
+    ui.scroll_sensitivity = QSlider.new3(qnamespace_enums.Orientation.Horizontal);
+    ui.scroll_sensitivity.setRange(50, 250);
+    ui.scroll_sensitivity.setPageStep(25);
+    ui.scroll_sensitivity.setMinimumWidth(180);
+    ui.scroll_value = QLabel.new3("100%");
+    ui.scroll_value.setObjectName("ligmaValue");
+    ui.scroll_value.setFixedWidth(40);
+    ui.scroll_value.setAlignment(qnamespace_enums.AlignmentFlag.AlignRight |
+        qnamespace_enums.AlignmentFlag.AlignVCenter);
+    scroll_layout.addWidget2(ui.scroll_sensitivity, 1);
+    scroll_layout.addWidget(ui.scroll_value);
+    ui.scroll_sensitivity.onValueChanged(onScrollSensitivityChanged);
+    _ = addRow(
+        view,
+        "Scroll sensitivity",
+        "Wheel and touchpad distance",
+        scroll_row,
+    );
+
     ui.show_emblems = addCheck(view, "Link and read-only emblems", "Keep the symlink badge on icons");
 
     const files = addCard(page, "Files");

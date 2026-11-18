@@ -38,6 +38,7 @@ pub const Settings = struct {
     view_mode: ViewMode = .details,
     grid_icon_size: i32 = 96,
     density: Density = .compact,
+    scroll_sensitivity: f64 = 1.0,
     filename_truncation: FilenameTruncation = .end,
     show_hidden: bool = false,
     show_backups: bool = true,
@@ -98,6 +99,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
     settings.sidebar_width = std.math.clamp(settings.sidebar_width, 160, 620);
     settings.thumbnail_max_mib = std.math.clamp(settings.thumbnail_max_mib, 1, 1024);
     settings.video_hover_seconds = std.math.clamp(settings.video_hover_seconds, 1, 30);
+    settings.scroll_sensitivity = std.math.clamp(settings.scroll_sensitivity, 0.5, 2.5);
     settings.background_opacity = std.math.clamp(settings.background_opacity, 0.20, 1.0);
     settings.corner_radius_scale = std.math.clamp(settings.corner_radius_scale, 0.0, 2.0);
     return settings;
@@ -139,6 +141,7 @@ pub fn save(settings: Settings, gpa: std.mem.Allocator, io: std.Io, path: []cons
     );
     try writer.print(
         "[views]\nview_mode = \"{s}\"\ngrid_icon_size = {d}\ndensity = \"{s}\"\n" ++
+            "scroll_sensitivity = {d:.2}\n" ++
             "filename_truncation = \"{s}\"\nshow_hidden = {s}\nshow_backups = {s}\n" ++
             "show_emblems = {s}\ndirectories_first = {s}\nsort_by = \"{s}\"\n" ++
             "sort_descending = {s}\nshow_size_column = {s}\nshow_kind_column = {s}\n" ++
@@ -147,6 +150,7 @@ pub fn save(settings: Settings, gpa: std.mem.Allocator, io: std.Io, path: []cons
             @tagName(settings.view_mode),
             settings.grid_icon_size,
             @tagName(settings.density),
+            settings.scroll_sensitivity,
             @tagName(settings.filename_truncation),
             boolText(settings.show_hidden),
             boolText(settings.show_backups),
@@ -230,6 +234,8 @@ fn applyValue(
             settings.grid_icon_size = intValue(value) orelse settings.grid_icon_size;
         } else if (std.mem.eql(u8, key, "density")) {
             settings.density = enumValue(Density, value) orelse settings.density;
+        } else if (std.mem.eql(u8, key, "scroll_sensitivity")) {
+            settings.scroll_sensitivity = floatValue(value) orelse settings.scroll_sensitivity;
         } else if (std.mem.eql(u8, key, "filename_truncation")) {
             settings.filename_truncation = enumValue(FilenameTruncation, value) orelse
                 settings.filename_truncation;
