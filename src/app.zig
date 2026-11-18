@@ -340,16 +340,18 @@ fn loadApplicationIcon() QIcon {
 }
 
 pub fn run(init: std.process.Init, qapp: QApplication) !void {
+    admin_mode = std.c.getenv("LIGMA_ADMIN") != null;
+
     const settings_path = settingsPath(init.gpa) catch null;
     defer if (settings_path) |path| init.gpa.free(path);
-    const initial_settings = if (settings_path) |path|
+    var initial_settings = if (settings_path) |path|
         settings_mod.load(init.gpa, init.io, path)
     else
         settings_mod.Settings{};
+    if (admin_mode) applyAdminThemeSettings(&initial_settings);
     QApplication.setApplicationName("Ligma");
     QApplication.setApplicationDisplayName("Ligma");
     QApplication.setDesktopFileName("org.ligma.FileManager");
-    admin_mode = std.c.getenv("LIGMA_ADMIN") != null;
 
     detectMatugenScheme(init.gpa, init.io);
     appearance_mode = loadAppearanceSetting(init.gpa, init.io);
@@ -1102,7 +1104,15 @@ fn appendAdminEnv(
 fn currentExecutablePath() ?[]u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = std.Io.Dir.readLinkAbsolute(app.io, "/proc/self/exe", &buffer) catch return null;
-    return app.gpa.dupe(u8, buffer[0..length]) catch null;
+    const path = buffer[0..length];
+    // A rebuilt or updated binary can still be running after its path has been
+    // replaced. Executing `/proc/<our pid>/exe` reaches the same inode and
+    // avoids passing a `(deleted)` path to pkexec.
+    const deleted_suffix = " (deleted)";
+    if (std.mem.endsWith(u8, path, deleted_suffix)) {
+        return std.fmt.allocPrint(app.gpa, "/proc/{d}/exe", .{std.c.getpid()}) catch null;
+    }
+    return app.gpa.dupe(u8, path) catch null;
 }
 
 fn adminXauthorityPath() ?[]u8 {
@@ -1212,6 +1222,44 @@ fn onOpenAsAdministrator(_: QAction) callconv(.c) void {
     inline for (root_env) |entry| {
         if (!appendAdminEnv(&owned, &env_args, entry[0], entry[1])) return;
     }
+
+    // Copy the visual theme into the elevated window. Root still uses its own
+    // writable config directory, but starts with the user's appearance mode,
+    // Matugen scheme, corner radius, and background opacity.
+    if (!appendAdminEnv(
+        &owned,
+        &env_args,
+        "LIGMA_ADMIN_APPEARANCE",
+        adminAppearanceName(appearance_mode),
+    )) return;
+    if (matugen_available and matugen_scheme_len > 0) {
+        if (!appendAdminEnv(
+            &owned,
+            &env_args,
+            "LIGMA_ADMIN_MATUGEN",
+            matugen_scheme_buf[0..matugen_scheme_len],
+        )) return;
+    }
+    var theme_number: [64]u8 = undefined;
+    const radius_text = std.fmt.bufPrint(
+        &theme_number,
+        "{d:.3}",
+        .{app.settings.corner_radius_scale},
+    ) catch "1.0";
+    if (!appendAdminEnv(&owned, &env_args, "LIGMA_ADMIN_RADIUS", radius_text)) return;
+    const opacity_text = std.fmt.bufPrint(
+        &theme_number,
+        "{d:.3}",
+        .{app.settings.background_opacity},
+    ) catch "1.0";
+    if (!appendAdminEnv(&owned, &env_args, "LIGMA_ADMIN_OPACITY", opacity_text)) return;
+    if (!appendAdminEnv(
+        &owned,
+        &env_args,
+        "LIGMA_ADMIN_COMPACT_MENUS",
+        if (app.settings.compact_menus) "1" else "0",
+    )) return;
+
     if (!appendAdminArgument(&owned, &env_args, "LIGMA_ADMIN=1")) return;
     if (!appendAdminEnv(&owned, &env_args, "LIGMA_START_PATH", start_path)) return;
     inline for (.{ "LANG", "LC_ALL", "LANGUAGE" }) |key| {
@@ -1334,6 +1382,53 @@ fn applySettingsToAllPanes() void {
     saveSettings();
 }
 
+/// The administrator window runs as root with its own config directory. The
+/// launcher passes the user's visual preferences through the environment so
+/// the elevated window keeps the same theme without sharing writable config
+/// files with the root process.
+fn applyAdminThemeSettings(settings: *settings_mod.Settings) void {
+    if (std.c.getenv("LIGMA_ADMIN_RADIUS")) |raw| {
+        const value = std.fmt.parseFloat(
+            f64,
+            std.mem.trim(u8, std.mem.span(raw), " \t\r\n"),
+        ) catch std.math.nan(f64);
+        if (std.math.isFinite(value))
+            settings.corner_radius_scale = std.math.clamp(value, 0.0, 2.0);
+    }
+    if (std.c.getenv("LIGMA_ADMIN_OPACITY")) |raw| {
+        const value = std.fmt.parseFloat(
+            f64,
+            std.mem.trim(u8, std.mem.span(raw), " \t\r\n"),
+        ) catch std.math.nan(f64);
+        if (std.math.isFinite(value))
+            settings.background_opacity = std.math.clamp(value, 0.20, 1.0);
+    }
+    if (std.c.getenv("LIGMA_ADMIN_COMPACT_MENUS")) |raw| {
+        const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+        settings.compact_menus = std.mem.eql(u8, value, "1") or
+            std.ascii.eqlIgnoreCase(value, "true");
+    }
+}
+
+fn adminAppearanceName(mode: Appearance) []const u8 {
+    return switch (mode) {
+        .matugen => "matugen",
+        .light => "light",
+        .dark => "dark",
+        .system => "system",
+    };
+}
+
+fn adminAppearanceFromEnv() ?Appearance {
+    const raw = std.c.getenv("LIGMA_ADMIN_APPEARANCE") orelse return null;
+    const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(value, "matugen")) return .matugen;
+    if (std.ascii.eqlIgnoreCase(value, "light")) return .light;
+    if (std.ascii.eqlIgnoreCase(value, "dark")) return .dark;
+    if (std.ascii.eqlIgnoreCase(value, "system")) return .system;
+    return null;
+}
+
 fn appearanceSettingsPath(gpa: std.mem.Allocator) ![]u8 {
     const config = try configHome(gpa);
     defer gpa.free(config);
@@ -1341,6 +1436,7 @@ fn appearanceSettingsPath(gpa: std.mem.Allocator) ![]u8 {
 }
 
 fn loadAppearanceSetting(gpa: std.mem.Allocator, io: std.Io) Appearance {
+    if (adminAppearanceFromEnv()) |mode| return mode;
     const path = appearanceSettingsPath(gpa) catch {
         return if (matugen_available) .matugen else .system;
     };
@@ -1385,6 +1481,24 @@ fn setMatugenPath(path: []const u8) void {
 fn detectMatugenScheme(gpa: std.mem.Allocator, io: std.Io) void {
     matugen_available = false;
     matugen_scheme_len = 0;
+
+    // The elevated window gets the user's scheme path explicitly because
+    // its own config directory contains root's settings, not the user's.
+    if (std.c.getenv("LIGMA_ADMIN_MATUGEN")) |raw| {
+        const path = std.mem.span(raw);
+        if (path.len > 0) {
+            const exists = if (std.Io.Dir.cwd().statFile(
+                io,
+                path,
+                .{ .follow_symlinks = true },
+            )) |_| true else |_| false;
+            if (exists) {
+                setMatugenPath(path);
+                matugen_available = true;
+                return;
+            }
+        }
+    }
 
     const config = configHome(gpa) catch return;
     defer gpa.free(config);
