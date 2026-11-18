@@ -1,6 +1,7 @@
 const std = @import("std");
 const qt6 = @import("libqt6zig");
 
+const admin_client = @import("../core/admin_client.zig");
 const file_ops = @import("../core/file_ops.zig");
 const text_sort = @import("../core/text_sort.zig");
 
@@ -59,6 +60,7 @@ pub const LocalModel = struct {
     job: ?*LoadJob = null,
     retired: std.ArrayList(*LoadJob) = .empty,
     generation: u64 = 0,
+    admin_socket: ?[]u8 = null,
 
     video_icons: std.StringHashMapUnmanaged(QIcon) = .empty,
     video_pending: std.StringHashMapUnmanaged(void) = .empty,
@@ -195,6 +197,7 @@ pub const LocalModel = struct {
         self.video_icons.deinit(self.gpa);
         if (self.mime_db.ptr != null) self.mime_db.delete();
         self.visible.deinit(self.gpa);
+        if (self.admin_socket) |socket| self.gpa.free(socket);
         self.freeRoot();
         self.freeFilter();
         self.gpa.destroy(self);
@@ -237,7 +240,7 @@ pub const LocalModel = struct {
         self.clearEntries();
         self.resetModel();
 
-        const job = LoadJob.create(self, self.generation, new_root) catch |err| {
+        const job = LoadJob.create(self, self.generation, new_root, self.admin_socket) catch |err| {
             self.setError(@errorName(err));
             return;
         };
@@ -252,6 +255,16 @@ pub const LocalModel = struct {
     pub fn reload(self: *LocalModel) void {
         const path = self.root_path orelse return;
         self.load(path);
+    }
+
+    /// Route directory listings through the pkexec administrator helper while
+    /// administrator mode is active. Passing null restores normal user access.
+    pub fn setAdminSocket(self: *LocalModel, socket: ?[]const u8) void {
+        if (self.admin_socket) |old| self.gpa.free(old);
+        self.admin_socket = if (socket) |value|
+            self.gpa.dupe(u8, value) catch null
+        else
+            null;
     }
 
     pub fn setFilter(self: *LocalModel, text: []const u8) void {
@@ -818,6 +831,7 @@ const LoadJob = struct {
     model: *LocalModel,
     generation: u64,
     path: []u8,
+    admin_socket: ?[]u8 = null,
     entries: std.ArrayList(LocalModel.Entry) = .empty,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -830,17 +844,26 @@ const LoadJob = struct {
         model: *LocalModel,
         generation: u64,
         path: []const u8,
+        admin_socket: ?[]const u8,
     ) !*LoadJob {
         const self = try model.gpa.create(LoadJob);
         errdefer model.gpa.destroy(self);
 
         const copy = try model.gpa.dupe(u8, path);
+        errdefer model.gpa.free(copy);
+        const socket_copy = if (admin_socket) |socket|
+            try model.gpa.dupe(u8, socket)
+        else
+            null;
+        errdefer if (socket_copy) |socket| model.gpa.free(socket);
+
         self.* = .{
             .gpa = model.gpa,
             .io = model.io,
             .model = model,
             .generation = generation,
             .path = copy,
+            .admin_socket = socket_copy,
         };
         return self;
     }
@@ -872,8 +895,14 @@ const LoadJob = struct {
             "folder not found"
         else if (err == error.NotDir)
             "not a folder"
+        else if (err == error.AdminHelperUnavailable)
+            "administrator helper unavailable"
         else
             @errorName(err);
+        self.failWithText(text);
+    }
+
+    fn failWithText(self: *LoadJob, text: []const u8) void {
         const len = @min(text.len, self.error_buffer.len);
         @memcpy(self.error_buffer[0..len], text[0..len]);
         self.error_len = len;
@@ -897,18 +926,21 @@ const LoadJob = struct {
         self.join();
         self.dropEntries();
         self.gpa.free(self.path);
+        if (self.admin_socket) |socket| self.gpa.free(socket);
         self.gpa.destroy(self);
     }
 
     fn worker(self: *LoadJob) void {
         self.scan() catch |err| {
-            if (err != error.Cancelled) self.setError(err);
+            // A failed helper request already stored the helper's own message.
+            if (err != error.Cancelled and !self.failed) self.setError(err);
         };
         self.done.store(true, .release);
     }
 
     fn scan(self: *LoadJob) !void {
         if (file_ops.isTrashLocation(self.path)) return self.scanTrash();
+        if (self.admin_socket) |socket| return self.scanAdmin(socket);
 
         var dir = try std.Io.Dir.openDirAbsolute(self.io, self.path, .{ .iterate = true });
         defer dir.close(self.io);
@@ -949,6 +981,43 @@ const LoadJob = struct {
                 .is_symlink = item.kind == .sym_link,
                 .size = size,
                 .mtime = mtime,
+            });
+        }
+    }
+
+    fn scanAdmin(self: *LoadJob, socket: []const u8) !void {
+        var remote_error: ?[]u8 = null;
+        var remote_entries = admin_client.list(
+            self.gpa,
+            self.io,
+            socket,
+            self.path,
+            &remote_error,
+        ) catch {
+            if (remote_error) |text| {
+                defer self.gpa.free(text);
+                self.failWithText(text);
+            }
+            return error.AdminHelperUnavailable;
+        };
+        defer {
+            for (remote_entries.items) |*entry| entry.deinit(self.gpa);
+            remote_entries.deinit(self.gpa);
+        }
+
+        for (remote_entries.items) |remote| {
+            if (self.cancel.load(.acquire)) return error.Cancelled;
+            const name = try self.gpa.dupe(u8, remote.name);
+            errdefer self.gpa.free(name);
+            const path = try std.fs.path.join(self.gpa, &.{ self.path, name });
+            errdefer self.gpa.free(path);
+            try self.entries.append(self.gpa, .{
+                .name = name,
+                .path = path,
+                .is_dir = remote.is_dir,
+                .is_symlink = remote.is_symlink,
+                .size = remote.size,
+                .mtime = remote.mtime,
             });
         }
     }

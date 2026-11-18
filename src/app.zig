@@ -5,6 +5,7 @@ const file_ops = @import("core/file_ops.zig");
 const paths = @import("core/paths.zig");
 const search_index = @import("core/search_index.zig");
 const search_scan = @import("core/search_scan.zig");
+const admin_client = @import("core/admin_client.zig");
 const settings_mod = @import("core/settings.zig");
 const settings_dialog = @import("ui/settings_dialog.zig");
 const text_sort = @import("core/text_sort.zig");
@@ -107,6 +108,107 @@ const ViewMode = enum { details, icons, compact, grid };
 
 const Appearance = enum { matugen, light, dark, system };
 
+const AdminKind = enum { delete, rename, mkdir, copy, move };
+
+/// One asynchronous operation performed by the administrator helper. The UI
+/// keeps rendering while the root helper works and polls `done` from a timer.
+const AdminOp = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    socket: []u8,
+    kind: AdminKind,
+    owned_paths: std.ArrayList([]u8) = .empty,
+    paths: std.ArrayList([]const u8) = .empty,
+    dest: ?[]u8 = null,
+    new_name: ?[]u8 = null,
+    clear_cut: bool = false,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    success: bool = false,
+    error_text: ?[]u8 = null,
+    thread: ?std.Thread = null,
+
+    fn addPath(self: *AdminOp, path: []const u8) !void {
+        const copy = try self.gpa.dupe(u8, path);
+        errdefer self.gpa.free(copy);
+        try self.owned_paths.append(self.gpa, copy);
+        errdefer _ = self.owned_paths.pop();
+        try self.paths.append(self.gpa, copy);
+    }
+
+    fn start(self: *AdminOp) !void {
+        self.thread = try std.Thread.spawn(.{}, worker, .{self});
+    }
+
+    fn worker(self: *AdminOp) void {
+        const operation: admin_client.Operation = switch (self.kind) {
+            .delete => .{ .delete = self.paths.items },
+            .rename => .{ .rename = .{
+                .source = if (self.paths.items.len > 0) self.paths.items[0] else "",
+                .new_name = self.new_name orelse "",
+            } },
+            .mkdir => .{ .mkdir = if (self.paths.items.len > 0) self.paths.items[0] else "" },
+            .copy => .{ .copy = .{
+                .sources = self.paths.items,
+                .dest_dir = self.dest orelse "",
+            } },
+            .move => .{ .move = .{
+                .sources = self.paths.items,
+                .dest_dir = self.dest orelse "",
+            } },
+        };
+        self.success = if (admin_client.run(
+            self.gpa,
+            self.io,
+            self.socket,
+            operation,
+            &self.error_text,
+        ))
+            true
+        else |_|
+            false;
+        self.done.store(true, .release);
+    }
+
+    fn join(self: *AdminOp) void {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    fn deinit(self: *AdminOp) void {
+        self.join();
+        for (self.owned_paths.items) |path| self.gpa.free(path);
+        self.owned_paths.deinit(self.gpa);
+        self.paths.deinit(self.gpa);
+        if (self.dest) |dest| self.gpa.free(dest);
+        if (self.new_name) |name| self.gpa.free(name);
+        if (self.error_text) |text| self.gpa.free(text);
+        self.gpa.free(self.socket);
+        self.gpa.destroy(self);
+    }
+
+    fn verb(self: *const AdminOp) []const u8 {
+        return switch (self.kind) {
+            .delete => "Deleting as administrator…",
+            .rename => "Renaming as administrator…",
+            .mkdir => "Creating folder as administrator…",
+            .copy => "Copying as administrator…",
+            .move => "Moving as administrator…",
+        };
+    }
+
+    fn doneVerb(self: *const AdminOp) []const u8 {
+        return switch (self.kind) {
+            .delete => "Deleted as administrator",
+            .rename => "Renamed as administrator",
+            .mkdir => "Folder created as administrator",
+            .copy => "Copied as administrator",
+            .move => "Moved as administrator",
+        };
+    }
+};
+
 extern fn ligma_apply_qt6ct_palette(path: [*:0]const u8) c_int;
 extern fn ligma_apply_builtin_palette(dark: c_int) void;
 extern fn ligma_apply_system_palette() void;
@@ -175,7 +277,6 @@ extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_m
 extern fn ligma_dock_new(title: [*:0]const u8, parent: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) ?*anyopaque;
 
 var appearance_mode: Appearance = .system;
-var admin_mode: bool = false;
 var matugen_scheme_buf: [4096]u8 = undefined;
 var matugen_scheme_len: usize = 0;
 var matugen_available = false;
@@ -186,6 +287,14 @@ const App = struct {
     qapp: QApplication,
 
     window: QMainWindow,
+    admin_action: QAction,
+    admin_helper: ?QProcess = null,
+    admin_socket: ?[]u8 = null,
+    admin_pending: bool = false,
+    admin_active: bool = false,
+    admin_op: ?*AdminOp = null,
+    admin_timer: QTimer,
+    admin_badge: QLabel,
     tabs: QTabWidget,
     main_splitter: QSplitter,
     sidebar: QWidget,
@@ -308,6 +417,7 @@ const App = struct {
 
     show_hidden: bool = false,
     suppress_filter: bool = false,
+    suppress_selection_status: bool = false,
     tabs_updating: bool = false,
     status_hold_until_ms: i64 = 0,
 
@@ -349,7 +459,6 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     QApplication.setApplicationName("Ligma");
     QApplication.setApplicationDisplayName("Ligma");
     QApplication.setDesktopFileName("org.ligma.FileManager");
-    admin_mode = std.c.getenv("LIGMA_ADMIN") != null;
 
     detectMatugenScheme(init.gpa, init.io);
     appearance_mode = loadAppearanceSetting(init.gpa, init.io);
@@ -527,6 +636,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const sidebar_timer = QTimer.new2(window);
     sidebar_timer.setInterval(150);
 
+    const admin_timer = QTimer.new2(window);
+    admin_timer.setInterval(100);
+
     const unmount_process = QProcess.new2(window);
     unmount_process.onFinished(onUnmountFinished);
     unmount_process.onErrorOccurred(onUnmountError);
@@ -541,6 +653,15 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const index_label = QLabel.new3("Index: …");
     status.addPermanentWidget(index_label);
 
+    const admin_badge = QLabel.new3("Administrator");
+    admin_badge.setStyleSheet(
+        "QLabel { color: white; border-radius: 4px; padding: 2px 8px; font-weight: 600; " ++
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, " ++
+            "stop:0 rgba(59, 130, 246, 0.90), stop:1 rgba(99, 102, 241, 0.65)); }",
+    );
+    admin_badge.hide();
+    status.addPermanentWidget(admin_badge);
+
     // ---- Menus -----------------------------------------------------------
     const menubar = window.menuBar();
 
@@ -552,7 +673,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     file_menu.addAction(rename_action);
     const run_action = makeAction(file_menu, "Run Selected", "Ctrl+Return", onRunSelected);
     file_menu.addAction(run_action);
-    const admin_action = makeAction(file_menu, "Open as Administrator", "Ctrl+.", onOpenAsAdministrator);
+    const admin_action = makeAction(file_menu, "Enter Administrator Mode", "Ctrl+.", onToggleAdminMode);
     file_menu.addAction(admin_action);
     _ = file_menu.addSeparator();
     const trash_action = makeAction(file_menu, "Move to Trash", "Delete", onTrashSelected);
@@ -748,6 +869,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .io = init.io,
         .qapp = qapp,
         .window = window,
+        .admin_action = admin_action,
+        .admin_timer = admin_timer,
+        .admin_badge = admin_badge,
         .tabs = tabs,
         .main_splitter = main_splitter,
         .sidebar = sidebar,
@@ -853,6 +977,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     fs_refresh_timer.onTimeout(onFsRefreshTimer);
     mount_timer.onTimeout(onMountTimer);
     sidebar_timer.onTimeout(onSidebarTimer);
+    admin_timer.onTimeout(onAdminTimer);
     terminal_dock.onVisibilityChanged(onTerminalVisibilityChanged);
     player_dock.onVisibilityChanged(onPlayerVisibilityChanged);
     tabs.onCurrentChanged(onTabChanged);
@@ -866,22 +991,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     file_timer.onTimeout(onFileTimer);
     model_timer.onTimeout(onModelTimer);
 
-    if (admin_mode) {
-        // The elevated instance starts in the folder that requested it rather
-        // than restoring the root account's previous tabs.
-        if (std.c.getenv("LIGMA_START_PATH")) |raw| {
-            const start_path = std.mem.span(raw);
-            if (start_path.len > 0 and start_path[0] == '/') {
-                _ = createTab(start_path);
-            } else {
-                _ = createRestoredTab(home);
-            }
-        } else {
-            _ = createRestoredTab(home);
-        }
-    } else {
-        _ = createRestoredTab(home);
-    }
+    _ = createRestoredTab(home);
     window.show();
     applySidebarWidth(app.settings.sidebar_width);
     _ = ligma_mpris_start(&mpris_callbacks);
@@ -928,6 +1038,10 @@ fn saveSession() void {
         std.Io.Dir.deleteFileAbsolute(app.io, path) catch {};
         return;
     }
+    // Administrator browsing can leave a tab on a root-only folder. Keep the
+    // previous session in that case instead of restoring an unreadable path
+    // on the next normal launch.
+    if (!sessionPathsReadable()) return;
 
     var buffer: [32 * 1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
@@ -947,6 +1061,24 @@ fn saveSession() void {
         .data = writer.buffered(),
         .flags = .{ .truncate = true },
     }) catch {};
+}
+
+fn pathReadableByUser(path: []const u8) bool {
+    if (file_ops.isTrashLocation(path)) return true;
+    // `iterate = true` clears Zig's default O_PATH shortcut, so this checks
+    // the read permission a normal folder listing actually needs.
+    var dir = std.Io.Dir.openDirAbsolute(app.io, path, .{ .iterate = true }) catch return false;
+    dir.close(app.io);
+    return true;
+}
+
+fn sessionPathsReadable() bool {
+    for (app.tabs_list.items) |tab| {
+        const pane = tab.panes[tab.active] orelse tab.panes[0] orelse continue;
+        const current = pane.model.currentPath() orelse continue;
+        if (!pathReadableByUser(current)) return false;
+    }
+    return true;
 }
 
 fn createRestoredTab(home: []const u8) *Tab {
@@ -1070,7 +1202,7 @@ fn onSettingsSidebarWidth(width: i32) callconv(.c) void {
     applySidebarWidth(width);
 }
 
-fn appendAdminArgument(
+fn appendOwnedArgument(
     owned: *std.ArrayList([]u8),
     args: *std.ArrayList([]const u8),
     text: []const u8,
@@ -1088,7 +1220,7 @@ fn appendAdminArgument(
     return true;
 }
 
-fn appendAdminEnv(
+fn appendOwnedEnv(
     owned: *std.ArrayList([]u8),
     args: *std.ArrayList([]const u8),
     key: []const u8,
@@ -1096,7 +1228,7 @@ fn appendAdminEnv(
 ) bool {
     var buffer: [8192]u8 = undefined;
     const assignment = std.fmt.bufPrint(&buffer, "{s}={s}", .{ key, value }) catch return false;
-    return appendAdminArgument(owned, args, assignment);
+    return appendOwnedArgument(owned, args, assignment);
 }
 
 fn currentExecutablePath() ?[]u8 {
@@ -1105,146 +1237,363 @@ fn currentExecutablePath() ?[]u8 {
     return app.gpa.dupe(u8, buffer[0..length]) catch null;
 }
 
-fn adminXauthorityPath() ?[]u8 {
-    if (std.c.getenv("XAUTHORITY")) |raw| {
-        const value = std.mem.span(raw);
-        if (value.len > 0) return app.gpa.dupe(u8, value) catch null;
+fn makeAdminSocketPath() ![]u8 {
+    var nonce: u64 = undefined;
+    std.Io.randomSecure(app.io, std.mem.asBytes(&nonce)) catch
+        std.Io.random(app.io, std.mem.asBytes(&nonce));
+    const uid = std.c.getuid();
+    if (std.c.getenv("XDG_RUNTIME_DIR")) |raw| {
+        const runtime = std.mem.span(raw);
+        if (runtime.len > 0) {
+            const path = try std.fmt.allocPrint(
+                app.gpa,
+                "{s}/ligma-admin-{d}-{x}.sock",
+                .{ runtime, uid, nonce },
+            );
+            if (path.len <= 100) return path;
+            app.gpa.free(path);
+        }
     }
-    const home_raw = std.c.getenv("HOME") orelse return null;
-    const home = std.mem.span(home_raw);
-    if (home.len == 0) return null;
-    const candidate = std.fs.path.join(app.gpa, &.{ home, ".Xauthority" }) catch return null;
-    _ = std.Io.Dir.cwd().statFile(
-        app.io,
-        candidate,
-        .{ .follow_symlinks = true },
-    ) catch {
-        app.gpa.free(candidate);
-        return null;
-    };
-    return candidate;
+    return std.fmt.allocPrint(
+        app.gpa,
+        "/tmp/ligma-admin-{d}-{x}.sock",
+        .{ uid, nonce },
+    );
 }
 
-fn pkexecAvailable() bool {
-    const candidates = [_][]const u8{
-        "/usr/bin/pkexec",
-        "/bin/pkexec",
-        "/usr/sbin/pkexec",
-        "/usr/local/bin/pkexec",
-    };
-    for (candidates) |path| {
-        _ = std.Io.Dir.cwd().statFile(app.io, path, .{ .follow_symlinks = true }) catch continue;
-        return true;
+fn startAdminHelper() void {
+    if (app.admin_active or app.admin_pending) return;
+    if (app.file_job != null or app.admin_op != null) {
+        showStatus("Finish the current operation first", 3500);
+        return;
     }
-    return false;
-}
 
-fn onOpenAsAdministrator(_: QAction) callconv(.c) void {
-    if (admin_mode) {
-        showStatus("This window already has administrator privileges", 3500);
+    const socket = makeAdminSocketPath() catch {
+        showStatus("Could not create the administrator socket", 4000);
         return;
-    }
-    if (!pkexecAvailable()) {
-        showStatus("pkexec is not installed; administrator mode needs polkit", 4500);
-        return;
-    }
+    };
+    var socket_owned = true;
+    defer if (socket_owned) app.gpa.free(socket);
 
     const exe_owned = currentExecutablePath();
     defer if (exe_owned) |path| app.gpa.free(path);
     const executable = exe_owned orelse "/usr/bin/ligma";
 
-    const start_path = if (activePane()) |pane| blk: {
-        const path = pane.current_path orelse break :blk "/";
-        if (path.len > 0 and path[0] == '/') break :blk path;
-        break :blk "/";
-    } else "/";
-
     var owned: std.ArrayList([]u8) = .empty;
-    var env_args: std.ArrayList([]const u8) = .empty;
+    var args: std.ArrayList([]const u8) = .empty;
     defer {
         for (owned.items) |argument| app.gpa.free(argument);
         owned.deinit(app.gpa);
-        env_args.deinit(app.gpa);
+        args.deinit(app.gpa);
     }
 
-    var has_display = false;
-    var has_wayland = false;
-    if (std.c.getenv("DISPLAY")) |raw| {
-        const display = std.mem.span(raw);
-        if (display.len > 0) {
-            has_display = true;
-            if (!appendAdminEnv(&owned, &env_args, "DISPLAY", display)) return;
-            if (!appendAdminArgument(&owned, &env_args, "QT_QPA_PLATFORM=xcb")) return;
-            if (adminXauthorityPath()) |path| {
-                defer app.gpa.free(path);
-                if (!appendAdminEnv(&owned, &env_args, "XAUTHORITY", path)) return;
-            }
-        }
+    if (!appendOwnedArgument(&owned, &args, "/usr/bin/env")) return;
+    if (!appendOwnedArgument(&owned, &args, "LIGMA_ADMIN_HELPER=1")) return;
+    if (!appendOwnedEnv(&owned, &args, "LIGMA_ADMIN_SOCKET", socket)) return;
+
+    var number_buffer: [32]u8 = undefined;
+    const uid_text = std.fmt.bufPrint(&number_buffer, "{d}", .{std.c.getuid()}) catch return;
+    if (!appendOwnedEnv(&owned, &args, "LIGMA_ADMIN_UID", uid_text)) return;
+    const gid_text = std.fmt.bufPrint(&number_buffer, "{d}", .{std.c.getgid()}) catch return;
+    if (!appendOwnedEnv(&owned, &args, "LIGMA_ADMIN_GID", gid_text)) return;
+    const pid_text = std.fmt.bufPrint(&number_buffer, "{d}", .{std.c.getpid()}) catch return;
+    if (!appendOwnedEnv(&owned, &args, "LIGMA_ADMIN_PID", pid_text)) return;
+    if (!appendOwnedArgument(&owned, &args, executable)) return;
+
+    const process = QProcess.new2(app.window);
+    process.onFinished2(onAdminHelperFinished);
+    process.onErrorOccurred(onAdminHelperError);
+    process.setProgram("pkexec");
+    process.setArguments(app.gpa, args.items);
+
+    app.admin_helper = process;
+    app.admin_socket = socket;
+    socket_owned = false;
+    app.admin_pending = true;
+    app.admin_timer.start(100);
+    showStatus("Waiting for administrator authentication…", 0);
+    process.start2();
+}
+
+fn cleanupAdminHelper(proc: QProcess, message: []const u8) void {
+    if (app.admin_helper) |current| {
+        if (current.ptr == proc.ptr) app.admin_helper = null;
     }
-    if (!has_display) {
-        if (std.c.getenv("WAYLAND_DISPLAY")) |raw| {
-            const wayland = std.mem.span(raw);
-            if (wayland.len > 0) {
-                has_wayland = true;
-                if (!appendAdminEnv(&owned, &env_args, "WAYLAND_DISPLAY", wayland)) return;
-                if (!appendAdminArgument(&owned, &env_args, "QT_QPA_PLATFORM=wayland")) return;
-                if (std.c.getenv("XDG_RUNTIME_DIR")) |runtime_raw| {
-                    const runtime = std.mem.span(runtime_raw);
-                    if (runtime.len > 0) {
-                        if (!appendAdminEnv(&owned, &env_args, "XDG_RUNTIME_DIR", runtime)) return;
-                    }
-                }
-            }
-        }
+
+    const was_active = app.admin_active;
+    app.admin_pending = false;
+    app.admin_active = false;
+    if (was_active) {
+        setAdminModels(null);
+        returnToReadableFolders();
     }
-    if (!has_display and !has_wayland) {
-        showStatus("No graphical session is available for administrator mode", 4500);
+
+    releaseAdminSocket();
+    updateAdminUi();
+    if (app.admin_op == null) app.admin_timer.stop();
+    if (message.len > 0) showStatus(message, 5000);
+    proc.deleteLater();
+}
+
+/// Remove the helper socket and free its path. The helper also unlinks the
+/// socket during a graceful shutdown; unlinking here covers crashes and the
+/// window being killed.
+fn releaseAdminSocket() void {
+    if (app.admin_socket) |socket| {
+        std.Io.Dir.deleteFileAbsolute(app.io, socket) catch {};
+        app.gpa.free(socket);
+        app.admin_socket = null;
+    }
+}
+
+fn onAdminHelperFinished(proc: QProcess, exit_code: i32, exit_status: i32) callconv(.c) void {
+    if (app.admin_helper) |current| {
+        if (current.ptr != proc.ptr) {
+            proc.deleteLater();
+            return;
+        }
+    } else {
+        proc.deleteLater();
         return;
     }
 
-    // Keep root's configuration and caches out of the user's home.
-    const root_env = [_][2][]const u8{
-        .{ "XDG_CONFIG_HOME", "/root/.config" },
-        .{ "XDG_DATA_HOME", "/root/.local/share" },
-        .{ "XDG_CACHE_HOME", "/root/.cache" },
-        .{ "XDG_STATE_HOME", "/root/.local/state" },
-    };
-    inline for (root_env) |entry| {
-        if (!appendAdminEnv(&owned, &env_args, entry[0], entry[1])) return;
-    }
-    if (!appendAdminArgument(&owned, &env_args, "LIGMA_ADMIN=1")) return;
-    if (!appendAdminEnv(&owned, &env_args, "LIGMA_START_PATH", start_path)) return;
-    inline for (.{ "LANG", "LC_ALL", "LANGUAGE" }) |key| {
-        if (std.c.getenv(key)) |raw| {
-            const value = std.mem.span(raw);
-            if (value.len > 0) {
-                if (!appendAdminEnv(&owned, &env_args, key, value)) return;
+    const message = if (app.admin_pending)
+        switch (exit_code) {
+            126 => "Administrator authentication was canceled",
+            127 => "Administrator authorization was denied",
+            125 => "Could not start the administrator helper",
+            else => "The administrator helper could not start",
+        }
+    else if (app.admin_op != null)
+        "Administrator helper stopped during the operation"
+    else if (exit_status != qprocess_enums.ExitStatus.NormalExit or exit_code != 0)
+        "Administrator helper stopped — administrator mode ended"
+    else
+        "Administrator mode ended";
+    cleanupAdminHelper(proc, message);
+}
+
+fn onAdminHelperError(proc: QProcess, code: i32) callconv(.c) void {
+    if (code != qprocess_enums.ProcessError.FailedToStart) return;
+    cleanupAdminHelper(proc, "Could not start pkexec");
+}
+
+fn onAdminTimer(_: QTimer) callconv(.c) void {
+    if (app.admin_pending) {
+        if (app.admin_socket) |socket| {
+            if (admin_client.ping(app.io, socket)) {
+                app.admin_pending = false;
+                app.admin_active = true;
+                app.admin_timer.stop();
+                setAdminModels(socket);
+                updateAdminUi();
+                showStatus("Administrator mode enabled", 4000);
             }
         }
     }
-    if (!appendAdminArgument(&owned, &env_args, executable)) return;
 
-    const x11_wrapper =
-        "if command -v xhost >/dev/null 2>&1; then " ++
-        "xhost +SI:localuser:root >/dev/null 2>&1; " ++
-        "trap 'xhost -SI:localuser:root >/dev/null 2>&1' EXIT HUP INT TERM; fi; " ++
-        "pkexec env \"$@\"";
-    const wayland_wrapper = "pkexec env \"$@\"";
+    if (app.admin_op) |op| {
+        if (op.done.load(.acquire)) {
+            op.join();
+            const success = op.success;
+            const clear_cut = op.clear_cut and success;
+            const done_text = op.doneVerb();
+            var failure_buffer: [512]u8 = undefined;
+            var failure_text: ?[]const u8 = null;
+            if (!success) {
+                if (op.error_text) |text| {
+                    failure_text = std.fmt.bufPrint(
+                        &failure_buffer,
+                        "Administrator operation failed: {s}",
+                        .{text},
+                    ) catch null;
+                }
+            }
+            op.deinit();
+            app.admin_op = null;
+            refreshAllPanes();
+            if (clear_cut) clearClipboard();
+            updateUndoAction();
+            showStatus(
+                if (success) done_text else (failure_text orelse "Administrator operation failed"),
+                if (success) 5000 else 6000,
+            );
+        }
+    }
 
-    var launch_args: std.ArrayList([]const u8) = .empty;
-    defer launch_args.deinit(app.gpa);
-    launch_args.append(app.gpa, "-c") catch return;
-    launch_args.append(app.gpa, if (has_display) x11_wrapper else wayland_wrapper) catch return;
-    launch_args.append(app.gpa, "sh") catch return;
-    launch_args.appendSlice(app.gpa, env_args.items) catch return;
+    if (!app.admin_pending and app.admin_op == null) app.admin_timer.stop();
+}
 
-    const process = QProcess.new2(app.window);
-    defer process.delete();
-    process.setProgram("/bin/sh");
-    process.setArguments(app.gpa, launch_args.items);
-    showStatus("Waiting for administrator authentication…", 6000);
-    if (!process.startDetached())
-        showStatus("Could not launch pkexec", 4000);
+fn setAdminModels(socket: ?[]const u8) void {
+    for (app.panes_list.items) |pane| {
+        pane.model.setAdminSocket(socket);
+        pane.model.reload();
+    }
+    refreshWatchPaths();
+}
+
+/// Leave any root-only folder that can no longer be read after the
+/// administrator helper exits, instead of showing a permission error.
+fn returnToReadableFolders() void {
+    for (app.panes_list.items) |pane| {
+        const path = pane.current_path orelse continue;
+        if (!pathReadableByUser(path)) navigateTo(pane, homePath(), false);
+    }
+}
+
+fn updateAdminUi() void {
+    app.admin_action.setText(if (app.admin_active)
+        "Leave Administrator Mode"
+    else
+        "Enter Administrator Mode");
+    app.admin_badge.setVisible(app.admin_active);
+    app.file_trash_action.setText(if (app.admin_active)
+        "Delete Permanently (Administrator)"
+    else
+        "Move to Trash");
+    app.ctx_trash_action.setText(if (app.admin_active)
+        "Delete Permanently (Administrator)"
+    else
+        "Move to Trash");
+    app.ctx_delete_action.setText(if (app.admin_active)
+        "&Delete Permanently (Administrator)"
+    else
+        "&Delete Permanently");
+    app.file_delete_action.setText(if (app.admin_active)
+        "Delete Permanently (Administrator)"
+    else
+        "Delete Permanently");
+    updateWindowTitle();
+    updateUndoAction();
+}
+
+fn leaveAdminMode() void {
+    if (app.admin_pending) {
+        showStatus("Waiting for administrator authentication…", 3000);
+        return;
+    }
+    if (app.admin_op != null) {
+        showStatus("Wait for the administrator operation to finish", 3500);
+        return;
+    }
+    if (!app.admin_active) return;
+
+    if (app.admin_socket) |socket| admin_client.shutdown(app.io, socket);
+    app.admin_active = false;
+    app.admin_timer.stop();
+    setAdminModels(null);
+    releaseAdminSocket();
+
+    returnToReadableFolders();
+    updateAdminUi();
+    showStatus("Leaving administrator mode…", 3000);
+}
+
+fn onToggleAdminMode(_: QAction) callconv(.c) void {
+    if (app.admin_active) {
+        leaveAdminMode();
+        return;
+    }
+    if (app.admin_pending) {
+        showStatus("Waiting for administrator authentication…", 3000);
+        return;
+    }
+    startAdminHelper();
+}
+
+fn startAdminOp(
+    kind: AdminKind,
+    path_list: []const []const u8,
+    dest: ?[]const u8,
+    new_name: ?[]const u8,
+    clear_cut: bool,
+) bool {
+    if (!app.admin_active) {
+        showStatus("Enable administrator mode first", 3000);
+        return false;
+    }
+    if (app.admin_op != null or app.file_job != null) {
+        showStatus("Finish the current operation first", 3500);
+        return false;
+    }
+    const socket = app.admin_socket orelse {
+        showStatus("Administrator helper is not connected", 3500);
+        return false;
+    };
+
+    const op = app.gpa.create(AdminOp) catch {
+        showStatus("Out of memory starting the administrator operation", 3500);
+        return false;
+    };
+    op.* = .{
+        .gpa = app.gpa,
+        .io = app.io,
+        .socket = app.gpa.dupe(u8, socket) catch {
+            app.gpa.destroy(op);
+            showStatus("Out of memory starting the administrator operation", 3500);
+            return false;
+        },
+        .kind = kind,
+        .clear_cut = clear_cut,
+    };
+
+    for (path_list) |path| {
+        op.addPath(path) catch {
+            op.deinit();
+            showStatus("Out of memory starting the administrator operation", 3500);
+            return false;
+        };
+    }
+    if (dest) |value| {
+        op.dest = app.gpa.dupe(u8, value) catch {
+            op.deinit();
+            showStatus("Out of memory starting the administrator operation", 3500);
+            return false;
+        };
+    }
+    if (new_name) |value| {
+        op.new_name = app.gpa.dupe(u8, value) catch {
+            op.deinit();
+            showStatus("Out of memory starting the administrator operation", 3500);
+            return false;
+        };
+    }
+
+    op.start() catch {
+        op.deinit();
+        showStatus("Could not start the administrator operation", 3500);
+        return false;
+    };
+    app.admin_op = op;
+    app.admin_timer.start(100);
+    showStatus(op.verb(), 0);
+    return true;
+}
+
+fn startAdminDelete(path_list: []const []const u8) bool {
+    return startAdminOp(.delete, path_list, null, null, false);
+}
+
+fn startAdminRename(path: []const u8, new_name: []const u8) bool {
+    return startAdminOp(.rename, &.{path}, null, new_name, false);
+}
+
+fn startAdminMkdir(path: []const u8) bool {
+    return startAdminOp(.mkdir, &.{path}, null, null, false);
+}
+
+fn startAdminCopyMove(
+    sources: []const []const u8,
+    dest_dir: []const u8,
+    move: bool,
+) bool {
+    return startAdminOp(
+        if (move) .move else .copy,
+        sources,
+        dest_dir,
+        null,
+        move,
+    );
 }
 
 fn onSettingsBackgroundOpacity(opacity: f64) callconv(.c) void {
@@ -1594,6 +1943,9 @@ fn shutdown() void {
     app.fs_refresh_timer.stop();
     app.mount_timer.stop();
     app.sidebar_timer.stop();
+    app.admin_timer.stop();
+    if (app.admin_socket) |socket| admin_client.shutdown(app.io, socket);
+    releaseAdminSocket();
     app.unmount_active = false;
     if (app.unmount_process.state() != qprocess_enums.ProcessState.NotRunning) {
         _ = app.unmount_process.kill();
@@ -1760,6 +2112,9 @@ fn createPane(tab: *Tab, initial_path: []const u8) *Pane {
 
     const model = local_model.LocalModel.create(app.gpa, app.io, container) catch
         @panic("Out of memory creating model");
+    if (app.admin_active) {
+        if (app.admin_socket) |socket| model.setAdminSocket(socket);
+    }
     model.setDropHandler(onModelDrop);
     tree.setModel(model.qt);
     list.setModel(model.qt);
@@ -2293,6 +2648,11 @@ fn captureSelection(pane: *Pane) void {
 fn restorePendingSelection(pane: *Pane) void {
     if (pane.pending_selection.items.len == 0) return;
 
+    // Restoring selection after a reload is not a user action. Keep a status
+    // message such as an operation result from being overwritten.
+    app.suppress_selection_status = true;
+    defer app.suppress_selection_status = false;
+
     var first = true;
     for (pane.pending_selection.items) |path| {
         const index = pane.model.indexForPath(path) orelse continue;
@@ -2449,7 +2809,7 @@ fn onFsDirectoryChanged(_: QFileSystemWatcher, _: [*:0]const u8) callconv(.c) vo
 }
 
 fn onFsRefreshTimer(_: QTimer) callconv(.c) void {
-    if (app.file_job != null) {
+    if (app.file_job != null or app.admin_op != null) {
         // The operation completion path refreshes panes once the worker
         // finishes; retry shortly in case a long job is still running.
         app.fs_refresh_timer.start(250);
@@ -2547,7 +2907,7 @@ fn refreshCount(pane: *Pane) void {
 }
 
 fn updateWindowTitle() void {
-    const app_name = if (admin_mode) "Administrator — Ligma" else "Ligma";
+    const app_name = if (app.admin_active) "Administrator — Ligma" else "Ligma";
     const pane = activePane() orelse {
         app.window.setWindowTitle(app_name);
         return;
@@ -2979,7 +3339,9 @@ fn onFileMenuAboutToShow(_: QMenu) callconv(.c) void {
     app.file_empty_trash_action.setEnabled(
         trash_view and pane.?.model.count() > 0 and app.file_job == null,
     );
-    app.file_delete_action.setVisible(true);
+    // In administrator mode the Delete action is the one permanent-delete
+    // entry; showing the ordinary one as well would duplicate the menu item.
+    app.file_delete_action.setVisible(!app.admin_active or trash_view);
 }
 
 fn freeUndoBatch(batch: *UndoBatch) void {
@@ -2995,12 +3357,17 @@ fn clearClipboard() void {
 
 fn updateUndoAction() void {
     if (app.undo_action) |action| {
-        action.setEnabled(app.undo_stack.items.len > 0 and app.file_job == null);
+        action.setEnabled(
+            !app.admin_active and
+                app.undo_stack.items.len > 0 and
+                app.file_job == null and
+                app.admin_op == null,
+        );
     }
 }
 
 fn startFileJob(job: *file_ops.Job, clear_cut_clipboard: bool) bool {
-    if (app.file_job != null) {
+    if (app.file_job != null or app.admin_op != null) {
         job.deinit();
         showStatus("Finish or cancel the current operation first", 3500);
         return false;
@@ -3187,6 +3554,16 @@ fn onNewFolder(_: QAction) callconv(.c) void {
         return;
     }
 
+    if (app.admin_active) {
+        const full_path = std.fs.path.join(app.gpa, &.{ parent, name }) catch {
+            showStatus("Could not create the folder", 3500);
+            return;
+        };
+        defer app.gpa.free(full_path);
+        _ = startAdminMkdir(full_path);
+        return;
+    }
+
     const job = file_ops.Job.createMkdir(app.gpa, app.io, parent, name) catch {
         showStatus("Could not create the folder", 3500);
         return;
@@ -3233,6 +3610,11 @@ fn onRename(_: QAction) callconv(.c) void {
     }
     if (std.mem.eql(u8, new_name, old_name)) return;
 
+    if (app.admin_active) {
+        _ = startAdminRename(path, new_name);
+        return;
+    }
+
     const job = file_ops.Job.createRename(app.gpa, app.io, path, new_name) catch {
         showStatus("Could not rename the item", 3500);
         return;
@@ -3240,7 +3622,13 @@ fn onRename(_: QAction) callconv(.c) void {
     _ = startFileJob(job, false);
 }
 
-fn onTrashSelected(_: QAction) callconv(.c) void {
+fn onTrashSelected(action: QAction) callconv(.c) void {
+    if (app.admin_active) {
+        // Administrator mode does not use the user's Trash; the permanent
+        // delete path provides the explicit confirmation instead.
+        onDeleteSelected(action);
+        return;
+    }
     const pane = activePane() orelse return;
     if (pane.model.isTrash()) {
         showStatus("These items are already in Trash", 2500);
@@ -3331,6 +3719,11 @@ fn onDeleteSelected(_: QAction) callconv(.c) void {
     defer app.gpa.free(message);
 
     if (!confirmPermanentDelete("Delete Permanently", message)) return;
+
+    if (app.admin_active) {
+        _ = startAdminDelete(selected.items);
+        return;
+    }
 
     const job = file_ops.Job.createDelete(app.gpa, app.io, selected.items) catch {
         showStatus("Could not start the delete operation", 3500);
@@ -3569,6 +3962,11 @@ fn onPaste(_: QAction) callconv(.c) void {
     const dest = pane.current_path orelse return;
     const cutting = app.clip_mode == .cut;
 
+    if (app.admin_active) {
+        _ = startAdminCopyMove(app.clip_paths.items, dest, cutting);
+        return;
+    }
+
     const job = if (cutting)
         file_ops.Job.createMove(app.gpa, app.io, app.clip_paths.items, dest)
     else
@@ -3598,10 +3996,13 @@ fn onModelDrop(
     const pane = target orelse return false;
     if (!isActivePane(pane)) setActivePane(pane);
 
-    if (app.file_job != null) {
+    if (app.file_job != null or app.admin_op != null) {
         showStatus("Finish or cancel the current operation first", 3500);
         return false;
     }
+
+    if (app.admin_active)
+        return startAdminCopyMove(sources, dest_dir, move);
 
     const job = if (move)
         file_ops.Job.createMove(app.gpa, app.io, sources, dest_dir)
@@ -3615,7 +4016,11 @@ fn onModelDrop(
 }
 
 fn onUndo(_: QAction) callconv(.c) void {
-    if (app.file_job != null) {
+    if (app.admin_active) {
+        showStatus("Undo is unavailable for administrator operations", 3500);
+        return;
+    }
+    if (app.file_job != null or app.admin_op != null) {
         showStatus("Wait for the current operation to finish", 3000);
         return;
     }
@@ -4919,7 +5324,9 @@ fn updateContextMenuState(pane: *Pane, index: QModelIndex) void {
     app.ctx_copy_action.setEnabled(has_item);
     app.ctx_properties_action.setVisible(has_item);
     app.ctx_properties_action.setEnabled(has_item);
-    app.ctx_trash_action.setVisible(!trash_view and has_item);
+    // In administrator mode the relabeled trash action already deletes
+    // permanently, so the separate permanent-delete entry is redundant.
+    app.ctx_trash_action.setVisible(!trash_view and has_item and !app.admin_active);
     app.ctx_trash_action.setEnabled(has_item);
     app.ctx_delete_action.setVisible(has_item);
     app.ctx_delete_action.setEnabled(has_item);
@@ -5391,6 +5798,7 @@ fn updateSelectionStatus(pane: *Pane, force: bool) void {
 }
 
 fn onSelectionChanged(selection: QItemSelectionModel, _: QModelIndex, _: QModelIndex) callconv(.c) void {
+    if (app.suppress_selection_status) return;
     const pane = findPaneBySelection(selection) orelse return;
     if (!isActivePane(pane)) return;
     updateSelectionStatus(pane, true);
