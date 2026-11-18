@@ -11,6 +11,7 @@ const text_sort = @import("core/text_sort.zig");
 const local_model = @import("ui/local_model.zig");
 const mounts = @import("ui/mounts.zig");
 const player_mod = @import("ui/player.zig");
+const properties_dialog = @import("ui/properties_dialog.zig");
 const theme = @import("ui/theme.zig");
 const preview_mod = @import("ui/preview.zig");
 const terminal_mod = @import("ui/terminal.zig");
@@ -37,6 +38,7 @@ const QListView = qt6.QListView;
 const QListWidget = qt6.QListWidget;
 const QListWidgetItem = qt6.QListWidgetItem;
 const QMainWindow = qt6.QMainWindow;
+const QMimeDatabase = qt6.QMimeDatabase;
 const QMenu = qt6.QMenu;
 const QMessageBox = qt6.QMessageBox;
 const QModelIndex = qt6.QModelIndex;
@@ -49,6 +51,7 @@ const QPushButton = qt6.QPushButton;
 const QSize = qt6.QSize;
 const QSplitter = qt6.QSplitter;
 const QStackedWidget = qt6.QStackedWidget;
+const QStandardPaths = qt6.QStandardPaths;
 const QStatusBar = qt6.QStatusBar;
 const QTabWidget = qt6.QTabWidget;
 const QTimer = qt6.QTimer;
@@ -495,6 +498,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     // playlist. The panel owns the GStreamer engine; the dock owns the
     // widget tree.
     const player_dock = createDock("Music Player", window, false, 190, 0);
+    player_dock.setObjectName("ligmaPlayerDock");
     player_dock.setAllowedAreas(qnamespace_enums.DockWidgetArea.BottomDockWidgetArea);
     player_dock.setFeatures(qdockwidget_enums.DockWidgetFeature.DockWidgetClosable |
         qdockwidget_enums.DockWidgetFeature.DockWidgetMovable);
@@ -552,6 +556,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     file_menu.addAction(new_folder_action);
     const rename_action = makeAction(file_menu, "Rename…", "F2", onRename);
     file_menu.addAction(rename_action);
+    const properties_action = makeAction(file_menu, "Properties", "Alt+Return", onProperties);
+    file_menu.addAction(properties_action);
     const run_action = makeAction(file_menu, "Run Selected", "Ctrl+Return", onRunSelected);
     file_menu.addAction(run_action);
     const admin_action = makeAction(file_menu, "Open as Administrator", "Ctrl+.", onOpenAsAdministrator);
@@ -2738,6 +2744,13 @@ fn openSelected(pane: *Pane, index: QModelIndex) void {
         return;
     }
 
+    // Source files and plain text open in the embedded terminal so the
+    // configured editor (Neovim, Vim, or a custom command) can edit them.
+    if (isTextFile(app.gpa, path)) {
+        openTextInTerminal(path);
+        return;
+    }
+
     // Executables are launched directly instead of being handed to the
     // desktop opener, which usually forces an editor or archive tool.
     if (isExecutableFile(path)) {
@@ -2749,6 +2762,140 @@ fn openSelected(pane: *Pane, index: QModelIndex) void {
     defer url.delete();
     if (!QDesktopServices.openUrl(url))
         showStatus("No application is registered to open this file", 3500);
+}
+
+/// Text and source files are handled by the embedded editor instead of the
+/// desktop MIME opener. The extension list covers source formats that the
+/// shared MIME database often reports as application/octet-stream.
+fn isTextFile(gpa: std.mem.Allocator, path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    const basenames = [_][]const u8{
+        "Makefile", "makefile",       "Dockerfile", "dockerfile",
+        "PKGBUILD", "CMakeLists.txt", "LICENSE",    "README",
+        "COPYING",  "meson.build",    ".gitignore", ".gitattributes",
+    };
+    for (basenames) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    }
+
+    const extensions = [_][]const u8{
+        ".txt",   ".text",    ".md",      ".markdown", ".rst",   ".log",
+        ".zig",   ".zon",     ".py",      ".pyw",      ".html",  ".htm",
+        ".css",   ".scss",    ".sass",    ".js",       ".mjs",   ".cjs",
+        ".ts",    ".tsx",     ".jsx",     ".json",     ".jsonc", ".toml",
+        ".yaml",  ".yml",     ".xml",     ".ini",      ".conf",  ".cfg",
+        ".sh",    ".bash",    ".zsh",     ".fish",     ".c",     ".h",
+        ".cc",    ".cpp",     ".cxx",     ".hpp",      ".hh",    ".rs",
+        ".go",    ".java",    ".kt",      ".kts",      ".php",   ".rb",
+        ".lua",   ".sql",     ".vim",     ".el",       ".lisp",  ".cr",
+        ".swift", ".ex",      ".exs",     ".erl",      ".hrl",   ".cs",
+        ".env",   ".service", ".desktop", ".rules",    ".cmake",
+    };
+    const extension = std.fs.path.extension(name);
+    for (extensions) |candidate| {
+        if (std.ascii.eqlIgnoreCase(extension, candidate)) return true;
+    }
+
+    const db = QMimeDatabase.new();
+    defer db.delete();
+    const mime = db.mimeTypeForFile(path);
+    defer mime.delete();
+    const mime_name = mime.name(gpa);
+    defer gpa.free(mime_name);
+    return std.mem.startsWith(u8, mime_name, "text/") or
+        std.mem.eql(u8, mime_name, "application/x-shellscript") or
+        std.mem.eql(u8, mime_name, "application/xml") or
+        std.mem.eql(u8, mime_name, "application/json");
+}
+
+fn resolveTextEditor(gpa: std.mem.Allocator) ![]const u8 {
+    const configured = std.mem.trim(u8, app.settings.text_editor, " \t\r\n");
+    if (configured.len > 0) return gpa.dupe(u8, configured);
+
+    const candidates = [_][]const u8{ "nvim", "vim" };
+    for (candidates) |name| {
+        const found = QStandardPaths.findExecutable(gpa, name);
+        if (found.len > 0) return found;
+        gpa.free(found);
+    }
+
+    const environment = [_][:0]const u8{ "VISUAL", "EDITOR" };
+    for (environment) |key| {
+        if (std.c.getenv(key.ptr)) |raw| {
+            const value = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+            if (value.len > 0) return gpa.dupe(u8, value);
+        }
+    }
+    return error.NoTextEditor;
+}
+
+fn appendShellQuoted(
+    list: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    text: []const u8,
+) !void {
+    try list.append(gpa, '\'');
+    for (text) |byte| {
+        if (byte == '\'') {
+            try list.appendSlice(gpa, "'\\''");
+        } else {
+            try list.append(gpa, byte);
+        }
+    }
+    try list.append(gpa, '\'');
+}
+
+fn openTextInTerminal(path: []const u8) void {
+    const editor = resolveTextEditor(app.gpa) catch {
+        showStatus(
+            "No terminal editor found — install Neovim/Vim or choose an editor in Settings",
+            5000,
+        );
+        return;
+    };
+    defer app.gpa.free(editor);
+
+    const directory = std.fs.path.dirname(path) orelse "/";
+    if (!app.terminal_dock.isVisible()) {
+        ligma_dock_slide_show(app.terminal_dock.ptr, 1, 190, 400);
+    }
+    app.terminal_dock.raise();
+
+    // Recreate a terminal whose shell has exited so the editor command has a
+    // live PTY to run in.
+    if (app.terminal_started and terminal_mod.shellProcessId(app.terminal_widget) <= 0) {
+        terminal_mod.shutdown(app.terminal_widget);
+        app.terminal_widget = terminal_mod.create(app.terminal_dock, onTerminalKeyToggle);
+        app.terminal_dock.setWidget(app.terminal_widget);
+        app.terminal_started = false;
+    }
+    if (!app.terminal_started) {
+        openTerminalAt(directory);
+    } else {
+        terminal_mod.setFocus(app.terminal_widget);
+    }
+
+    const shell_pid = terminal_mod.shellProcessId(app.terminal_widget);
+    const foreground_pid = terminal_mod.foregroundProcessId(app.terminal_widget);
+    if (shell_pid > 0 and foreground_pid > 0 and foreground_pid != shell_pid) {
+        showStatus("The terminal is busy — finish the current command first", 4000);
+        return;
+    }
+
+    var command: std.ArrayList(u8) = .empty;
+    defer command.deinit(app.gpa);
+    command.appendSlice(app.gpa, editor) catch {
+        showStatus("Could not prepare the editor command", 3500);
+        return;
+    };
+    command.append(app.gpa, ' ') catch return;
+    appendShellQuoted(&command, app.gpa, path) catch return;
+    command.append(app.gpa, '\n') catch return;
+    if (!terminal_mod.sendText(app.terminal_widget, app.gpa, command.items)) {
+        showStatus("Could not send the editor command to the terminal", 3500);
+        return;
+    }
+    terminal_mod.setFocus(app.terminal_widget);
 }
 
 fn isExecutableFile(path: []const u8) bool {
@@ -3497,7 +3644,66 @@ fn onProperties(_: QAction) callconv(.c) void {
         appendMultiProperties(&text, pane, targets) catch return;
     }
 
-    _ = QMessageBox.information(app.window, "Properties", text.items);
+    var item_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (item_paths.items) |path| app.gpa.free(path);
+        item_paths.deinit(app.gpa);
+    }
+    var items: std.ArrayList(properties_dialog.Item) = .empty;
+    defer items.deinit(app.gpa);
+
+    for (targets) |index| {
+        const entry = pane.model.entryAt(index) orelse continue;
+        const path = pane.model.pathAt(app.gpa, index);
+        item_paths.append(app.gpa, path) catch {
+            app.gpa.free(path);
+            continue;
+        };
+        const kind = if (entry.is_symlink)
+            (if (entry.is_dir) "Folder link" else "Symbolic link")
+        else if (entry.is_dir)
+            "Folder"
+        else
+            "File";
+        items.append(app.gpa, .{
+            .path = path,
+            .name = entry.name,
+            .kind = kind,
+            .is_dir = entry.is_dir,
+            .mode = pathPermissionMode(path),
+        }) catch continue;
+    }
+    if (items.items.len == 0) {
+        showStatus("That item is no longer available", 2500);
+        return;
+    }
+
+    properties_dialog.open(
+        app.window,
+        app.gpa,
+        app.io,
+        items.items,
+        text.items,
+        !pane.model.isTrash(),
+        .{ .changed = onPropertiesChanged },
+    );
+}
+
+fn pathPermissionMode(path: []const u8) u32 {
+    const stat = std.Io.Dir.cwd().statFile(
+        app.io,
+        path,
+        .{ .follow_symlinks = true },
+    ) catch return 0;
+    return @intCast(stat.permissions.toMode() & 0o7777);
+}
+
+fn onPropertiesChanged(ok: bool) callconv(.c) void {
+    refreshAllPanes();
+    showStatus(
+        if (ok) "Permissions updated" else "Some permissions could not be changed",
+        3500,
+    );
 }
 
 fn appendProperties(list: *std.ArrayList(u8), comptime format: []const u8, args: anytype) !void {
@@ -3556,6 +3762,12 @@ fn appendSingleProperties(list: *std.ArrayList(u8), pane: *Pane, index: QModelIn
     }
     try appendProperties(list, "Modified: {s}\n", .{local_model.formatModified(entry.mtime)});
     try appendProperties(list, "Permissions: {s}\n", .{permissions[0..]});
+    const owner = info.owner(app.gpa);
+    defer app.gpa.free(owner);
+    const group = info.group(app.gpa);
+    defer app.gpa.free(group);
+    try appendProperties(list, "Owner: {s}\n", .{if (owner.len > 0) owner else "—"});
+    try appendProperties(list, "Group: {s}\n", .{if (group.len > 0) group else "—"});
 
     if (info.isSymLink()) {
         const target = info.symLinkTarget(app.gpa);
@@ -4989,7 +5201,10 @@ fn openViewContextMenu(pane: *Pane, index: QModelIndex, global: QPoint) void {
 
 fn setContextSelection(pane: *Pane, index: QModelIndex) void {
     if (index.isValid()) {
-        if (!pane.selection.isSelected(index)) {
+        // SelectRows marks the row, but `isSelected` is column-sensitive when
+        // the click lands on Size/Kind/Modified. Check the row so a right-click
+        // on any column keeps an existing multi-selection intact.
+        if (!pane.selection.isRowSelected(index.row())) {
             pane.selection.select(
                 index,
                 qitemselectionmodel_enums.SelectionFlag.ClearAndSelect |

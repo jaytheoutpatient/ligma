@@ -112,6 +112,26 @@ void ligma_terminal_set_focus(void *handle)
         term->setFocus(Qt::OtherFocusReason);
 }
 
+void ligma_terminal_send_text(void *handle, const char *text)
+{
+    if (auto *term = static_cast<QTermWidget *>(handle))
+        term->sendText(fromUtf8(text));
+}
+
+int ligma_terminal_shell_pid(void *handle)
+{
+    if (auto *term = static_cast<QTermWidget *>(handle))
+        return term->getShellPID();
+    return -1;
+}
+
+int ligma_terminal_foreground_pid(void *handle)
+{
+    if (auto *term = static_cast<QTermWidget *>(handle))
+        return term->getForegroundProcessId();
+    return -1;
+}
+
 /// Ask the running shell to change directory. QTermWidget only forwards the
 /// `cd` when the shell is in the foreground, so a job like an editor keeps
 /// running undisturbed.

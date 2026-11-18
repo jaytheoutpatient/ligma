@@ -21,6 +21,7 @@
 #include <QPainterPath>
 #include <QPalette>
 #include <QPropertyAnimation>
+#include <QPushButton>
 #include <QScrollBar>
 #include <QString>
 #include <QStyledItemDelegate>
@@ -519,6 +520,13 @@ void ligma_apply_window_chrome(void *window_pointer, double opacity, int compact
                  "border: none; padding: 2px 4px; }";
         style += "QMenuBar, QMenuBar::item, QStatusBar "
                  "{ background-color: " + background + "; }";
+        // Docks sit outside the tinted QSplitter, so give them the same
+        // background tint while leaving their contents and the terminal's
+        // own black surface alone.
+        style += "QDockWidget#ligmaPlayerDock { background-color: " + background + "; }";
+        style += "QDockWidget#ligmaPlayerDock::title "
+                 "{ background-color: " + background + "; }";
+        style += "QWidget#ligmaPlayerPanel { background: transparent; }";
     }
 
     if (compact_menus != 0) {
@@ -530,6 +538,76 @@ void ligma_apply_window_chrome(void *window_pointer, double opacity, int compact
 
     window->setStyleSheet(style);
     window->update();
+}
+
+void ligma_player_control_icon(void *button_pointer, int kind, int size_px)
+{
+    auto *button = static_cast<QPushButton *>(button_pointer);
+    if (button == nullptr || size_px <= 0)
+        return;
+
+    QPixmap pixmap(size_px, size_px);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    QColor color = button->palette().color(QPalette::ButtonText);
+    if (!color.isValid())
+        color = button->palette().color(QPalette::WindowText);
+    QPen pen(color, std::max(1.4, size_px / 12.0));
+    pen.setCapStyle(Qt::RoundCap);
+    pen.setJoinStyle(Qt::RoundJoin);
+    painter.setPen(pen);
+
+    const double u = size_px / 18.0;
+    auto line = [&](double x1, double y1, double x2, double y2) {
+        painter.drawLine(QPointF(x1 * u, y1 * u), QPointF(x2 * u, y2 * u));
+    };
+    auto arrow = [&](double tip_x, double tip_y, double dx, double dy) {
+        // Two short barbs forming an arrowhead at the given tip.
+        const double length = 3.2;
+        const double side = 2.4;
+        const double nx = -dy;
+        const double ny = dx;
+        line(tip_x, tip_y,
+            tip_x - dx * length + nx * side, tip_y - dy * length + ny * side);
+        line(tip_x, tip_y,
+            tip_x - dx * length - nx * side, tip_y - dy * length - ny * side);
+    };
+
+    if (kind == 2) {
+        // Crossing shuffle arrows.
+        line(4.0, 5.0, 7.0, 5.0);
+        line(7.0, 5.0, 12.0, 11.0);
+        line(4.0, 13.0, 7.0, 13.0);
+        line(7.0, 13.0, 12.0, 7.0);
+        arrow(13.4, 12.6, 0.5, 0.55);
+        arrow(13.4, 5.4, 0.5, -0.55);
+    } else {
+        // Two opposing loop arrows. Repeat-one adds a small centered 1.
+        line(4.0, 8.5, 4.0, 5.5);
+        line(4.0, 5.5, 13.0, 5.5);
+        line(13.0, 5.5, 13.0, 7.2);
+        arrow(13.0, 8.4, 0.0, 1.0);
+
+        line(14.0, 9.5, 14.0, 12.5);
+        line(14.0, 12.5, 5.0, 12.5);
+        line(5.0, 12.5, 5.0, 10.8);
+        arrow(5.0, 9.6, 0.0, -1.0);
+
+        if (kind == 1) {
+            QFont font = button->font();
+            font.setPixelSize(std::max(7, int(7.0 * u)));
+            font.setBold(true);
+            painter.setFont(font);
+            painter.drawText(QRectF(7.0 * u, 7.0 * u, 4.0 * u, 4.0 * u),
+                Qt::AlignCenter, QStringLiteral("1"));
+        }
+    }
+
+    painter.end();
+    button->setIcon(QIcon(pixmap));
+    button->setIconSize(QSize(size_px, size_px));
 }
 
 void ligma_checkbox_row_click(void *text_pointer, void *checkbox_pointer)

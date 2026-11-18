@@ -58,6 +58,8 @@ const Ui = struct {
     switch_new_tab: QCheckBox = undefined,
     restore_last_window: QCheckBox = undefined,
     terminal: QLineEdit = undefined,
+    text_editor: QComboBox = undefined,
+    text_editor_custom: QLineEdit = undefined,
 
     theme: QComboBox = undefined,
     opacity: QSlider = undefined,
@@ -377,6 +379,19 @@ fn syncControls(settings: *const settings_mod.Settings) void {
     ui.switch_new_tab.setChecked(settings.switch_new_tab);
     ui.restore_last_window.setChecked(settings.restore_last_window);
     ui.terminal.setText(settings.terminal_command);
+    if (settings.text_editor.len == 0) {
+        ui.text_editor.setCurrentIndex(0);
+        ui.text_editor_custom.setText("");
+    } else if (std.mem.eql(u8, settings.text_editor, "nvim")) {
+        ui.text_editor.setCurrentIndex(1);
+        ui.text_editor_custom.setText("");
+    } else if (std.mem.eql(u8, settings.text_editor, "vim")) {
+        ui.text_editor.setCurrentIndex(2);
+        ui.text_editor_custom.setText("");
+    } else {
+        ui.text_editor.setCurrentIndex(3);
+        ui.text_editor_custom.setText(settings.text_editor);
+    }
 
     ui.opacity.setValue(@intFromFloat(@round(settings.background_opacity * 100.0)));
     updatePercentLabel(ui.opacity_value, ui.opacity.value());
@@ -447,6 +462,21 @@ fn buildGeneralPage() void {
     ui.terminal.setMinimumWidth(220);
     ui.terminal.onEditingFinished(onAnyText);
     _ = addRow(terminal, "Terminal command", "For example: foot or kitty. Empty uses $TERMINAL.", ui.terminal);
+
+    const text_files = addCard(page, "Text files");
+    ui.text_editor = addCombo(text_files, "Open text files with", "Runs in the embedded terminal panel", &.{
+        "Automatic (Neovim, then Vim)", "Neovim", "Vim", "Custom command",
+    });
+    ui.text_editor_custom = QLineEdit.new2();
+    ui.text_editor_custom.setPlaceholderText("For example: helix or code --wait");
+    ui.text_editor_custom.setMinimumWidth(220);
+    ui.text_editor_custom.onEditingFinished(onAnyText);
+    _ = addRow(
+        text_files,
+        "Custom editor",
+        "Used when Custom command is selected. Add arguments if needed.",
+        ui.text_editor_custom,
+    );
 
     page.addStretch();
 }

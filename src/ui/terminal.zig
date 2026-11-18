@@ -21,6 +21,9 @@ extern fn ligma_terminal_new(
 extern fn ligma_terminal_start(handle: ?*anyopaque, shell: [*:0]const u8, working_directory: [*:0]const u8) void;
 extern fn ligma_terminal_start_command(handle: ?*anyopaque, command: [*:0]const u8, working_directory: [*:0]const u8) void;
 extern fn ligma_terminal_set_focus(handle: ?*anyopaque) void;
+extern fn ligma_terminal_send_text(handle: ?*anyopaque, text: [*:0]const u8) void;
+extern fn ligma_terminal_shell_pid(handle: ?*anyopaque) i32;
+extern fn ligma_terminal_foreground_pid(handle: ?*anyopaque) i32;
 extern fn ligma_terminal_change_dir(handle: ?*anyopaque, working_directory: [*:0]const u8) void;
 extern fn ligma_terminal_shutdown(handle: ?*anyopaque) void;
 
@@ -53,6 +56,24 @@ pub fn startCommand(widget: QWidget, gpa: std.mem.Allocator, command: []const u8
 
 pub fn setFocus(widget: QWidget) void {
     ligma_terminal_set_focus(widget.ptr);
+}
+
+/// Send text to the terminal's PTY as though the user typed it.
+pub fn sendText(widget: QWidget, gpa: std.mem.Allocator, text: []const u8) bool {
+    const text_z = gpa.dupeSentinel(u8, text, 0) catch return false;
+    defer gpa.free(text_z);
+    ligma_terminal_send_text(widget.ptr, text_z);
+    return true;
+}
+
+/// PID of the shell that owns the terminal, or -1 when it has exited.
+pub fn shellProcessId(widget: QWidget) i32 {
+    return ligma_terminal_shell_pid(widget.ptr);
+}
+
+/// PID currently in the foreground. Equal to the shell PID at an idle prompt.
+pub fn foregroundProcessId(widget: QWidget) i32 {
+    return ligma_terminal_foreground_pid(widget.ptr);
 }
 
 /// Ask a running shell to change directory. Does nothing when the shell is

@@ -22,6 +22,7 @@ pub const Settings = struct {
     switch_new_tab: bool = false,
     restore_last_window: bool = false,
     terminal_command: []u8 = &.{},
+    text_editor: []u8 = &.{},
 
     // Appearance and sidebar
     always_show_tab_bar: bool = true,
@@ -62,6 +63,8 @@ pub const Settings = struct {
     pub fn deinit(self: *Settings, gpa: std.mem.Allocator) void {
         if (self.terminal_command.len > 0) gpa.free(self.terminal_command);
         self.terminal_command = &.{};
+        if (self.text_editor.len > 0) gpa.free(self.text_editor);
+        self.text_editor = &.{};
     }
 
     pub fn sortColumn(self: Settings) i32 {
@@ -113,7 +116,7 @@ pub fn save(settings: Settings, gpa: std.mem.Allocator, io: std.Io, path: []cons
     try writer.print(
         "# Ligma settings\n\n[general]\nactivation = \"{s}\"\ntyping_mode = \"{s}\"\n" ++
             "confirm_delete = {s}\nswitch_new_tab = {s}\nrestore_last_window = {s}\n" ++
-            "terminal_command = \"{s}\"\n\n",
+            "terminal_command = \"{s}\"\ntext_editor = \"{s}\"\n\n",
         .{
             @tagName(settings.activation),
             @tagName(settings.typing_mode),
@@ -121,6 +124,7 @@ pub fn save(settings: Settings, gpa: std.mem.Allocator, io: std.Io, path: []cons
             boolText(settings.switch_new_tab),
             boolText(settings.restore_last_window),
             settings.terminal_command,
+            settings.text_editor,
         },
     );
     try writer.print(
@@ -206,6 +210,10 @@ fn applyValue(
             const previous = settings.terminal_command;
             settings.terminal_command = gpa.dupe(u8, value) catch previous;
             if (settings.terminal_command.ptr != previous.ptr) gpa.free(previous);
+        } else if (std.mem.eql(u8, key, "text_editor")) {
+            const previous = settings.text_editor;
+            settings.text_editor = gpa.dupe(u8, value) catch previous;
+            if (settings.text_editor.ptr != previous.ptr) gpa.free(previous);
         }
     } else if (std.mem.eql(u8, section, "appearance")) {
         if (std.mem.eql(u8, key, "always_show_tab_bar")) {
@@ -314,11 +322,13 @@ test "settings parser reads values and ignores unknown keys" {
 
     applyValue(gpa, &settings, "general", "activation", "\"single_click\"");
     applyValue(gpa, &settings, "general", "unknown", "true");
+    applyValue(gpa, &settings, "general", "text_editor", "\"helix\"");
     applyValue(gpa, &settings, "views", "view_mode", "\"grid\"");
     applyValue(gpa, &settings, "views", "grid_icon_size", "128");
     applyValue(gpa, &settings, "thumbnails", "thumbnail_policy", "\"never\"");
 
     try std.testing.expectEqual(Activation.single_click, settings.activation);
+    try std.testing.expectEqualStrings("helix", settings.text_editor);
     try std.testing.expectEqual(ViewMode.grid, settings.view_mode);
     try std.testing.expectEqual(@as(i32, 128), settings.grid_icon_size);
     try std.testing.expectEqual(ThumbnailPolicy.never, settings.thumbnail_policy);

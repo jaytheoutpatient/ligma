@@ -192,7 +192,7 @@ Per-folder state remembers view mode, sort column/order, grouping, zoom, hidden-
 - `~`, relative paths, and `file://` URIs accepted in the location bar.
 - Places sidebar with Home, XDG directories, Starred, Recent, Trash, Filesystem, devices, network.
 - **Implemented (v0.4):** right-click a folder → *Add to Places* pins it to the sidebar; right-click a user-added entry → *Remove from Places*. Custom entries persist in `$XDG_CONFIG_HOME/ligma/places`, one absolute path per line, and load at startup after the built-ins. Built-in entries cannot be removed. Right-clicking the built-in Trash entry offers *Empty Trash…*. The file-list menu also offers *Open in Terminal*.
-- **Implemented (v0.4):** the file-list context menu exposes *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, *Delete Permanently*, and *Add to Places* (shown only when the selection contains a folder). Right-clicking an unselected row selects it first, right-clicking a row that is already selected preserves a multi-selection, and right-clicking empty space clears the selection so only folder-wide actions (*Paste*, *New Folder…*) remain enabled. *Paste* is enabled only while the clipboard holds items and no file operation is running. *Properties* shows name, kind, size, location, modified time, permissions, and the symlink target for one item, and the item count, folder/file breakdown, total size, and location for a multi-selection. In Trash the menu becomes *Restore*, *Properties*, *Delete Permanently*, and *Empty Trash…*.
+- **Implemented (v0.4):** the file-list context menu exposes *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, *Delete Permanently*, and *Add to Places* (shown only when the selection contains a folder). Right-clicking an unselected row selects it first, right-clicking any column of a selected row preserves a multi-selection, and right-clicking empty space clears the selection so only folder-wide actions (*Paste*, *New Folder…*) remain enabled. *Paste* is enabled only while the clipboard holds items and no file operation is running. *Properties* shows name, kind, size, location, modified time, owner, group, permissions, and the symlink target for one item, and the item count, folder/file breakdown, total size, and location for a multi-selection. The Permissions tab edits Read/Write/Execute for Owner/Group/Others, supports Set UID/GID/Sticky, provides Make Executable and Remove Execute shortcuts, and can apply the mode to a folder's subfolders and contents. In Trash the menu becomes *Restore*, *Properties*, *Delete Permanently*, and *Empty Trash…*.
 - Drag a folder to the sidebar to bookmark it.
 - Middle-click a folder to open it in a new tab.
 - Enter opens; Ctrl+Enter opens in the other pane; Shift+Enter opens in a new tab.
@@ -230,6 +230,7 @@ Planned on top of this:
 
 - **Implemented (v0.4):** `F12` toggles a terminal panel docked on the right side of the window. The dock can also be hidden with its title-bar button or through **View > Terminal Panel**; the menu item's check state follows visibility.
 - **Implemented (v0.4):** right-clicking the file list offers **Open in Terminal**. The action follows the row under the pointer — a folder opens the terminal there, a file opens it in the containing folder, and empty space falls back to the pane's current folder. If a shell is already running it receives a `cd` only while it is at a prompt, so a foreground job (editor, build) is not disturbed.
+- **Implemented:** activating a text or source file opens it in the embedded terminal instead of the desktop MIME opener. The editor command is sent to an idle shell, then quitting the editor returns to that shell. Detection combines an explicit source-extension list with `text/*` MIME types. **Settings > General > Text files** selects Automatic (Neovim, then Vim), Neovim, Vim, or a custom command; Automatic also falls back to `$VISUAL`/`$EDITOR`. A foreground terminal job is never typed over — the user is asked to finish it first.
 
 - The shell is started lazily on the first open, using `$SHELL` and the active pane's current folder.
 - Hiding and reopening the panel keeps the same shell session and working directory, including anything the user ran in it.
@@ -761,7 +762,7 @@ Acceptance criteria:
 - Batch rename with preview, move/copy to, make link, image resize/rotate, set wallpaper.
 - Per-folder view/zoom, configurable toolbar, templates manager.
 - Selection mode, focus-other-view, Miller columns.
-- Root/polkit operations; properties editing.
+- Root/polkit operations and Dolphin-style properties permissions are implemented; batch rename remains.
 - Free-space and selection-size status; operation history UI.
 
 ### Phase 3 — Search and metadata

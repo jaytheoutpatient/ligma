@@ -51,7 +51,7 @@ This repository contains a working **v0.5 prototype**:
 - **Global filename search** — `Ctrl+Shift+F`, streamed results in a search dock
 - **SQLite FTS5 search index** — automatic background build, trigram substring matching, status-bar health, and `View > Rebuild Search Index`
 - **Async file operations** — copy, cut, paste, rename, new folder, trash, restore, permanent delete, empty Trash, and undo, all on a worker thread with progress and cancellation
-- **Context menu file actions** — right-click any row for *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, and *Delete Permanently*. In Trash, the same menu offers *Restore*, *Properties*, *Delete Permanently*, and *Empty Trash…*. Right-clicking an unselected row targets it first, right-clicking a selected row keeps a multi-selection, and right-clicking empty space clears the selection while leaving folder-wide actions available. *Properties* reports name, kind, size, location, modified time, and permissions, or the count and total size of a multi-selection
+- **Context menu file actions** — right-click any row for *Open*, *Open in Terminal*, *Cut*, *Copy*, *Paste*, *New Folder…*, *Properties*, *Move to Trash*, and *Delete Permanently*. In Trash, the same menu offers *Restore*, *Properties*, *Delete Permanently*, and *Empty Trash…*. Right-clicking an unselected row targets it first, right-clicking any column of a selected row keeps a multi-selection, and right-clicking empty space clears the selection while leaving folder-wide actions available. *Properties* reports name, kind, size, location, modified time, owner, group, and permissions, or the count and total size of a multi-selection. Its **Permissions** tab edits Read/Write/Execute for Owner, Group, and Others, supports Set UID/GID/Sticky, has **Make Executable** and **Remove Execute** shortcuts, and can apply the same mode to a folder's subfolders and contents
 - **Drag and drop** — drag selected rows to move them, or hold Ctrl to copy. Drop onto a folder row or into a pane's empty space. Drags from other applications always copy, same-folder drops are no-ops, and collisions use the same `name (1).ext` naming as paste
 - **Freedesktop.org Trash** — a dedicated **Trash** place browses `Trash/files`, shows each item's original location and deletion date, and supports **Restore**, **Delete Permanently**, and **Empty Trash**. Trash contents use `Path=`/`DeletionDate=` `.trashinfo` files, collision-safe storage names, and restore conflicts use `name (1).ext`; restoring is also available through undo for a just-trashed batch
 - **Undo journal** — the last completed batch can be reversed with `Ctrl+Z`, including copies, moves, renames, new folders, and trashed items
@@ -87,6 +87,8 @@ Open Settings with `Ctrl+,` or **Edit > Preferences…**. The window uses the sa
 
 **Open as Administrator** starts a separate instance rather than elevating the current process. Authentication is handled by pkexec/polkit; Ligma never reads or stores a password. The launcher passes your appearance mode, Matugen scheme path, corner radius, background opacity, and compact-menu preference to the elevated process, so the admin window matches the theme of the window that launched it while still keeping its own root configuration. On X11/XWayland it runs `xhost +SI:localuser:root` for the lifetime of the elevated window and removes that access when the window exits. The new window starts in the folder that was active and can read or modify any file, so use it only for the task that needs root and close it afterwards.
 
+**Text files** under **General** chooses the terminal editor used when a text or source file is activated: Automatic (Neovim, then Vim), Neovim, Vim, or a custom command. Automatic also falls back to `$VISUAL`/`$EDITOR`, and Ligma reports when no editor is available.
+
 **Scroll sensitivity** is a 50–250% slider under **Views > View**. It scales wheel and touchpad distance for every smooth-scrolling surface and applies immediately; 100% is the tuned default.
 
 **Background opacity** is a 20–100% slider under **Appearance > Window**. It tints the file manager's large surfaces — the sidebar, file views, menu/status bars, and pane background — while labels, icons, input fields, tabs, and the preview content stay opaque. At 100% the window is fully opaque and keeps the normal palette look; below 100% Ligma uses the compositor's window translucency and reveals the desktop behind the tint, so a compositing desktop is required. The slider updates the window live.
@@ -102,6 +104,8 @@ Press `F12` to show or hide a terminal docked on the right side of the window. T
 The terminal is [QTermWidget](https://github.com/lxqt/qtermwidget) (the widget used by QTerminal). Because it is a C++ Qt class, `src/ui/terminal_widget.cpp` provides a small C ABI shim that is compiled with the system C++ compiler and linked against the qtermwidget development package.
 
 Right-clicking an item offers **Open in Terminal**, which shows the panel and points the shell at the row under the pointer: a folder opens there, a file opens in its containing folder, and right-clicking empty space uses the pane's current folder. If the shell is already running, it receives a `cd` only when it is sitting at a prompt, so a foreground job (an editor, a long build) is not interrupted.
+
+Activating a plain-text or source file — TXT, Zig, Python, HTML, Markdown, shell scripts, and the other formats in the source-extension list — opens it in the terminal instead of handing it to the desktop MIME opener. The editor runs in the file's folder; quitting it returns to the shell. **Settings > General > Text files** chooses **Automatic (Neovim, then Vim)**, **Neovim**, **Vim**, or a **Custom command** (for example `helix` or `code --wait`). Automatic falls back to `$VISUAL`/`$EDITOR` when neither Neovim nor Vim is installed. If the terminal is busy with a foreground command, Ligma asks you to finish it first rather than typing into the running program.
 
 The panel is intentionally not synchronized in both directions yet: navigating in Ligma after the shell starts does not `cd` the shell, and `cd` in the shell does not navigate the pane.
 
@@ -338,6 +342,7 @@ sudo update-desktop-database /usr/share/applications
 | `F5` | Reload |
 | `Ctrl+Shift+N` | New folder |
 | `F2` | Rename |
+| `Alt+Return` | Show Properties |
 | `Ctrl+Return` | Run the selected executable (with confirmation) |
 | `Delete` | Move to Trash (disabled while browsing Trash) |
 | `Shift+Delete` | Delete permanently, including from Trash |

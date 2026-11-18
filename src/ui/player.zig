@@ -20,6 +20,7 @@ const theme = @import("theme.zig");
 
 extern fn ligma_mpris_notify() void;
 extern fn ligma_mpris_seeked() void;
+extern fn ligma_player_control_icon(button: ?*anyopaque, kind: c_int, size_px: c_int) void;
 extern fn ligma_smooth_scroll_attach(view: ?*anyopaque) void;
 
 const QHBoxLayout = qt6.QHBoxLayout;
@@ -103,6 +104,7 @@ pub const PlayerPanel = struct {
         self.rng = std.Random.DefaultPrng.init(seed);
 
         self.container = QWidget.new2();
+        self.container.setObjectName("ligmaPlayerPanel");
         self.title_label = QLabel.new3("No track loaded");
         self.time_label = QLabel.new3("0:00 / 0:00");
         self.time_label.setMinimumWidth(118);
@@ -136,8 +138,6 @@ pub const PlayerPanel = struct {
         self.configureControl(self.shuffle_button, "Shuffle: off");
         self.repeat_button.setStyleSheet(toggle_style);
         self.shuffle_button.setStyleSheet(toggle_style);
-        self.repeat_button.setFixedWidth(72);
-        self.shuffle_button.setFixedWidth(64);
 
         const controls = QHBoxLayout.new2();
         controls.setSpacing(4);
@@ -645,7 +645,11 @@ pub const PlayerPanel = struct {
 
     fn refreshRepeatButton(self: *PlayerPanel) void {
         self.repeat_button.setChecked(self.repeat_mode != .off);
-        self.repeat_button.setText(if (self.repeat_mode == .one) "Repeat 1" else "Repeat");
+        self.repeat_button.setAccessibleName("Repeat");
+        const repeat_one = self.repeat_mode == .one;
+        self.repeat_button.setText("");
+        self.repeat_button.setFixedWidth(36);
+        ligma_player_control_icon(self.repeat_button.ptr, if (repeat_one) 1 else 0, 20);
         self.repeat_button.setToolTip(switch (self.repeat_mode) {
             .off => "Repeat: off",
             .all => "Repeat: all",
@@ -661,7 +665,10 @@ pub const PlayerPanel = struct {
 
     fn refreshShuffleButton(self: *PlayerPanel) void {
         self.shuffle_button.setChecked(self.shuffle);
-        self.shuffle_button.setText("Shuffle");
+        self.shuffle_button.setAccessibleName("Shuffle");
+        self.shuffle_button.setText("");
+        self.shuffle_button.setFixedWidth(36);
+        ligma_player_control_icon(self.shuffle_button.ptr, 2, 20);
         self.shuffle_button.setToolTip(if (self.shuffle) "Shuffle: on" else "Shuffle: off");
     }
 
