@@ -12,6 +12,7 @@
 #include <QDockWidget>
 #include <QEasingCurve>
 #include <QEvent>
+#include <QFontMetrics>
 #include <QIcon>
 #include <QKeyEvent>
 #include <QLinearGradient>
@@ -102,6 +103,38 @@ class RowToggleFilter final : public QObject {
     QCheckBox *box_;
 };
 
+QStringList wrapGridText(const QString &text, const QFontMetrics &metrics, int width)
+{
+    QStringList lines;
+    if (text.isEmpty() || width <= 0)
+        return lines;
+    QString remaining = text;
+    for (int line = 0; line < 3 && !remaining.isEmpty(); ++line) {
+        if (metrics.horizontalAdvance(remaining) <= width) {
+            lines.append(remaining);
+            break;
+        }
+        int fit = 0;
+        while (fit < remaining.size() &&
+            metrics.horizontalAdvance(remaining.left(fit + 1)) <= width)
+            ++fit;
+        if (fit <= 0)
+            fit = 1;
+        if (line == 2) {
+            lines.append(metrics.elidedText(remaining, Qt::ElideRight, width));
+            break;
+        }
+        int cut = remaining.lastIndexOf(QLatin1Char(' '), fit);
+        if (cut <= 0)
+            cut = fit;
+        const QString first = remaining.left(cut).trimmed();
+        remaining = remaining.mid(cut).trimmed();
+        if (!first.isEmpty())
+            lines.append(first);
+    }
+    return lines;
+}
+
 class CenteredGridDelegate final : public QStyledItemDelegate {
   public:
     explicit CenteredGridDelegate(QObject *parent = nullptr)
@@ -114,6 +147,72 @@ class CenteredGridDelegate final : public QStyledItemDelegate {
         QStyledItemDelegate::initStyleOption(option, index);
         option->displayAlignment = Qt::AlignHCenter | Qt::AlignTop;
     }
+
+    void setCellSize(const QSize &size) { cell_size_ = size; }
+
+    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        const QSize base = QStyledItemDelegate::sizeHint(option, index);
+        if (!cell_size_.isValid() || cell_size_.isEmpty())
+            return base;
+        return QSize(std::max(base.width(), cell_size_.width()),
+            std::max(base.height(), cell_size_.height()));
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+        const QModelIndex &index) const override
+    {
+        QStyleOptionViewItem opt = option;
+        initStyleOption(&opt, index);
+        const QString name = opt.text;
+        const QIcon icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
+        const bool selected = (opt.state & QStyle::State_Selected) != 0;
+
+        // Let the style paint the item background (including the gradient
+        // selection and hover rules) without its single-line label.
+        QStyleOptionViewItem background = opt;
+        background.text.clear();
+        background.icon = QIcon();
+        QStyle *style = background.widget ? background.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &background, painter, background.widget);
+
+        const QRect cell = opt.rect;
+        QSize iconSize = opt.decorationSize;
+        if (!iconSize.isValid() || iconSize.isEmpty())
+            iconSize = QSize(64, 64);
+        const int margin = 6;
+        const QRect iconRect(cell.x() + (cell.width() - iconSize.width()) / 2,
+            cell.y() + margin, iconSize.width(), iconSize.height());
+        if (!icon.isNull())
+            icon.paint(painter, iconRect, Qt::AlignCenter, QIcon::Normal, QIcon::Off);
+
+        if (name.isEmpty())
+            return;
+        QFontMetrics metrics(opt.font);
+        const int textWidth = std::max(1, cell.width() - 12);
+        const QStringList lines = wrapGridText(name, metrics, textWidth);
+        if (lines.isEmpty())
+            return;
+
+        painter->save();
+        painter->setFont(opt.font);
+        painter->setPen(selected ? QColor(Qt::white) : opt.palette.color(QPalette::Text));
+        const int lineHeight = metrics.height();
+        const int available = std::max(0, cell.bottom() - (iconRect.bottom() + 5));
+        const int maxLines = std::min<int>(
+            {3, static_cast<int>(lines.size()), std::max(available / lineHeight, 1)});
+        int y = iconRect.bottom() + 5;
+        for (int i = 0; i < maxLines; ++i) {
+            const QRect lineRect(cell.x() + 6, y, textWidth, lineHeight);
+            painter->drawText(lineRect, Qt::AlignHCenter | Qt::AlignTop,
+                lines.at(i));
+            y += lineHeight;
+        }
+        painter->restore();
+    }
+
+  private:
+    QSize cell_size_;
 };
 
 class GradientRowDelegate final : public QStyledItemDelegate {
@@ -243,12 +342,13 @@ class GradientRowDelegate final : public QStyledItemDelegate {
 
 class SmoothScrollFilter final : public QObject {
   public:
-    SmoothScrollFilter(QWidget *viewport, QScrollBar *bar)
+    SmoothScrollFilter(QWidget *viewport, QScrollBar *bar, QAbstractItemView *view)
         : QObject(viewport)
         , bar_(bar)
+        , view_(view)
         , animation_(new QPropertyAnimation(bar, "value", this))
     {
-        animation_->setDuration(160);
+        animation_->setDuration(100);
         animation_->setEasingCurve(QEasingCurve::OutCubic);
         QObject::connect(bar, &QScrollBar::sliderPressed, animation_,
             &QPropertyAnimation::stop);
@@ -267,12 +367,23 @@ class SmoothScrollFilter final : public QObject {
         // Qt uses the same sign for pixelDelta and angleDelta: positive means
         // scrolling up. QAbstractItemView applies `value - delta`, so negate
         // both here; using pixelDelta directly made touchpad scrolling reverse.
-        int distance = -wheel->pixelDelta().y();
-        if (distance == 0) {
+        const int pixel_delta = -wheel->pixelDelta().y();
+        int distance = 0;
+        if (pixel_delta != 0) {
+            // Touchpads report fine pixel deltas. Doubling keeps a light swipe
+            // responsive without making a full swipe overshoot.
+            const int magnitude = pixel_delta < 0 ? -pixel_delta : pixel_delta;
+            distance = (pixel_delta < 0 ? -1 : 1) * std::max(magnitude * 2, 2);
+        } else {
             const int angle = wheel->angleDelta().y();
             if (angle == 0)
                 return QObject::eventFilter(watched, event);
-            distance = (angle > 0 ? -1 : 1) * std::max(bar_->singleStep() * 3, 48);
+            const bool per_pixel = view_ != nullptr &&
+                view_->verticalScrollMode() == QAbstractItemView::ScrollPerPixel;
+            const int unit = per_pixel
+                ? std::max(bar_->singleStep() * 4, 160)
+                : std::max(bar_->singleStep() * 3, 48);
+            distance = (angle > 0 ? -1 : 1) * unit;
         }
 
         animation_->stop();
@@ -288,6 +399,7 @@ class SmoothScrollFilter final : public QObject {
 
   private:
     QScrollBar *bar_;
+    QAbstractItemView *view_;
     QPropertyAnimation *animation_;
 };
 
@@ -446,6 +558,19 @@ void ligma_set_list_text_alignment(void *view_pointer, int center)
     }
 }
 
+void ligma_set_grid_item_size(void *view_pointer, int width, int height)
+{
+    auto *view = static_cast<QAbstractItemView *>(view_pointer);
+    if (view == nullptr)
+        return;
+    auto *delegate = dynamic_cast<CenteredGridDelegate *>(view->itemDelegate());
+    if (delegate == nullptr)
+        return;
+    delegate->setCellSize(QSize(std::max(width, 1), std::max(height, 1)));
+    view->doItemsLayout();
+    view->viewport()->update();
+}
+
 void ligma_set_row_gradient_colors(int start_r, int start_g, int start_b, int end_r,
     int end_g, int end_b)
 {
@@ -486,7 +611,8 @@ void ligma_smooth_scroll_attach(void *view)
     QWidget *viewport = item_view->viewport();
     if (viewport == nullptr)
         return;
-    viewport->installEventFilter(new SmoothScrollFilter(viewport, item_view->verticalScrollBar()));
+    viewport->installEventFilter(
+        new SmoothScrollFilter(viewport, item_view->verticalScrollBar(), item_view));
 }
 
 void *ligma_dock_new(const char *title, void *parent_pointer, int horizontal,

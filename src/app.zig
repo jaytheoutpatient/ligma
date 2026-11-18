@@ -167,6 +167,7 @@ extern fn ligma_set_row_gradient_colors(start_r: c_int, start_g: c_int, start_b:
 extern fn ligma_attach_row_gradient(view: ?*anyopaque) void;
 extern fn ligma_set_list_text_alignment(view: ?*anyopaque, center: c_int) void;
 extern fn ligma_attach_typing_filter(view: ?*anyopaque, callback: *const fn (u32) callconv(.c) c_int) void;
+extern fn ligma_set_grid_item_size(view: ?*anyopaque, width: c_int, height: c_int) void;
 extern fn ligma_apply_window_chrome(window: ?*anyopaque, opacity: f64, compact_menus: c_int) void;
 extern fn ligma_dock_slide_show(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
 extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) void;
@@ -197,6 +198,7 @@ const App = struct {
     mount_places: std.ArrayList(mounts.Volume) = .empty,
     drives_updating: bool = false,
     mount_timer: QTimer,
+    sidebar_timer: QTimer,
     fs_watcher: QFileSystemWatcher,
     fs_watch_paths: std.ArrayList([]u8) = .empty,
     fs_refresh_timer: QTimer,
@@ -519,6 +521,9 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     const mount_timer = QTimer.new2(window);
     mount_timer.setInterval(2000);
 
+    const sidebar_timer = QTimer.new2(window);
+    sidebar_timer.setInterval(150);
+
     const unmount_process = QProcess.new2(window);
     unmount_process.onFinished(onUnmountFinished);
     unmount_process.onErrorOccurred(onUnmountError);
@@ -747,6 +752,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
         .drives_label = drives_label,
         .drives = drives,
         .mount_timer = mount_timer,
+        .sidebar_timer = sidebar_timer,
         .fs_watcher = fs_watcher,
         .fs_refresh_timer = fs_refresh_timer,
         .status = status,
@@ -841,6 +847,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     fs_watcher.onDirectoryChanged(onFsDirectoryChanged);
     fs_refresh_timer.onTimeout(onFsRefreshTimer);
     mount_timer.onTimeout(onMountTimer);
+    sidebar_timer.onTimeout(onSidebarTimer);
     terminal_dock.onVisibilityChanged(onTerminalVisibilityChanged);
     player_dock.onVisibilityChanged(onPlayerVisibilityChanged);
     tabs.onCurrentChanged(onTabChanged);
@@ -861,6 +868,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     ligma_mpris_notify();
     model_timer.start(50);
     mount_timer.start(2000);
+    sidebar_timer.start(150);
     initSearchIndex(home);
     if (activePane()) |pane| focusPane(pane);
 
@@ -979,6 +987,7 @@ fn applySettingsChrome() void {
     const has_drives = app.settings.show_drives and app.mount_places.items.len > 0;
     app.drives_label.setVisible(has_drives);
     app.drives.setVisible(has_drives);
+    updateSidebarHeights();
     if (app.hidden_action) |action| action.setChecked(app.show_hidden);
     if (radius_changed) {
         applyThemeStyles();
@@ -1379,6 +1388,7 @@ fn shutdown() void {
     app.file_timer.stop();
     app.fs_refresh_timer.stop();
     app.mount_timer.stop();
+    app.sidebar_timer.stop();
     app.unmount_active = false;
     if (app.unmount_process.state() != qprocess_enums.ProcessState.NotRunning) {
         _ = app.unmount_process.kill();
@@ -1810,11 +1820,23 @@ fn configureListView(pane: *Pane, mode: ViewMode) void {
             const icon_size = QSize.new4(icon_side, icon_side);
             defer icon_size.delete();
             pane.list.setIconSize(icon_size);
-            const cell_w: i32 = if (comfortable) 96 else 80;
-            const cell_h: i32 = if (comfortable) 76 else 60;
+            const cell_w: i32 = if (large)
+                (if (comfortable) 112 else 96)
+            else
+                (if (comfortable) 96 else 80);
+            const cell_h: i32 = if (large)
+                (if (comfortable) 112 else 96)
+            else
+                (if (comfortable) 84 else 76);
             const grid = QSize.new4(icon_side + cell_w, icon_side + cell_h);
             defer grid.delete();
             pane.list.setGridSize(grid);
+            const spacing: i32 = if (comfortable) 12 else 8;
+            ligma_set_grid_item_size(
+                pane.list.ptr,
+                icon_side + cell_w - spacing * 2,
+                icon_side + cell_h - spacing * 2,
+            );
             pane.list.setViewMode(qlistview_enums.ViewMode.IconMode);
             pane.list.setFlow(qlistview_enums.Flow.LeftToRight);
             pane.list.setWrapping(true);
@@ -3827,28 +3849,70 @@ fn onPlaceItemClicked(list: QListWidget, item: QListWidgetItem) callconv(.c) voi
 
 // ---- Mounted drives and sidebar sizing -----------------------------------
 
-fn updateSidebarHeights() void {
-    const window_height = app.window.height();
-    const places_max = @max(120, @min(340, @divTrunc(window_height * 32, 100)));
-    const drives_max = @max(80, @min(220, @divTrunc(window_height * 20, 100)));
-    setSidebarListHeight(app.places, places_max);
-    setSidebarListHeight(app.drives, drives_max);
+fn onSidebarTimer(_: QTimer) callconv(.c) void {
+    updateSidebarHeights();
 }
 
-fn setSidebarListHeight(list: QListWidget, max_height: i32) void {
+/// Compute the height the list would like to have for all of its rows.
+fn sidebarContentHeight(list: QListWidget) i32 {
     const count = list.count();
-    if (count <= 0) {
-        list.setFixedHeight(0);
-        return;
-    }
+    if (count <= 0) return 0;
     const row_height = @max(list.sizeHintForRow(0), 20);
     const spacing = @max(list.spacing(), 0);
     // QListWidget adds viewport margins and a frame around the rows; a small
     // allowance avoids a scrollbar when every row already fits.
     const chrome = list.frameWidth() * 2 + 12;
-    const content = count * row_height +
-        @max(count - 1, 0) * spacing + chrome;
-    list.setFixedHeight(@max(row_height + chrome, @min(content, max_height)));
+    return @max(
+        row_height + chrome,
+        count * row_height + @max(count - 1, 0) * spacing + chrome,
+    );
+}
+
+fn setSidebarListHeight(list: QListWidget, target: i32) void {
+    if (list.height() != target) list.setFixedHeight(target);
+}
+
+/// Keep Places, Drives, and the preview inside the space that actually
+/// remains after the player or terminal dock opens. A fixed height based on
+/// the whole window used to over-constrain the sidebar, which made the
+/// Drives section overlap the last Places row.
+fn updateSidebarHeights() void {
+    const total = if (app.sidebar.height() > 200)
+        app.sidebar.height()
+    else
+        app.window.height();
+    const preview_reserve: i32 = if (app.settings.show_preview) 168 else 0;
+    const labels_and_spacing: i32 = 112;
+    const budget = @max(80, total - preview_reserve - labels_and_spacing);
+    const drives_visible = app.settings.show_drives and app.mount_places.items.len > 0;
+
+    const places_cap = if (drives_visible)
+        @min(340, @max(70, @divTrunc(budget * 64, 100)))
+    else
+        @min(340, budget);
+    const places_target = @min(sidebarContentHeight(app.places), places_cap);
+    const drives_cap = if (drives_visible) @max(60, budget - places_target) else 0;
+    const drives_target = if (drives_visible)
+        @min(sidebarContentHeight(app.drives), drives_cap)
+    else
+        0;
+
+    setSidebarListHeight(app.places, snapSidebarHeight(app.places, places_target));
+    setSidebarListHeight(app.drives, snapSidebarHeight(app.drives, drives_target));
+}
+
+/// Round a list height down to whole rows so the last visible row is not
+/// sliced in half when the sidebar is tight.
+fn snapSidebarHeight(list: QListWidget, target: i32) i32 {
+    if (target <= 0 or list.count() <= 0) return 0;
+    const row_height = @max(list.sizeHintForRow(0), 20);
+    const spacing = @max(list.spacing(), 0);
+    const chrome = list.frameWidth() * 2 + 12;
+    const step = row_height + spacing;
+    const usable = target - chrome;
+    if (usable <= row_height) return @min(target, row_height + chrome);
+    const rows = @divTrunc(usable + spacing, step);
+    return @min(target, chrome + rows * row_height + @max(rows - 1, 0) * spacing);
 }
 
 fn refreshMountedPlaces() void {
