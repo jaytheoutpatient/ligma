@@ -348,7 +348,7 @@ class SmoothScrollFilter final : public QObject {
         , view_(view)
         , animation_(new QPropertyAnimation(bar, "value", this))
     {
-        animation_->setDuration(100);
+        animation_->setDuration(85);
         animation_->setEasingCurve(QEasingCurve::OutCubic);
         QObject::connect(bar, &QScrollBar::sliderPressed, animation_,
             &QPropertyAnimation::stop);
@@ -370,10 +370,11 @@ class SmoothScrollFilter final : public QObject {
         const int pixel_delta = -wheel->pixelDelta().y();
         int distance = 0;
         if (pixel_delta != 0) {
-            // Touchpads report fine pixel deltas. Doubling keeps a light swipe
-            // responsive without making a full swipe overshoot.
+            // Touchpads report fine pixel deltas. A 2.5x scale keeps a light
+            // swipe responsive while still preserving fine control.
             const int magnitude = pixel_delta < 0 ? -pixel_delta : pixel_delta;
-            distance = (pixel_delta < 0 ? -1 : 1) * std::max(magnitude * 2, 2);
+            distance = (pixel_delta < 0 ? -1 : 1) *
+                std::max((magnitude * 5) / 2, 2);
         } else {
             const int angle = wheel->angleDelta().y();
             if (angle == 0)
@@ -381,8 +382,8 @@ class SmoothScrollFilter final : public QObject {
             const bool per_pixel = view_ != nullptr &&
                 view_->verticalScrollMode() == QAbstractItemView::ScrollPerPixel;
             const int unit = per_pixel
-                ? std::max(bar_->singleStep() * 4, 160)
-                : std::max(bar_->singleStep() * 3, 48);
+                ? std::max(bar_->singleStep() * 5, 200)
+                : std::max(bar_->singleStep() * 3, 60);
             distance = (angle > 0 ? -1 : 1) * unit;
         }
 
