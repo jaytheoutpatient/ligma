@@ -59,6 +59,7 @@ This repository contains a working **v0.5 prototype**:
 - **Embedded terminal** — `F12` toggles a terminal panel docked on the right; the first open starts the user's shell in the active folder, and the session survives hiding and reopening. Opening and closing the panel, and the music player, slide in from their dock edges; closing with the dock's title-bar button animates the same way
 - **Smooth scrolling** — wheel events animate the Places, Drives, file views, search results, and player playlist instead of jumping by whole rows. Scroll sensitivity is adjustable from 50% to 250% under **Settings > Views**
 - **Run executables** — activating an executable file asks for confirmation, then launches it detached with its folder as the working directory
+- **Administrator window** — **File > Open as Administrator** (`Ctrl+.`) authenticates through **pkexec** and opens a separate Ligma window with root privileges in the active folder. The polkit agent supplies the password dialog; the elevated window is titled **Administrator — Ligma**. On X11/XWayland Ligma temporarily grants root access to the display and revokes it when that window closes. This is a full root instance, so close it when the administrative task is finished
 - **Preview panel** — the whole sidebar area below Places and Drives is a persistent preview panel. It shows a scaled image, an ffmpeg video frame, or a file summary, and hovering a video plays a short muted snippet
 - **Built-in music player** — GStreamer-powered playback with prev/play-pause/next/stop, repeat (off/all/one), shuffle, seek, volume, optional EQ/ReplayGain, and a playlist. A direct-ALSA/bit-perfect output mode is available for exclusive playback. Natural completion keeps the queue and advances to the next track; the context menu adds **Play** and **Add to Playlist**
 - **MPRIS / playerctl** — exposes `org.mpris.MediaPlayer2.ligma` with root and Player interfaces, so desktop media keys, `playerctl`, panels, and other MPRIS clients can read metadata, seek, set volume, change loop/shuffle, and control playback
@@ -83,6 +84,8 @@ The panel occupies all of the sidebar space below Places and Drives and stays vi
 ## Settings
 
 Open Settings with `Ctrl+,` or **Edit > Preferences…**. The window uses the same accent gradients, rounded cards, and compact spacing as the rest of Ligma. Changes apply immediately; there is no Apply button, and **Reset All** restores the built-in defaults.
+
+**Open as Administrator** starts a separate instance rather than elevating the current process. Authentication is handled by pkexec/polkit; Ligma never reads or stores a password. On X11/XWayland it runs `xhost +SI:localuser:root` for the lifetime of the elevated window and removes that access when the window exits. The new window starts in the folder that was active and can read or modify any file, so use it only for the task that needs root and close it afterwards.
 
 **Scroll sensitivity** is a 50–250% slider under **Views > View**. It scales wheel and touchpad distance for every smooth-scrolling surface and applies immediately; 100% is the tuned default.
 
@@ -322,6 +325,7 @@ sudo update-desktop-database /usr/share/applications
 | `Ctrl+Shift+W` | Close window |
 | `F3` / `F6` | Toggle split view / focus other pane |
 | `Ctrl+,` | Open Settings |
+| `Ctrl+.` | Open a pkexec-authenticated administrator window |
 | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` | Details / Icons / Compact / Grid view |
 | `F12` | Toggle the terminal panel |
 | `F9` | Toggle the music player |

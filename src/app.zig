@@ -175,6 +175,7 @@ extern fn ligma_dock_slide_hide(dock: ?*anyopaque, horizontal: c_int, duration_m
 extern fn ligma_dock_new(title: [*:0]const u8, parent: ?*anyopaque, horizontal: c_int, duration_ms: c_int, minimum: c_int) ?*anyopaque;
 
 var appearance_mode: Appearance = .system;
+var admin_mode: bool = false;
 var matugen_scheme_buf: [4096]u8 = undefined;
 var matugen_scheme_len: usize = 0;
 var matugen_available = false;
@@ -348,6 +349,7 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     QApplication.setApplicationName("Ligma");
     QApplication.setApplicationDisplayName("Ligma");
     QApplication.setDesktopFileName("org.ligma.FileManager");
+    admin_mode = std.c.getenv("LIGMA_ADMIN") != null;
 
     detectMatugenScheme(init.gpa, init.io);
     appearance_mode = loadAppearanceSetting(init.gpa, init.io);
@@ -550,6 +552,8 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     file_menu.addAction(rename_action);
     const run_action = makeAction(file_menu, "Run Selected", "Ctrl+Return", onRunSelected);
     file_menu.addAction(run_action);
+    const admin_action = makeAction(file_menu, "Open as Administrator", "Ctrl+.", onOpenAsAdministrator);
+    file_menu.addAction(admin_action);
     _ = file_menu.addSeparator();
     const trash_action = makeAction(file_menu, "Move to Trash", "Delete", onTrashSelected);
     file_menu.addAction(trash_action);
@@ -862,7 +866,22 @@ pub fn run(init: std.process.Init, qapp: QApplication) !void {
     file_timer.onTimeout(onFileTimer);
     model_timer.onTimeout(onModelTimer);
 
-    _ = createRestoredTab(home);
+    if (admin_mode) {
+        // The elevated instance starts in the folder that requested it rather
+        // than restoring the root account's previous tabs.
+        if (std.c.getenv("LIGMA_START_PATH")) |raw| {
+            const start_path = std.mem.span(raw);
+            if (start_path.len > 0 and start_path[0] == '/') {
+                _ = createTab(start_path);
+            } else {
+                _ = createRestoredTab(home);
+            }
+        } else {
+            _ = createRestoredTab(home);
+        }
+    } else {
+        _ = createRestoredTab(home);
+    }
     window.show();
     applySidebarWidth(app.settings.sidebar_width);
     _ = ligma_mpris_start(&mpris_callbacks);
@@ -1049,6 +1068,183 @@ fn onSettingsTheme(index: i32) callconv(.c) void {
 
 fn onSettingsSidebarWidth(width: i32) callconv(.c) void {
     applySidebarWidth(width);
+}
+
+fn appendAdminArgument(
+    owned: *std.ArrayList([]u8),
+    args: *std.ArrayList([]const u8),
+    text: []const u8,
+) bool {
+    const copy = app.gpa.dupe(u8, text) catch return false;
+    owned.append(app.gpa, copy) catch {
+        app.gpa.free(copy);
+        return false;
+    };
+    args.append(app.gpa, copy) catch {
+        _ = owned.pop();
+        app.gpa.free(copy);
+        return false;
+    };
+    return true;
+}
+
+fn appendAdminEnv(
+    owned: *std.ArrayList([]u8),
+    args: *std.ArrayList([]const u8),
+    key: []const u8,
+    value: []const u8,
+) bool {
+    var buffer: [8192]u8 = undefined;
+    const assignment = std.fmt.bufPrint(&buffer, "{s}={s}", .{ key, value }) catch return false;
+    return appendAdminArgument(owned, args, assignment);
+}
+
+fn currentExecutablePath() ?[]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = std.Io.Dir.readLinkAbsolute(app.io, "/proc/self/exe", &buffer) catch return null;
+    return app.gpa.dupe(u8, buffer[0..length]) catch null;
+}
+
+fn adminXauthorityPath() ?[]u8 {
+    if (std.c.getenv("XAUTHORITY")) |raw| {
+        const value = std.mem.span(raw);
+        if (value.len > 0) return app.gpa.dupe(u8, value) catch null;
+    }
+    const home_raw = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.span(home_raw);
+    if (home.len == 0) return null;
+    const candidate = std.fs.path.join(app.gpa, &.{ home, ".Xauthority" }) catch return null;
+    _ = std.Io.Dir.cwd().statFile(
+        app.io,
+        candidate,
+        .{ .follow_symlinks = true },
+    ) catch {
+        app.gpa.free(candidate);
+        return null;
+    };
+    return candidate;
+}
+
+fn pkexecAvailable() bool {
+    const candidates = [_][]const u8{
+        "/usr/bin/pkexec",
+        "/bin/pkexec",
+        "/usr/sbin/pkexec",
+        "/usr/local/bin/pkexec",
+    };
+    for (candidates) |path| {
+        _ = std.Io.Dir.cwd().statFile(app.io, path, .{ .follow_symlinks = true }) catch continue;
+        return true;
+    }
+    return false;
+}
+
+fn onOpenAsAdministrator(_: QAction) callconv(.c) void {
+    if (admin_mode) {
+        showStatus("This window already has administrator privileges", 3500);
+        return;
+    }
+    if (!pkexecAvailable()) {
+        showStatus("pkexec is not installed; administrator mode needs polkit", 4500);
+        return;
+    }
+
+    const exe_owned = currentExecutablePath();
+    defer if (exe_owned) |path| app.gpa.free(path);
+    const executable = exe_owned orelse "/usr/bin/ligma";
+
+    const start_path = if (activePane()) |pane| blk: {
+        const path = pane.current_path orelse break :blk "/";
+        if (path.len > 0 and path[0] == '/') break :blk path;
+        break :blk "/";
+    } else "/";
+
+    var owned: std.ArrayList([]u8) = .empty;
+    var env_args: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (owned.items) |argument| app.gpa.free(argument);
+        owned.deinit(app.gpa);
+        env_args.deinit(app.gpa);
+    }
+
+    var has_display = false;
+    var has_wayland = false;
+    if (std.c.getenv("DISPLAY")) |raw| {
+        const display = std.mem.span(raw);
+        if (display.len > 0) {
+            has_display = true;
+            if (!appendAdminEnv(&owned, &env_args, "DISPLAY", display)) return;
+            if (!appendAdminArgument(&owned, &env_args, "QT_QPA_PLATFORM=xcb")) return;
+            if (adminXauthorityPath()) |path| {
+                defer app.gpa.free(path);
+                if (!appendAdminEnv(&owned, &env_args, "XAUTHORITY", path)) return;
+            }
+        }
+    }
+    if (!has_display) {
+        if (std.c.getenv("WAYLAND_DISPLAY")) |raw| {
+            const wayland = std.mem.span(raw);
+            if (wayland.len > 0) {
+                has_wayland = true;
+                if (!appendAdminEnv(&owned, &env_args, "WAYLAND_DISPLAY", wayland)) return;
+                if (!appendAdminArgument(&owned, &env_args, "QT_QPA_PLATFORM=wayland")) return;
+                if (std.c.getenv("XDG_RUNTIME_DIR")) |runtime_raw| {
+                    const runtime = std.mem.span(runtime_raw);
+                    if (runtime.len > 0) {
+                        if (!appendAdminEnv(&owned, &env_args, "XDG_RUNTIME_DIR", runtime)) return;
+                    }
+                }
+            }
+        }
+    }
+    if (!has_display and !has_wayland) {
+        showStatus("No graphical session is available for administrator mode", 4500);
+        return;
+    }
+
+    // Keep root's configuration and caches out of the user's home.
+    const root_env = [_][2][]const u8{
+        .{ "XDG_CONFIG_HOME", "/root/.config" },
+        .{ "XDG_DATA_HOME", "/root/.local/share" },
+        .{ "XDG_CACHE_HOME", "/root/.cache" },
+        .{ "XDG_STATE_HOME", "/root/.local/state" },
+    };
+    inline for (root_env) |entry| {
+        if (!appendAdminEnv(&owned, &env_args, entry[0], entry[1])) return;
+    }
+    if (!appendAdminArgument(&owned, &env_args, "LIGMA_ADMIN=1")) return;
+    if (!appendAdminEnv(&owned, &env_args, "LIGMA_START_PATH", start_path)) return;
+    inline for (.{ "LANG", "LC_ALL", "LANGUAGE" }) |key| {
+        if (std.c.getenv(key)) |raw| {
+            const value = std.mem.span(raw);
+            if (value.len > 0) {
+                if (!appendAdminEnv(&owned, &env_args, key, value)) return;
+            }
+        }
+    }
+    if (!appendAdminArgument(&owned, &env_args, executable)) return;
+
+    const x11_wrapper =
+        "if command -v xhost >/dev/null 2>&1; then " ++
+        "xhost +SI:localuser:root >/dev/null 2>&1; " ++
+        "trap 'xhost -SI:localuser:root >/dev/null 2>&1' EXIT HUP INT TERM; fi; " ++
+        "pkexec env \"$@\"";
+    const wayland_wrapper = "pkexec env \"$@\"";
+
+    var launch_args: std.ArrayList([]const u8) = .empty;
+    defer launch_args.deinit(app.gpa);
+    launch_args.append(app.gpa, "-c") catch return;
+    launch_args.append(app.gpa, if (has_display) x11_wrapper else wayland_wrapper) catch return;
+    launch_args.append(app.gpa, "sh") catch return;
+    launch_args.appendSlice(app.gpa, env_args.items) catch return;
+
+    const process = QProcess.new2(app.window);
+    defer process.delete();
+    process.setProgram("/bin/sh");
+    process.setArguments(app.gpa, launch_args.items);
+    showStatus("Waiting for administrator authentication…", 6000);
+    if (!process.startDetached())
+        showStatus("Could not launch pkexec", 4000);
 }
 
 fn onSettingsBackgroundOpacity(opacity: f64) callconv(.c) void {
@@ -2351,20 +2547,21 @@ fn refreshCount(pane: *Pane) void {
 }
 
 fn updateWindowTitle() void {
+    const app_name = if (admin_mode) "Administrator — Ligma" else "Ligma";
     const pane = activePane() orelse {
-        app.window.setWindowTitle("Ligma");
+        app.window.setWindowTitle(app_name);
         return;
     };
     const path = pane.current_path orelse {
-        app.window.setWindowTitle("Ligma");
+        app.window.setWindowTitle(app_name);
         return;
     };
 
     var buffer: [8192]u8 = undefined;
     const title = if (file_ops.isTrashLocation(path))
-        "Trash — Ligma"
+        std.fmt.bufPrint(&buffer, "Trash — {s}", .{app_name}) catch app_name
     else
-        std.fmt.bufPrint(&buffer, "{s} — Ligma", .{path}) catch "Ligma";
+        std.fmt.bufPrint(&buffer, "{s} — {s}", .{ path, app_name }) catch app_name;
     app.window.setWindowTitle(title);
 }
 

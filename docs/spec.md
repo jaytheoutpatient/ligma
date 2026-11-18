@@ -80,7 +80,7 @@ Legend: **MVP** = phase 1, **P2**–**P6** = later phases, **opt** = optional/fe
 | Tree List view | Details view plus an expandable tree mode; Miller columns as a differentiator | P2 |
 | Native archive handling | Archive VFS via libarchive; extract/create with progress and undo | P2 |
 | GVfs/GOA remote and cloud | Optional GVfs bridge (`gio` mount points) in addition to native backends | P4 |
-| `admin:///` and properties | Polkit-backed privileged operations, not a root file manager | P2 |
+| `admin:///` and properties | Polkit-backed privileged operations, plus an explicit pkexec-authenticated administrator window (`Ctrl+.`); no implicit root process | Implemented |
 | Python extensions and scripts | Modern action/JS/native extension tiers, plus importers for Nemo actions | P5 |
 | Recent files | XDG recent-documents integration and internal frecency | P3 |
 
@@ -90,7 +90,7 @@ Legend: **MVP** = phase 1, **P2**–**P6** = later phases, **opt** = optional/fe
 |---|---|---|
 | Desktop icons | Optional separate desktop layer; deferred because Wayland support varies by compositor | P6/opt |
 | Extra Pane (F3) | First-class split view with independent panes and "focus other view" | P1 |
-| Open as Root | Polkit helper for explicit privileged operations; no root UI process | P2 |
+| Open as Root | Separate Ligma window launched through pkexec after polkit authentication; starts in the active folder and temporarily grants root X access while it is open | Implemented |
 | Open in Terminal | Embedded terminal panel (`F12`) implemented; external terminal action planned | P1, P2 |
 | Configurable toolbar/UI | Customizable toolbar and sidebar; command palette exposes the same actions | P2 |
 | Per-folder view/zoom | Remembered per-folder view mode, sort, zoom, and columns | P2 |
@@ -702,6 +702,11 @@ Open absolute folder tabs are saved to `$XDG_CONFIG_HOME/ligma/session` when ses
 
 ---
 
+### 5.12 Administrator mode
+
+**Implemented (v0.5):** **File > Open as Administrator** (`Ctrl+.`) launches a separate Ligma process via `pkexec`, with `LIGMA_ADMIN=1` and `LIGMA_START_PATH` pointing at the active folder. The elevated process uses its own root configuration and skips the user's session-restore file. pkexec triggers the system polkit agent for the password; Ligma never reads or stores credentials.
+
+On X11/XWayland the launcher runs a small shell wrapper that temporarily authorizes root for the display with `xhost +SI:localuser:root`, runs `pkexec env ... ligma`, and installs an EXIT/INT/TERM trap that revokes the grant when pkexec (and the elevated window) finishes. The display is selected with `DISPLAY` and `QT_QPA_PLATFORM=xcb`; a Wayland-only session falls back to native Wayland. This is a full root file-manager instance, not a fine-grained privileged helper: it is intentionally explicit and should only be used for tasks that require root.
 ## 6. Performance budgets
 
 | Scenario | Target |
@@ -807,6 +812,7 @@ Acceptance criteria:
 - **Fuzzing:** query parser, manifest parser, archive path sanitizer, `.desktop` action parser.
 - **Leak/UB checks:** debug allocator, ASAN/Valgrind on core tests; Qt object lifetime audit around model/view boundaries.
 - **Benchmarks:** startup, folder load, filter, search, copy, thumbnail; tracked per release.
+
 - **CI:** `zig fmt --check`, `zig build`, `zig build test`, offscreen smoke test, packaging checks.
 
 ---
@@ -880,6 +886,7 @@ Implemented in the v0.5 prototype:
 - Discord Rich Presence (`src/core/discord.zig`): title/artist/album from GStreamer tags, timestamps while playing, pause/stop handling, local socket discovery for native and Flatpak clients, and configurable app ID. Optional MusicBrainz enrichment supplies canonical metadata and release years.
 - Executable files (ELF binaries, scripts, AppImages) can be launched after a confirmation prompt by pressing Enter, double-clicking, or choosing `File > Run Selected` (`Ctrl+Return`); the process starts detached with the file's folder as its working directory.
 - Tabs (`Ctrl+T`, `Ctrl+W`) and split view (`F3`, `F6`); panes keep independent state. Optional session restore reopens absolute folder tabs from `$XDG_CONFIG_HOME/ligma/session`.
+- Administrator window (`Ctrl+.` / **File > Open as Administrator**): launches a separate Ligma instance through pkexec, starting in the active folder with root privileges. On X11/XWayland the launcher temporarily adds `SI:localuser:root` to `xhost` and removes it when the elevated window exits; pkexec supplies the password prompt.
 - Settings window (`Ctrl+,`) with General, Appearance, Views, Thumbnails, and Preview categories. Live-apply controls persist to `settings.toml`; Reset All returns to defaults. Appearance includes theme, a 20–100% background-opacity slider, corner-roundness scale, compact menus, tab/status bar visibility, sidebar and drives, and sidebar width. Views includes a 50–250% scroll-sensitivity slider that scales wheel and touchpad distance without reconfiguring panes. Background opacity uses compositor translucency: the QMainWindow becomes translucent, the QSplitter paints the palette's Window color at the selected alpha, and the large views, tabs, menu bar, and status bar paint transparent or tinted surfaces while labels, icons, input fields, and preview content stay opaque. At 100% the translucency attribute and background stylesheet are removed for the normal opaque look.
 - Preview panel fills the sidebar's remaining height below Places and Drives. Images and ffmpeg video frames scale into it; hovering a video plays a muted looping Qt Multimedia snippet. Video files also use extracted frames as Icons/Grid thumbnails, generated one at a time with a bounded queue.
 - Global filename search with streamed results in a dock.
