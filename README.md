@@ -233,7 +233,7 @@ Drag one or more selected rows onto a folder row or into a pane's empty space. T
 - Qt **6.8+** development files (tested with 6.12.0; QtWidgets, QtNetwork, QtDBus, QtMultimedia, and QtMultimediaWidgets)
 - GStreamer **1.x** development files and the base/good/bad/ugly plugin sets, plus a PipeWire or ALSA sink
 - **ffmpeg** for video thumbnails and the static video preview frame
-- QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`; Debian: `libqtermwidget-dev`; newer Ubuntu: `libqtermwidget6-2-dev`)
+- QTermWidget **2.x** for Qt 6 development files (`qtermwidget6.pc`; Arch: `qtermwidget`; Debian: `libqtermwidget-dev`; newer Ubuntu: `libqtermwidget6-2-dev`; Devario: not currently packaged, so the build script compiles 2.5.0 from source)
 - SQLite 3 development files with FTS5 and the trigram tokenizer (tested with 3.54.1)
 - `util-linux` (`lsblk`, `umount`) and **UDisks2** (`udisksctl`) for USB/removable-drive detection and mounting
 - A C/C++ toolchain (`g++`) and `pkg-config`
@@ -262,6 +262,39 @@ sudo pacman -S qt6-base qt6-multimedia sqlite qtermwidget utf8proc ffmpeg \
   gst-plugins-ugly gst-plugin-pipewire udisks2 util-linux
 ```
 
+On Devario:
+
+```bash
+shelly install standard --needed gcc make pkgconf cmake qt6-base qt6-tools \
+  qt6-multimedia qt6-multimedia-gstreamer qt6-wayland sqlite gstreamer \
+  gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly \
+  gst-plugin-pipewire udisks2 util-linux ffmpeg matugen zig
+```
+
+Shelly requests elevation for the transaction. QTermWidget is not in the
+Devario repositories yet, so `./build.sh` builds QTermWidget 2.5.0 from a
+checksum-verified source archive and installs it into `/usr` the first time it
+is needed. `qt6-tools` supplies the Qt Linguist tools required by that build.
+
+The build script also sets up Matugen for Ligma. It installs `matugen`, writes
+a qt6ct template to `~/.config/matugen/templates/ligma-qt6ct.conf`, and
+generates `~/.config/qt6ct/colors/matugen.conf`. The palette uses Pearl's
+current seed, variant, and scheme when `~/.config/pearl/preferences.json`
+exists, otherwise a Material You default. This enables **View > Appearance >
+Matugen** in Ligma and initializes `~/.config/qt6ct/qt6ct.conf` when that file
+is absent. Existing Matugen configuration is preserved; the script only
+appends its `ligma_qt6ct` template block when no qt6ct Matugen output is
+already configured. To regenerate the scheme after changing the wallpaper or
+seed, run:
+
+```bash
+matugen color hex '#6750a4' --config ~/.config/ligma/matugen.toml
+```
+
+Run `./build.sh` as your normal user rather than with `sudo`; the script
+elevates only the package transaction and the `/usr` installation, and it
+configures Matugen in the invoking account's home directory.
+
 The build fetches the pinned `libqt6zig` dependency automatically. The first build compiles only the Qt wrappers the app uses, so it is much faster than building the entire binding repository.
 
 ### Commands
@@ -280,9 +313,12 @@ entry and icons:
 
 On the first run, `./build.sh` checks for the required development packages
 and automatically starts the installer when something is missing. It detects
-`pacman`, `apt`, or `dnf`, shows the package list, and asks before changing the
-system. It installs the Qt 6, GStreamer, QTermWidget, SQLite, C/C++, and
-pkg-config development packages.
+`pacman`, `apt`, `dnf`, or Shelly on Devario, shows the package list, and asks
+before changing the system. It installs the Qt 6, GStreamer, QTermWidget,
+SQLite, C/C++, and pkg-config development packages. On Devario, where
+QTermWidget is not in the repositories yet, the script also builds QTermWidget
+2.5.0 from source and installs it system-wide, then generates a Matugen/qt6ct
+palette for Ligma.
 
 If Zig 0.17.0 or newer is not available, the script downloads the official
 Zig 0.17.0 compiler from <https://ziglang.org>, verifies its SHA-256 checksum,

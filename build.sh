@@ -5,7 +5,9 @@
 #
 # Examples:
 #   ./build.sh                 # install missing dependencies and build
-#                              # (downloads a local Zig compiler if needed)
+#                              # (downloads a local Zig compiler if needed;
+#                              # uses Shelly on Devario and builds QTermWidget
+#                              # from source when it is not packaged)
 #   ./build.sh --test          # build and run the unit tests
 #   ./build.sh --debug         # Debug build
 #   ./build.sh                 # build and install (pkexec prompts for auth)
@@ -88,6 +90,47 @@ need_pkg() {
     fi
 }
 
+download_verified_archive() {
+    local url="$1"
+    local archive="$2"
+    local expected_sha="$3"
+
+    need_command tar
+    need_command sha256sum
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        printf 'error: curl or wget is required to download %s.\n' "$url" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$archive" ]]; then
+        local partial="${archive}.part"
+        rm -f "$partial"
+        printf 'Downloading %s...\n' "$url"
+        if command -v curl >/dev/null 2>&1; then
+            if ! curl -fL --retry 3 -o "$partial" "$url"; then
+                rm -f "$partial"
+                printf 'error: could not download %s.\n' "$url" >&2
+                exit 1
+            fi
+        else
+            if ! wget -O "$partial" "$url"; then
+                rm -f "$partial"
+                printf 'error: could not download %s.\n' "$url" >&2
+                exit 1
+            fi
+        fi
+        mv -f "$partial" "$archive"
+    fi
+
+    local actual_sha
+    actual_sha="$(sha256sum "$archive" | awk '{print $1}')"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        rm -f "$archive"
+        printf 'error: checksum mismatch for %s.\n' "$url" >&2
+        exit 1
+    fi
+}
+
 zig_version_ok() {
     command -v zig >/dev/null 2>&1 || return 1
     local version
@@ -96,16 +139,28 @@ zig_version_ok() {
     [[ "$(printf '%s\n' 0.17.0 "$version" | sort -V | head -n1)" == "0.17.0" ]]
 }
 
+is_devario() {
+    [[ -r /etc/os-release ]] || return 1
+    local id
+    id="$(sed -n 's/^ID="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release)"
+    [[ "$id" == "devario" ]]
+}
+
 system_deps_ready() {
     command -v g++ >/dev/null 2>&1 || return 1
     command -v pkg-config >/dev/null 2>&1 || return 1
     command -v lsblk >/dev/null 2>&1 || return 1
     command -v udisksctl >/dev/null 2>&1 || return 1
     command -v ffmpeg >/dev/null 2>&1 || return 1
+    if is_devario && ! command -v matugen >/dev/null 2>&1; then
+        return 1
+    fi
     pkg-config --exists qtermwidget6 gstreamer-1.0 sqlite3 Qt6DBus Qt6Multimedia Qt6MultimediaWidgets
 }
 
 ZIG_BOOTSTRAP_VERSION="0.17.0"
+QTERMWIDGET_VERSION="2.5.0"
+LXQT_BUILD_TOOLS_VERSION="2.5.0"
 
 activate_local_zig() {
     local dir
@@ -281,6 +336,200 @@ run_priv() {
     return "$status"
 }
 
+qtermwidget_ready() {
+    pkg-config --exists qtermwidget6
+}
+
+install_qtermwidget() {
+    if qtermwidget_ready; then
+        return 0
+    fi
+
+    need_command cmake
+    need_command make
+    need_command nproc
+
+    local tools_dir="$ROOT/.tools"
+    local source_root="$tools_dir/qtermwidget-sources"
+    local lxqt_archive="$tools_dir/lxqt-build-tools-${LXQT_BUILD_TOOLS_VERSION}.tar.gz"
+    local qterm_archive="$tools_dir/qtermwidget-${QTERMWIDGET_VERSION}.tar.gz"
+    local lxqt_src="$source_root/lxqt-build-tools-${LXQT_BUILD_TOOLS_VERSION}"
+    local qterm_src="$source_root/qtermwidget-${QTERMWIDGET_VERSION}"
+    local lxqt_prefix="$tools_dir/lxqt-build-tools-${LXQT_BUILD_TOOLS_VERSION}-prefix"
+    local lxqt_build="$tools_dir/lxqt-build-tools-${LXQT_BUILD_TOOLS_VERSION}-build"
+    local qterm_build="$tools_dir/qtermwidget-${QTERMWIDGET_VERSION}-build"
+
+    mkdir -p "$tools_dir"
+    download_verified_archive \
+        "https://github.com/lxqt/lxqt-build-tools/archive/refs/tags/${LXQT_BUILD_TOOLS_VERSION}.tar.gz" \
+        "$lxqt_archive" \
+        "77dec4deef59576c00230df8d0adabdd598f8df4fc7007a895a5e10ad3208e81"
+    download_verified_archive \
+        "https://github.com/lxqt/qtermwidget/archive/refs/tags/${QTERMWIDGET_VERSION}.tar.gz" \
+        "$qterm_archive" \
+        "d21977cf4b4b0f37883a3d6c9af23b85604edc53b1281fc9170d189aaa8a4559"
+
+    rm -rf "$source_root" "$lxqt_build" "$qterm_build"
+    mkdir -p "$source_root"
+    tar -xzf "$lxqt_archive" -C "$source_root"
+    tar -xzf "$qterm_archive" -C "$source_root"
+
+    printf '\nQTermWidget 2.x development files are missing; building %s from source...\n' "$QTERMWIDGET_VERSION"
+    cmake -S "$lxqt_src" -B "$lxqt_build" \
+        -DCMAKE_INSTALL_PREFIX="$lxqt_prefix" \
+        -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$lxqt_build" --parallel "$(nproc)"
+    cmake --install "$lxqt_build"
+
+    cmake -S "$qterm_src" -B "$qterm_build" \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="$lxqt_prefix" \
+        -DQTERMWIDGET_BUILD_PYTHON_BINDING=OFF \
+        -DUSE_UTF8PROC=OFF
+    cmake --build "$qterm_build" --parallel "$(nproc)"
+
+    if [[ -z "${PRIV_KIND:-}" ]]; then
+        setup_privilege
+    fi
+    printf 'Installing QTermWidget %s into /usr...\n' "$QTERMWIDGET_VERSION"
+    run_priv cmake --install "$qterm_build"
+    if command -v ldconfig >/dev/null 2>&1; then
+        run_priv ldconfig
+    fi
+
+    if ! qtermwidget_ready; then
+        printf 'error: QTermWidget was built but qtermwidget6.pc is still unavailable.\n' >&2
+        exit 1
+    fi
+}
+
+setup_devario_matugen() {
+    if ! is_devario; then
+        return 0
+    fi
+    if ((EUID == 0)) && [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        printf 'note: run ./build.sh as %s without sudo to configure Matugen for that account.\n' "$SUDO_USER" >&2
+        return 0
+    fi
+    if ! command -v matugen >/dev/null 2>&1; then
+        printf 'Matugen is not installed; skipping Ligma color setup.\n'
+        return 0
+    fi
+
+    local config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+    local matugen_dir="$config_home/matugen"
+    local template_dir="$matugen_dir/templates"
+    local template_path="$template_dir/ligma-qt6ct.conf"
+    local scheme_path="$config_home/qt6ct/colors/matugen.conf"
+    local qt6ct_conf="$config_home/qt6ct/qt6ct.conf"
+    local main_config="$matugen_dir/config.toml"
+    local ligma_config="$config_home/ligma/matugen.toml"
+    local marker_begin="# >>> ligma qt6ct >>>"
+    local marker_end="# <<< ligma qt6ct <<<"
+
+    mkdir -p "$template_dir" "$(dirname "$scheme_path")" "$(dirname "$ligma_config")"
+
+    cat > "$template_path" <<'EOF'
+[ColorScheme]
+active_colors={{colors.on_surface.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.surface_container_high.default.hex}}, {{colors.surface_container_highest.default.hex}}, {{colors.surface_container_low.default.hex}}, {{colors.surface_container_lowest.default.hex}}, {{colors.on_surface.default.hex}}, {{colors.on_background.default.hex}}, {{colors.on_surface.default.hex}}, {{colors.background.default.hex}}, {{colors.background.default.hex}}, {{colors.shadow.default.hex}}, {{colors.primary.default.hex}}, {{colors.on_primary.default.hex}}, {{colors.secondary.default.hex}}, {{colors.primary.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.scrim.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.on_surface.default.hex}}, {{colors.on_surface_variant.default.hex}}
+inactive_colors={{colors.on_surface_variant.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.surface_container_high.default.hex}}, {{colors.surface_container_highest.default.hex}}, {{colors.surface_container_low.default.hex}}, {{colors.surface_container_lowest.default.hex}}, {{colors.on_surface_variant.default.hex}}, {{colors.on_background.default.hex}}, {{colors.on_surface_variant.default.hex}}, {{colors.background.default.hex}}, {{colors.background.default.hex}}, {{colors.shadow.default.hex}}, {{colors.primary.default.hex}}, {{colors.on_primary.default.hex}}, {{colors.secondary.default.hex}}, {{colors.primary.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.scrim.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.on_surface_variant.default.hex}}, {{colors.outline.default.hex}}
+disabled_colors={{colors.outline.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.surface_container_high.default.hex}}, {{colors.surface_container_highest.default.hex}}, {{colors.surface_container_low.default.hex}}, {{colors.surface_container_lowest.default.hex}}, {{colors.outline.default.hex}}, {{colors.on_background.default.hex}}, {{colors.outline.default.hex}}, {{colors.background.default.hex}}, {{colors.background.default.hex}}, {{colors.shadow.default.hex}}, {{colors.outline_variant.default.hex}}, {{colors.on_surface.default.hex}}, {{colors.outline.default.hex}}, {{colors.primary.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.scrim.default.hex}}, {{colors.surface_container.default.hex}}, {{colors.on_surface.default.hex}}, {{colors.outline.default.hex}}
+EOF
+
+    # Keep a Ligma-owned config so the scheme can always be regenerated with:
+    # matugen color hex <seed> --config ~/.config/ligma/matugen.toml
+    cat > "$ligma_config" <<EOF
+[config]
+
+[templates.ligma_qt6ct]
+input_path = '$template_path'
+output_path = '$scheme_path'
+EOF
+
+    local main_has_marker=0
+    local main_has_qt6ct=0
+    if [[ -f "$main_config" ]]; then
+        if grep -qF "$marker_begin" "$main_config"; then main_has_marker=1; fi
+        if grep -qF 'qt6ct/colors/matugen.conf' "$main_config"; then main_has_qt6ct=1; fi
+    fi
+
+    if ((main_has_marker == 0 && main_has_qt6ct == 0)); then
+        if [[ ! -f "$main_config" ]]; then
+            cat > "$main_config" <<EOF
+[config]
+
+$marker_begin
+[templates.ligma_qt6ct]
+input_path = '$template_path'
+output_path = '$scheme_path'
+$marker_end
+EOF
+        elif grep -Eq '^\[config\]' "$main_config"; then
+            {
+                printf '\n%s\n' "$marker_begin"
+                printf '[templates.ligma_qt6ct]\n'
+                printf "input_path = '%s'\n" "$template_path"
+                printf "output_path = '%s'\n" "$scheme_path"
+                printf '%s\n' "$marker_end"
+            } >> "$main_config"
+        else
+            printf 'warning: %s has no [config] table; leaving it unchanged.\n' "$main_config" >&2
+        fi
+    fi
+
+    if [[ ! -f "$qt6ct_conf" ]]; then
+        cat > "$qt6ct_conf" <<EOF
+[Appearance]
+color_scheme_path=$scheme_path
+custom_palette=true
+EOF
+    elif ! grep -qF 'matugen.conf' "$qt6ct_conf"; then
+        printf 'note: %s selects another qt6ct scheme; Ligma will use that scheme instead.\n' "$qt6ct_conf" >&2
+    fi
+
+    # Respect an existing Matugen qt6ct template owned by the user.
+    if ((main_has_qt6ct == 1 && main_has_marker == 0)) && [[ -f "$scheme_path" ]]; then
+        printf 'Using the existing Matugen qt6ct setup in %s.\n' "$main_config"
+        return 0
+    fi
+
+    local seed="#6750a4"
+    local mode="dark"
+    local scheme="scheme-fruit-salad"
+    local prefs="$config_home/pearl/preferences.json"
+    if [[ -r "$prefs" ]]; then
+        local value
+        value="$(sed -n 's/.*"seed"[[:space:]]*:[[:space:]]*"\(#[0-9A-Fa-f][0-9A-Fa-f]*\)".*/\1/p' "$prefs" | head -n1)"
+        if [[ -n "$value" ]]; then seed="$value"; fi
+        value="$(sed -n 's/.*"variant"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$prefs" | head -n1)"
+        case "$value" in
+            light|dark) mode="$value" ;;
+        esac
+        value="$(sed -n 's/.*"scheme"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$prefs" | head -n1)"
+        if [[ -n "$value" ]]; then
+            value="${value//_/-}"
+            if [[ "$value" != scheme-* ]]; then value="scheme-$value"; fi
+            case "$value" in
+                scheme-content|scheme-expressive|scheme-fidelity|scheme-fruit-salad|scheme-monochrome|scheme-neutral|scheme-rainbow|scheme-tonal-spot|scheme-vibrant|scheme-smart)
+                    scheme="$value" ;;
+            esac
+        fi
+    fi
+
+    printf 'Setting up Matugen for Ligma (%s, %s, %s)...\n' "$seed" "$mode" "$scheme"
+    if ! matugen color hex "$seed" --mode "$mode" --type "$scheme" --config "$ligma_config"; then
+        printf 'warning: Matugen could not generate %s.\n' "$scheme_path" >&2
+        return 0
+    fi
+    if [[ -f "$scheme_path" ]]; then
+        printf 'Matugen qt6ct scheme ready: %s\n' "$scheme_path"
+    else
+        printf 'warning: Matugen did not create %s.\n' "$scheme_path" >&2
+    fi
+}
+
 confirm_install() {
     if [[ "${LIGMA_ASSUME_YES:-0}" == "1" ]]; then
         return 0
@@ -340,10 +589,22 @@ install_deps() {
         printf 'Detected dnf. Installing: %s\n' "${packages[*]}"
         confirm_install dnf
         run_priv dnf install -y "${packages[@]}"
+    elif command -v shelly >/dev/null 2>&1; then
+        local packages=(gcc make pkgconf cmake qt6-base qt6-tools qt6-multimedia
+            qt6-multimedia-gstreamer qt6-wayland sqlite gstreamer gst-plugins-base
+            gst-plugins-good gst-plugins-bad gst-plugins-ugly
+            gst-plugin-pipewire udisks2 util-linux ffmpeg matugen zig)
+        printf 'Detected Shelly (Devario). Installing: %s\n' "${packages[*]}"
+        confirm_install shelly
+        run_priv shelly install standard --needed --no-confirm "${packages[@]}"
     else
         printf 'error: unsupported package manager.\n' >&2
         printf 'Install the packages listed in README.md manually.\n' >&2
         exit 1
+    fi
+
+    if ! qtermwidget_ready; then
+        install_qtermwidget
     fi
 
     hash -r
@@ -357,6 +618,8 @@ if ((DO_INSTALL_DEPS)) || ! system_deps_ready; then
     fi
     install_deps
 fi
+
+setup_devario_matugen
 
 ensure_zig
 
